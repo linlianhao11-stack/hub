@@ -16,39 +16,6 @@ from hub.routers import health, internal_callbacks, setup
 logger = logging.getLogger("hub")
 
 
-async def _start_dingtalk_stream(app: FastAPI) -> None:
-    """装配钉钉 Stream + sender，把入站消息转 dingtalk_inbound 任务投到 Redis Streams。
-
-    缺配置不报错，只记 warn——首启动时还没人配钉钉是正常的。
-    """
-    from hub.ports import InboundMessage
-    from hub.runtime import bootstrap_dingtalk_clients
-    clients = await bootstrap_dingtalk_clients(with_stream=True)
-    app.state.dingtalk_clients = clients
-
-    if clients.dingtalk_stream is None:
-        logger.warning("DingTalkStreamAdapter 未启动（钉钉应用未配置）")
-        return
-
-    runner = app.state.task_runner
-
-    async def _on_message(msg: InboundMessage) -> None:
-        await runner.submit("dingtalk_inbound", {
-            "channel_userid": msg.channel_userid,
-            "conversation_id": msg.conversation_id,
-            "content": msg.content,
-            "content_type": msg.content_type,
-            "timestamp": msg.timestamp,
-        })
-
-    clients.dingtalk_stream.on_message(_on_message)
-    # Stream.start() 会阻塞跑长连接；放后台任务里跑
-    app.state.dingtalk_stream_task = asyncio.create_task(
-        clients.dingtalk_stream.start(), name="dingtalk_stream",
-    )
-    logger.info("DingTalkStreamAdapter 已启动（后台 task）")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -57,7 +24,7 @@ async def lifespan(app: FastAPI):
     # 1. 初始化数据库连接（迁移已由 hub-migrate 容器跑完，这里只连）
     await init_db()
 
-    # 2. 跑种子数据（Task 9 创建 stub，Task 11 替换为真实实现）
+    # 2. 跑种子数据
     from hub.seed import run_seed
     await run_seed()
 
@@ -85,37 +52,55 @@ async def lifespan(app: FastAPI):
                 f"{'='*60}"
             )
 
-    # 4. 装配 task_runner（confirm-final 回调 + 入站消息都需要它把 task 投到 Redis Streams）
+    # 4. 装 task_runner（confirm-final 回调 + 入站消息都需要它把 task 投到 Redis Streams）
     from redis.asyncio import Redis
 
+    from hub.adapters.channel.dingtalk_stream import DingTalkStreamAdapter
+    from hub.lifecycle import connect_dingtalk_stream_when_ready
     from hub.queue import RedisStreamsRunner
-    redis = Redis.from_url(settings.redis_url, decode_responses=False)
-    app.state.redis = redis
-    app.state.task_runner = RedisStreamsRunner(redis_client=redis)
+    redis_client = Redis.from_url(settings.redis_url, decode_responses=False)
+    runner = RedisStreamsRunner(redis_client=redis_client)
+    app.state.redis = redis_client
+    app.state.task_runner = runner
+    app.state.dingtalk_adapter = None
 
-    # 5. 已初始化才启钉钉 Stream（首启动时还没钉钉配置，无意义）
-    if initialized:
-        await _start_dingtalk_stream(app)
-    else:
-        app.state.dingtalk_clients = None
+    # 5. 后台 task：等钉钉应用配置就绪后连 Stream（连上即退出 task）
+    async def _on_inbound(msg):
+        await runner.submit("dingtalk_inbound", {
+            "channel_type": msg.channel_type,
+            "channel_userid": msg.channel_userid,
+            "conversation_id": msg.conversation_id,
+            "content": msg.content,
+            "timestamp": msg.timestamp,
+        })
+
+    async def _bg_connect():
+        adapter = await connect_dingtalk_stream_when_ready(
+            on_inbound=_on_inbound,
+            adapter_factory=DingTalkStreamAdapter,
+        )
+        app.state.dingtalk_adapter = adapter
+
+    connect_task = asyncio.create_task(_bg_connect(), name="dingtalk_connect")
+    app.state.dingtalk_connect_task = connect_task
 
     yield
 
     logger.info("HUB Gateway 关闭")
-    # 反向关：Stream → sender/erp_adapter → redis → db
-    stream_task = getattr(app.state, "dingtalk_stream_task", None)
-    if stream_task is not None:
-        stream_task.cancel()
+    # 关闭顺序：先取消连接 task，再 stop adapter，最后 redis / db
+    if not connect_task.done():
+        connect_task.cancel()
         try:
-            await stream_task
+            await connect_task
         except (asyncio.CancelledError, Exception):
             pass
-    clients = getattr(app.state, "dingtalk_clients", None)
-    if clients is not None:
-        await clients.aclose()
-    redis = getattr(app.state, "redis", None)
-    if redis is not None:
-        await redis.aclose()
+    adapter = getattr(app.state, "dingtalk_adapter", None)
+    if adapter is not None:
+        try:
+            await adapter.stop()
+        except Exception:
+            logger.exception("DingTalk adapter 停止异常")
+    await redis_client.aclose()
     await close_db()
 
 
