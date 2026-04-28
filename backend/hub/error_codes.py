@@ -5,11 +5,11 @@ UI 大白话原则：每条 code 对应中文文案；最终回复钉钉用户�
 """
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from string import Template
 
 
-class BizErrorCode(str, Enum):
+class BizErrorCode(StrEnum):
     BIND_USER_NOT_FOUND = "BIND_USER_NOT_FOUND"
     BIND_CODE_INVALID = "BIND_CODE_INVALID"
     BIND_CODE_EXPIRED = "BIND_CODE_EXPIRED"

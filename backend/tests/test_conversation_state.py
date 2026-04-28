@@ -45,6 +45,7 @@ async def test_clear(fake_redis):
 async def test_ttl_expires(fake_redis):
     """TTL 过期后无法读取（fakeredis 支持 ttl）。"""
     import asyncio
+
     from hub.match.conversation_state import ConversationStateRepository
     repo = ConversationStateRepository(redis=fake_redis, ttl_seconds=1)
     await repo.save("u", {"x": 1})

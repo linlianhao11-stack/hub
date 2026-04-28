@@ -20,13 +20,22 @@ async def main():
 
     from hub.adapters.channel.dingtalk_sender import DingTalkSender
     from hub.adapters.downstream.erp4 import Erp4Adapter
+    from hub.capabilities.factory import load_active_ai_provider
     from hub.crypto import decrypt_secret
     from hub.handlers.dingtalk_inbound import handle_inbound
     from hub.handlers.dingtalk_outbound import handle_outbound
+    from hub.intent.chain_parser import ChainParser
+    from hub.intent.llm_parser import LLMParser
+    from hub.intent.rule_parser import RuleParser
+    from hub.match.conversation_state import ConversationStateRepository
     from hub.models import ChannelApp, DownstreamSystem
+    from hub.permissions import require_permissions
     from hub.services.binding_service import BindingService
     from hub.services.erp_active_cache import ErpActiveCache
     from hub.services.identity_service import IdentityService
+    from hub.strategy.pricing import DefaultPricingStrategy
+    from hub.usecases.query_customer_history import QueryCustomerHistoryUseCase
+    from hub.usecases.query_product import QueryProductUseCase
 
     redis_client = Redis.from_url(settings.redis_url, decode_responses=False)
 
@@ -68,17 +77,36 @@ async def main():
     identity_service = IdentityService(erp_active_cache=erp_active_cache)
     binding_service = BindingService(erp_adapter=erp_adapter)
 
+    # 业务依赖（Plan 4）：意图解析链 + 多轮上下文 + 价格策略 + 业务用例
+    ai_provider = await load_active_ai_provider()
+    chain_parser = ChainParser(
+        rule=RuleParser(), llm=LLMParser(ai=ai_provider),
+        low_confidence_threshold=0.7,
+    )
+    if ai_provider is None:
+        logger.warning("ai_provider 表为空，LLMParser 将一律返回 unknown（仅 RuleParser 有效）")
+    conversation_state = ConversationStateRepository(redis=redis_client, ttl_seconds=300)
+    pricing = DefaultPricingStrategy(erp_adapter=erp_adapter)
+    query_product = QueryProductUseCase(
+        erp=erp_adapter, pricing=pricing, sender=sender, state=conversation_state,
+    )
+    query_customer = QueryCustomerHistoryUseCase(
+        erp=erp_adapter, pricing=pricing, sender=sender, state=conversation_state,
+    )
+
     runtime = WorkerRuntime(redis_client=redis_client)
 
     async def dingtalk_inbound_handler(task_data):
-        # 进 worker.run() 之前已经轮询确认 binding_service 和 identity_service 都就绪。
-        # 此处不再有 None 兜底——一旦走到这里就必须真处理；handler 内部异常由
-        # WorkerRuntime 转入死信（不静默 ACK）。
         await handle_inbound(
             task_data,
             binding_service=binding_service,
             identity_service=identity_service,
             sender=sender,
+            chain_parser=chain_parser,
+            conversation_state=conversation_state,
+            query_product_usecase=query_product,
+            query_customer_history_usecase=query_customer,
+            require_permissions=require_permissions,
         )
 
     async def dingtalk_outbound_handler(task_data):
@@ -90,6 +118,8 @@ async def main():
     try:
         await runtime.run()
     finally:
+        if ai_provider is not None:
+            await ai_provider.aclose()
         await erp_adapter.aclose()
         await sender.aclose()
         await redis_client.aclose()

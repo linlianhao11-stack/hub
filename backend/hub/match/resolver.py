@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class MatchOutcome(str, Enum):
+class MatchOutcome(StrEnum):
     UNIQUE = "unique"
     MULTI = "multi"
     NONE = "none"
