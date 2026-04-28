@@ -7,9 +7,11 @@
     '钉钉 AppSecret xxx'
 """
 from __future__ import annotations
+
 from functools import lru_cache
+
 from hub.config import get_settings
-from hub.crypto.aes_gcm import encrypt, decrypt, DecryptError
+from hub.crypto.aes_gcm import DecryptError, decrypt, encrypt
 from hub.crypto.hkdf import derive_key
 
 

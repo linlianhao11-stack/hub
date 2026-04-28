@@ -1,5 +1,6 @@
 """IntentParser Protocol：意图解析。"""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Protocol
 

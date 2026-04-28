@@ -1,5 +1,6 @@
 """CapabilityProvider Protocol：通用能力（AI / OCR / SMS 等）。"""
 from __future__ import annotations
+
 from typing import Protocol
 
 

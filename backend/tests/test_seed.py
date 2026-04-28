@@ -3,8 +3,8 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_seed_creates_6_roles():
-    from hub.seed import run_seed
     from hub.models import HubRole
+    from hub.seed import run_seed
     await run_seed()
     roles = await HubRole.all()
     codes = {r.code for r in roles}
@@ -17,8 +17,8 @@ async def test_seed_creates_6_roles():
 
 @pytest.mark.asyncio
 async def test_seed_creates_all_permissions():
-    from hub.seed import run_seed
     from hub.models import HubPermission
+    from hub.seed import run_seed
     await run_seed()
     perms = await HubPermission.all()
     codes = {p.code for p in perms}
@@ -37,8 +37,8 @@ async def test_seed_creates_all_permissions():
 @pytest.mark.asyncio
 async def test_seed_idempotent():
     """跑两次种子结果不变（不重复创建）。"""
+    from hub.models import HubPermission, HubRole
     from hub.seed import run_seed
-    from hub.models import HubRole, HubPermission
     await run_seed()
     n_roles_1 = await HubRole.all().count()
     n_perms_1 = await HubPermission.all().count()
@@ -52,8 +52,8 @@ async def test_seed_idempotent():
 @pytest.mark.asyncio
 async def test_seed_role_permission_links():
     """platform_admin 应有所有 platform.* 权限。"""
-    from hub.seed import run_seed
     from hub.models import HubRole
+    from hub.seed import run_seed
     await run_seed()
     admin = await HubRole.get(code="platform_admin").prefetch_related("permissions")
     perms = [p async for p in admin.permissions]

@@ -10,8 +10,11 @@
 - 缺失 → 401；不匹配 → 403
 """
 from __future__ import annotations
+
 import secrets
+
 from fastapi import Header, HTTPException
+
 from hub.config import get_settings
 
 

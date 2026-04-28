@@ -52,7 +52,7 @@ services:
       context: .
       dockerfile: Dockerfile.migrate
     environment:
-      HUB_DATABASE_URL: postgresql://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
+      HUB_DATABASE_URL: postgres://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
     depends_on:
       hub-postgres:
         condition: service_healthy
@@ -67,7 +67,7 @@ services:
     env_file:
       - .env
     environment:
-      HUB_DATABASE_URL: postgresql://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
+      HUB_DATABASE_URL: postgres://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
       HUB_REDIS_URL: redis://hub-redis:6379/0
     ports:
       - "8091:8091"
@@ -94,7 +94,7 @@ services:
     env_file:
       - .env
     environment:
-      HUB_DATABASE_URL: postgresql://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
+      HUB_DATABASE_URL: postgres://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
       HUB_REDIS_URL: redis://hub-redis:6379/0
     depends_on:
       hub-migrate:

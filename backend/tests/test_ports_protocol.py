@@ -1,10 +1,7 @@
-import pytest
 
 
 def test_channel_adapter_protocol_imports():
-    from hub.ports import (
-        ChannelAdapter, InboundMessage, OutboundMessage, OutboundMessageType
-    )
+    from hub.ports import ChannelAdapter, InboundMessage
     assert ChannelAdapter is not None
     msg = InboundMessage(
         channel_type="dingtalk", channel_userid="m1",
@@ -20,23 +17,23 @@ def test_downstream_adapter_protocol_imports():
 
 
 def test_capability_provider_protocol_imports():
-    from hub.ports import CapabilityProvider, AICapability
+    from hub.ports import AICapability
     assert AICapability is not None
 
 
 def test_intent_parser_imports():
-    from hub.ports import IntentParser, ParsedIntent
+    from hub.ports import ParsedIntent
     intent = ParsedIntent(intent_type="query_product", fields={"sku": "X"}, confidence=0.9)
     assert intent.confidence == 0.9
 
 
 def test_task_runner_imports():
-    from hub.ports import TaskRunner, TaskStatus
+    from hub.ports import TaskStatus
     assert TaskStatus.QUEUED.value == "queued"
 
 
 def test_pricing_strategy_imports():
-    from hub.ports import PricingStrategy, PriceInfo
+    from hub.ports import PriceInfo
     p = PriceInfo(unit_price="100.00", source="retail", customer_id=None)
     assert p.unit_price == "100.00"
 

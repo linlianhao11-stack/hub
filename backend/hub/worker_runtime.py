@@ -7,9 +7,11 @@
 - 提供 run_once()：测试单步消费，避免 stop() 无法中断长 block 的问题
 """
 from __future__ import annotations
+
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
+
 from hub.queue import RedisStreamsRunner
 
 logger = logging.getLogger("hub.worker")
@@ -42,6 +44,7 @@ class WorkerRuntime:
         if self._redis_client is not None:
             return self._redis_client
         from redis.asyncio import Redis
+
         from hub.config import get_settings
         return Redis.from_url(get_settings().redis_url, decode_responses=False)
 

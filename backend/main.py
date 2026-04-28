@@ -1,13 +1,16 @@
 """HUB Gateway 进程入口。"""
 from __future__ import annotations
+
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from hub.config import get_settings
-from hub.database import init_db, close_db
-from hub.routers import health, setup
 
+from hub.config import get_settings
+from hub.database import close_db, init_db
+from hub.routers import health, setup
 
 logger = logging.getLogger("hub")
 
@@ -25,12 +28,13 @@ async def lifespan(app: FastAPI):
     await run_seed()
 
     # 3. 首启动检测：未初始化（system_initialized=false）且无未使用 token → 生成并打印
-    from hub.models import SystemConfig, BootstrapToken
-    from datetime import datetime, timezone
+    from datetime import datetime
+
+    from hub.models import BootstrapToken, SystemConfig
     initialized = await SystemConfig.filter(key="system_initialized", value=True).exists()
     if not initialized:
         active_token = await BootstrapToken.filter(
-            used_at__isnull=True, expires_at__gt=datetime.now(timezone.utc),
+            used_at__isnull=True, expires_at__gt=datetime.now(UTC),
         ).exists()
         if not active_token:
             from hub.auth.bootstrap_token import generate_token

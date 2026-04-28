@@ -1,11 +1,13 @@
 """ChannelAdapter Protocol：接入端协议适配（钉钉/企微/Web 等）。"""
 from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Protocol, Callable, Awaitable, Any
+from enum import StrEnum
+from typing import Protocol
 
 
-class OutboundMessageType(str, Enum):
+class OutboundMessageType(StrEnum):
     TEXT = "text"
     MARKDOWN = "markdown"
     ACTIONCARD = "actioncard"

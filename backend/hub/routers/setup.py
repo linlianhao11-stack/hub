@@ -4,12 +4,15 @@
 其余步骤（注册 ERP / 创建 admin / 钉钉 / AI / 完成）由 Plan 5 实现。
 """
 from __future__ import annotations
+
 import secrets
-from fastapi import APIRouter, HTTPException, Request, Body
+
+from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel
 from tortoise import connections
-from hub.config import get_settings
+
 from hub.auth.bootstrap_token import verify_and_consume_token
+from hub.config import get_settings
 from hub.models import SystemConfig
 
 router = APIRouter(prefix="/hub/v1/setup", tags=["setup"])

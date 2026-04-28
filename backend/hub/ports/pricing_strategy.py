@@ -1,5 +1,6 @@
 """PricingStrategy Protocol：价格策略（fallback 链可插拔）。"""
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Protocol
 

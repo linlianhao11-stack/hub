@@ -1,8 +1,11 @@
 """健康检查 endpoint。"""
 from __future__ import annotations
+
 import time
+
 from fastapi import APIRouter
 from tortoise import connections
+
 from hub import __version__
 
 router = APIRouter(prefix="/hub/v1", tags=["health"])

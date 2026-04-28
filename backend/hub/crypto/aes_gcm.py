@@ -4,9 +4,10 @@
 nonce 由系统随机生成，每次加密一个新的 nonce。
 """
 from __future__ import annotations
-import secrets
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+import secrets
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 NONCE_LENGTH = 12
 

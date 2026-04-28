@@ -1,5 +1,6 @@
+from datetime import UTC, datetime
+
 import pytest
-from datetime import datetime, timezone
 
 
 @pytest.mark.asyncio
@@ -12,7 +13,7 @@ async def test_hub_user_create():
 
 @pytest.mark.asyncio
 async def test_channel_user_binding_unique():
-    from hub.models import HubUser, ChannelUserBinding
+    from hub.models import ChannelUserBinding, HubUser
     u = await HubUser.create(display_name="x")
     await ChannelUserBinding.create(
         hub_user=u, channel_type="dingtalk", channel_userid="m1",
@@ -26,7 +27,7 @@ async def test_channel_user_binding_unique():
 
 @pytest.mark.asyncio
 async def test_downstream_identity_unique_per_downstream():
-    from hub.models import HubUser, DownstreamIdentity
+    from hub.models import DownstreamIdentity, HubUser
     u = await HubUser.create(display_name="y")
     await DownstreamIdentity.create(hub_user=u, downstream_type="erp", downstream_user_id=42)
     from tortoise.exceptions import IntegrityError
@@ -36,7 +37,7 @@ async def test_downstream_identity_unique_per_downstream():
 
 @pytest.mark.asyncio
 async def test_hub_role_permission_many_to_many():
-    from hub.models import HubRole, HubPermission
+    from hub.models import HubPermission, HubRole
     role = await HubRole.create(code="r1", name="角色 1", is_builtin=False)
     perm = await HubPermission.create(
         code="p1", resource="platform", sub_resource="x", action="read",
@@ -60,7 +61,7 @@ async def test_task_log_and_payload_relationship():
         task_log=t,
         encrypted_request=b"\x00" * 32,
         encrypted_response=b"\x00" * 32,
-        expires_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(UTC),
     )
     assert p.task_log_id == t.id
 

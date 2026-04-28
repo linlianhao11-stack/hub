@@ -1,7 +1,7 @@
 """启动时跑预设角色 + 权限码种子（幂等）。"""
 from __future__ import annotations
-from hub.models import HubRole, HubPermission
 
+from hub.models import HubPermission, HubRole
 
 # 全部权限码（spec §7.4）
 PERMISSIONS = [

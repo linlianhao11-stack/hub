@@ -4,9 +4,9 @@
 bootstrap token 哈希等）应使用各自派生的子密钥，避免密钥多用。
 """
 from __future__ import annotations
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
 
 HUB_HKDF_SALT = b"hub-middleware-2026"
 

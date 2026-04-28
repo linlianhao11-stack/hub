@@ -1,5 +1,5 @@
+
 import pytest
-import asyncio
 from fakeredis import aioredis as fakeredis_aio
 
 
@@ -38,7 +38,7 @@ async def test_consume_one_task(fake_redis):
 async def test_ack_marks_handled(fake_redis):
     from hub.queue.redis_streams import RedisStreamsRunner
     runner = RedisStreamsRunner(redis_client=fake_redis, stream_name="hub:tasks:default")
-    tid = await runner.submit("t", {})
+    await runner.submit("t", {})
     await runner.ensure_consumer_group("hub-workers")
     msgs = await runner.read_one("hub-workers", "c1", block_ms=10)
     msg_id, _ = msgs[0]

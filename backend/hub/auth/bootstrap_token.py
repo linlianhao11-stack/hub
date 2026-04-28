@@ -6,10 +6,12 @@
 - 生产场景：HUB 一次性 token 不存在"反复尝试"的攻击面（一次性 + 30 分钟 TTL + verify_and_consume 原子消费）
 """
 from __future__ import annotations
+
 import hashlib
 import hmac
 import secrets
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
+
 from hub.config import get_settings
 from hub.models import BootstrapToken
 
@@ -40,7 +42,7 @@ async def generate_token(ttl_seconds: int = 1800) -> str:
     """
     settings = get_settings()
     plaintext = settings.setup_token or secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
     salt = secrets.token_bytes(32)
     token_hash = _hash_token(plaintext, salt)
     await BootstrapToken.create(token_hash=token_hash, expires_at=expires_at)
@@ -58,7 +60,7 @@ async def verify_token(plaintext: str) -> bool:
         return False
     candidates = await BootstrapToken.filter(
         used_at__isnull=True,
-        expires_at__gt=datetime.now(timezone.utc),
+        expires_at__gt=datetime.now(UTC),
     ).order_by("-created_at").limit(20)
 
     for candidate in candidates:
@@ -73,7 +75,7 @@ async def mark_used(plaintext: str) -> None:
     candidates = await BootstrapToken.filter(used_at__isnull=True)
     for candidate in candidates:
         if _verify_hash(plaintext, candidate.token_hash):
-            candidate.used_at = datetime.now(timezone.utc)
+            candidate.used_at = datetime.now(UTC)
             await candidate.save()
             return
 
@@ -91,7 +93,7 @@ async def verify_and_consume_token(plaintext: str) -> bool:
         return False
     candidates = await BootstrapToken.filter(
         used_at__isnull=True,
-        expires_at__gt=datetime.now(timezone.utc),
+        expires_at__gt=datetime.now(UTC),
     ).order_by("-created_at").limit(20)
 
     for candidate in candidates:
@@ -100,6 +102,6 @@ async def verify_and_consume_token(plaintext: str) -> bool:
         # 哈希命中 → 用 UPDATE WHERE used_at IS NULL 原子标记
         rows = await BootstrapToken.filter(
             id=candidate.id, used_at__isnull=True,
-        ).update(used_at=datetime.now(timezone.utc))
+        ).update(used_at=datetime.now(UTC))
         return rows > 0  # 1 = 我赢了，0 = 并发别人先消费了
     return False

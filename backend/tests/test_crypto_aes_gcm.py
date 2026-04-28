@@ -1,10 +1,11 @@
-import pytest
 import secrets
+
+import pytest
 
 
 def test_aes_gcm_round_trip():
     """加密后能解密回原文。"""
-    from hub.crypto.aes_gcm import encrypt, decrypt
+    from hub.crypto.aes_gcm import decrypt, encrypt
     key = secrets.token_bytes(32)
     plaintext = "hello 世界 🚀"
     ciphertext = encrypt(key, plaintext)
@@ -14,7 +15,7 @@ def test_aes_gcm_round_trip():
 
 def test_aes_gcm_tampered_ciphertext_rejected():
     """密文被篡改时解密抛异常（GCM auth tag 校验）。"""
-    from hub.crypto.aes_gcm import encrypt, decrypt, DecryptError
+    from hub.crypto.aes_gcm import DecryptError, decrypt, encrypt
     key = secrets.token_bytes(32)
     ciphertext = encrypt(key, "secret")
     tampered = bytes([ciphertext[0] ^ 0xFF]) + ciphertext[1:]
@@ -24,7 +25,7 @@ def test_aes_gcm_tampered_ciphertext_rejected():
 
 def test_aes_gcm_wrong_key_rejected():
     """用错 key 解密应失败。"""
-    from hub.crypto.aes_gcm import encrypt, decrypt, DecryptError
+    from hub.crypto.aes_gcm import DecryptError, decrypt, encrypt
     key1 = secrets.token_bytes(32)
     key2 = secrets.token_bytes(32)
     ciphertext = encrypt(key1, "secret")

@@ -1,5 +1,5 @@
 import pytest
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 
 
 @pytest.fixture
@@ -66,6 +66,7 @@ async def test_setup_token_one_time_use(app_client):
 async def test_setup_token_concurrent_consume_only_one_wins(app_client):
     """并发场景：两个请求同时 verify 同一 token，只有一个能拿到 session。"""
     import asyncio
+
     from hub.auth.bootstrap_token import generate_token
     plain = await generate_token(ttl_seconds=300)
 

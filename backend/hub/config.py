@@ -4,6 +4,7 @@
 它们走 Web UI + 数据库加密存储（见 hub.crypto + hub.models.config）。
 """
 from __future__ import annotations
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 

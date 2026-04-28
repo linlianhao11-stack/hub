@@ -13,10 +13,11 @@ Stream 设计：
   submitted_at
 """
 from __future__ import annotations
+
 import json
 import secrets
 import time
-from typing import Any
+
 from redis.asyncio import Redis
 
 

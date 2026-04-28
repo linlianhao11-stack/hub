@@ -1,9 +1,9 @@
 """HUB Worker 进程入口。"""
 import asyncio
 import logging
-from hub.database import init_db, close_db
-from hub.worker_runtime import WorkerRuntime
 
+from hub.database import close_db, init_db
+from hub.worker_runtime import WorkerRuntime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hub.worker")

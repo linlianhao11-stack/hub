@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from tortoise import fields
 from tortoise.models import Model
 
@@ -11,7 +12,7 @@ class HubRole(Model):
     is_builtin = fields.BooleanField(default=False)
     created_at = fields.DatetimeField(auto_now_add=True)
 
-    permissions: fields.ManyToManyRelation["HubPermission"] = fields.ManyToManyField(
+    permissions: fields.ManyToManyRelation[HubPermission] = fields.ManyToManyField(
         "models.HubPermission", related_name="roles", through="hub_role_permission",
     )
 
@@ -28,7 +29,7 @@ class HubPermission(Model):
     name = fields.CharField(max_length=100)  # UI 中文名
     description = fields.TextField(null=True)
 
-    roles: fields.ManyToManyRelation["HubRole"]
+    roles: fields.ManyToManyRelation[HubRole]
 
     class Meta:
         table = "hub_permission"

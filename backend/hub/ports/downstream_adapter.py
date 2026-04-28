@@ -4,6 +4,7 @@
 acting_as_user_id 参数（模型 Y 强制约束）。
 """
 from __future__ import annotations
+
 from typing import Protocol
 
 
