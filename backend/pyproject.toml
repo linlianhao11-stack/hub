@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hub-backend"
+version = "0.1.0"
+description = "HUB 数据中台后端"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi>=0.110,<0.120",
+    "uvicorn[standard]>=0.27",
+    "tortoise-orm[asyncpg]>=0.20,<0.22",
+    "aerich>=0.7,<0.8",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "python-multipart>=0.0.6",
+    "httpx>=0.26",
+    "redis>=5.0",
+    "cryptography>=42.0",
+    "passlib[bcrypt]>=1.7",
+    "python-dateutil>=2.8",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "fakeredis>=2.20",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+# setuptools 包发现：仅扫描 hub/ 这个 namespace，避免把 tests/ migrations/ 当包安装
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hub", "hub.*"]
+exclude = ["tests*", "migrations*"]
+
+[tool.aerich]
+tortoise_orm = "hub.database.TORTOISE_ORM"
+location = "./migrations"
+src_folder = "./hub"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]
