@@ -69,6 +69,7 @@ services:
     environment:
       HUB_DATABASE_URL: postgres://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
       HUB_REDIS_URL: redis://hub-redis:6379/0
+      HUB_ERP_TO_HUB_SECRET: ${HUB_ERP_TO_HUB_SECRET:-}
     ports:
       - "8091:8091"
     depends_on:

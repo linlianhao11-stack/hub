@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from hub.config import get_settings
 from hub.database import close_db, init_db
-from hub.routers import health, setup
+from hub.routers import health, internal_callbacks, setup
 
 logger = logging.getLogger("hub")
 
@@ -76,3 +76,4 @@ app.add_middleware(
 # 路由注册
 app.include_router(health.router)
 app.include_router(setup.router)
+app.include_router(internal_callbacks.router)

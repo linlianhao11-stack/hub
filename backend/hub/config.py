@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # --- 紧急运维 ApiKey ---
     admin_key: str | None = Field(default=None, description="紧急 admin API Key（运维专用）")
 
+    # --- ERP → HUB 反向回调共享密钥 ---
+    erp_to_hub_secret: str | None = Field(
+        default=None, description="ERP 调 HUB confirm-final 时 X-ERP-Secret 头共享密钥",
+    )
+
     @field_validator("master_key")
     @classmethod
     def validate_master_key(cls, v: str) -> str:
