@@ -40,4 +40,7 @@ class DownstreamIdentity(Model):
 
     class Meta:
         table = "downstream_identity"
-        unique_together = (("hub_user_id", "downstream_type"),)
+        unique_together = (
+            ("hub_user_id", "downstream_type"),         # 一个 HUB 用户对每种下游只有一个身份
+            ("downstream_type", "downstream_user_id"),  # Plan 3：一个下游用户只能被一个 HUB 用户绑定
+        )

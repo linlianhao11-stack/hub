@@ -7,6 +7,7 @@ from hub.models.audit import AuditLog, MetaAuditLog, TaskLog, TaskPayload
 from hub.models.bootstrap import BootstrapToken
 from hub.models.cache import ErpUserStateCache
 from hub.models.config import AIProvider, ChannelApp, DownstreamSystem, SystemConfig
+from hub.models.consumed_token import ConsumedBindingToken
 from hub.models.identity import ChannelUserBinding, DownstreamIdentity, HubUser
 from hub.models.rbac import HubPermission, HubRole, HubUserRole
 
@@ -17,4 +18,5 @@ __all__ = [
     "TaskLog", "TaskPayload", "AuditLog", "MetaAuditLog",
     "ErpUserStateCache",
     "BootstrapToken",
+    "ConsumedBindingToken",
 ]
