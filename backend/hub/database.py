@@ -18,7 +18,8 @@ def _resolve_db_url() -> str:
     url = os.environ.get("HUB_DATABASE_URL")
     if not url:
         raise RuntimeError(
-            "HUB_DATABASE_URL 未设置。运行 aerich 命令前请 export HUB_DATABASE_URL=postgresql://..."
+            "HUB_DATABASE_URL 未设置。运行 aerich 命令前请 export HUB_DATABASE_URL=postgres://..."
+            "（注意：Tortoise 识别 postgres:// scheme，不识别 postgresql://）"
         )
     return url
 
