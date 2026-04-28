@@ -1,6 +1,7 @@
 """HUB Gateway 进程入口。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC
@@ -13,6 +14,39 @@ from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup
 
 logger = logging.getLogger("hub")
+
+
+async def _start_dingtalk_stream(app: FastAPI) -> None:
+    """装配钉钉 Stream + sender，把入站消息转 dingtalk_inbound 任务投到 Redis Streams。
+
+    缺配置不报错，只记 warn——首启动时还没人配钉钉是正常的。
+    """
+    from hub.ports import InboundMessage
+    from hub.runtime import bootstrap_dingtalk_clients
+    clients = await bootstrap_dingtalk_clients(with_stream=True)
+    app.state.dingtalk_clients = clients
+
+    if clients.dingtalk_stream is None:
+        logger.warning("DingTalkStreamAdapter 未启动（钉钉应用未配置）")
+        return
+
+    runner = app.state.task_runner
+
+    async def _on_message(msg: InboundMessage) -> None:
+        await runner.submit("dingtalk_inbound", {
+            "channel_userid": msg.channel_userid,
+            "conversation_id": msg.conversation_id,
+            "content": msg.content,
+            "content_type": msg.content_type,
+            "timestamp": msg.timestamp,
+        })
+
+    clients.dingtalk_stream.on_message(_on_message)
+    # Stream.start() 会阻塞跑长连接；放后台任务里跑
+    app.state.dingtalk_stream_task = asyncio.create_task(
+        clients.dingtalk_stream.start(), name="dingtalk_stream",
+    )
+    logger.info("DingTalkStreamAdapter 已启动（后台 task）")
 
 
 @asynccontextmanager
@@ -51,9 +85,37 @@ async def lifespan(app: FastAPI):
                 f"{'='*60}"
             )
 
+    # 4. 装配 task_runner（confirm-final 回调 + 入站消息都需要它把 task 投到 Redis Streams）
+    from redis.asyncio import Redis
+
+    from hub.queue import RedisStreamsRunner
+    redis = Redis.from_url(settings.redis_url, decode_responses=False)
+    app.state.redis = redis
+    app.state.task_runner = RedisStreamsRunner(redis_client=redis)
+
+    # 5. 已初始化才启钉钉 Stream（首启动时还没钉钉配置，无意义）
+    if initialized:
+        await _start_dingtalk_stream(app)
+    else:
+        app.state.dingtalk_clients = None
+
     yield
 
     logger.info("HUB Gateway 关闭")
+    # 反向关：Stream → sender/erp_adapter → redis → db
+    stream_task = getattr(app.state, "dingtalk_stream_task", None)
+    if stream_task is not None:
+        stream_task.cancel()
+        try:
+            await stream_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    clients = getattr(app.state, "dingtalk_clients", None)
+    if clients is not None:
+        await clients.aclose()
+    redis = getattr(app.state, "redis", None)
+    if redis is not None:
+        await redis.aclose()
     await close_db()
 
 
