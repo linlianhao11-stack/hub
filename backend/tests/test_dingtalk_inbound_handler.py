@@ -132,6 +132,37 @@ async def test_disabled_erp_user_blocked():
 
 
 @pytest.mark.asyncio
+async def test_sender_failure_propagates_so_runtime_can_dead_letter():
+    """sender.send_text 抛错时异常向上冒泡，让 WorkerRuntime 转死信。
+
+    回归 P2：早期版本捕获并吞异常 → 钉钉短暂故障时用户收不到回复，
+    任务也不会重试或进死信，问题被静默掩盖。
+    """
+    from hub.handlers.dingtalk_inbound import handle_inbound
+    from hub.services.identity_service import IdentityResolution
+
+    identity_svc = AsyncMock()
+    identity_svc.resolve = AsyncMock(return_value=IdentityResolution(
+        found=True, erp_active=True, hub_user_id=1, erp_user_id=42,
+    ))
+    sender = AsyncMock()
+    sender.send_text = AsyncMock(side_effect=RuntimeError("dingtalk down"))
+
+    payload = {
+        "task_id": "tX", "task_type": "dingtalk_inbound",
+        "payload": {
+            "channel_userid": "m1", "content": "随便说点啥",
+            "conversation_id": "c1", "timestamp": 1700000000,
+        },
+    }
+    with pytest.raises(RuntimeError, match="dingtalk down"):
+        await handle_inbound(
+            payload, binding_service=AsyncMock(),
+            identity_service=identity_svc, sender=sender,
+        )
+
+
+@pytest.mark.asyncio
 async def test_active_user_unrecognized_command():
     """已绑定 + ERP 启用 → 未识别命令提示帮助。"""
     from hub.handlers.dingtalk_inbound import handle_inbound

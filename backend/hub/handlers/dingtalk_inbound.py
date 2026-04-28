@@ -97,7 +97,9 @@ async def handle_inbound(
 
 
 async def _send_text(sender, userid: str, text: str) -> None:
-    try:
-        await sender.send_text(dingtalk_userid=userid, text=text)
-    except Exception:
-        logger.exception(f"send_text 失败 userid={userid}")
+    """发送失败让异常上抛，由 WorkerRuntime 转入死信流，不静默 ACK。
+
+    早期版本捕获并吞异常 → 钉钉短暂故障时用户收不到回复，
+    任务也不会重试或进死信，问题被掩盖。
+    """
+    await sender.send_text(dingtalk_userid=userid, text=text)

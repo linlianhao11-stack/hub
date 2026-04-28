@@ -26,11 +26,11 @@ class BindingResult:
     note: str | None = None  # already_consumed / conflict / created / reactivated
 
 
-class _AlreadyConsumed(Exception):
+class _AlreadyConsumedError(Exception):
     """内部异常：用于 confirm_final 事务内传递"已消费"信号。"""
 
 
-class _Conflict(Exception):
+class _ConflictError(Exception):
     """内部异常：用于 confirm_final 事务内传递冲突信号（事务回滚不消费 token）。"""
 
     def __init__(self, reply: str, code: str):
@@ -118,7 +118,7 @@ class BindingService:
                         erp_token_id=token_id, hub_user_id=0,
                     )
                 except IntegrityError as e:
-                    raise _AlreadyConsumed() from e
+                    raise _AlreadyConsumedError() from e
 
                 # 冲突检查：dingtalk → 不同 ERP
                 existing_binding = await ChannelUserBinding.filter(
@@ -129,7 +129,7 @@ class BindingService:
                         hub_user_id=existing_binding.hub_user_id, downstream_type="erp",
                     ).first()
                     if existing_di and existing_di.downstream_user_id != erp_user_id:
-                        raise _Conflict(
+                        raise _ConflictError(
                             "该钉钉账号已绑定到其他 ERP 用户。如需换绑请先发送 /解绑。",
                             "conflict_dingtalk_already_bound",
                         )
@@ -144,7 +144,7 @@ class BindingService:
                         channel_type="dingtalk", status="active",
                     ).first()
                     if other_active and other_active.channel_userid != dingtalk_userid:
-                        raise _Conflict(
+                        raise _ConflictError(
                             "该 ERP 用户已被另一个钉钉账号占用，请联系管理员解绑后再绑。",
                             "conflict_erp_user_owned",
                         )
@@ -185,7 +185,7 @@ class BindingService:
                             downstream_user_id=erp_user_id,
                         )
                     except IntegrityError as e:
-                        raise _Conflict(
+                        raise _ConflictError(
                             "该 ERP 用户已被另一个钉钉账号占用，请联系管理员解绑后再绑。",
                             "conflict_erp_user_owned",
                         ) from e
@@ -194,7 +194,7 @@ class BindingService:
                     try:
                         await di.save()
                     except IntegrityError as e:
-                        raise _Conflict(
+                        raise _ConflictError(
                             "该 ERP 用户已被另一个钉钉账号占用，请联系管理员解绑后再绑。",
                             "conflict_erp_user_owned",
                         ) from e
@@ -216,12 +216,12 @@ class BindingService:
                 note=note,
             )
 
-        except _AlreadyConsumed:
+        except _AlreadyConsumedError:
             existing = await ConsumedBindingToken.filter(erp_token_id=token_id).first()
             return BindingResult(
                 success=True, reply_text="该绑定请求已处理",
                 hub_user_id=existing.hub_user_id if existing else None,
                 note="already_consumed",
             )
-        except _Conflict as e:
+        except _ConflictError as e:
             return BindingResult(success=False, reply_text=e.reply, note=e.code)

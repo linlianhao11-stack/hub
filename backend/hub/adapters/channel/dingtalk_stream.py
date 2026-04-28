@@ -48,6 +48,16 @@ class _HubChatbotHandler(ChatbotHandler):
         self._callback = callback
 
     async def process(self, callback):
+        """钉钉 Stream 回调入口。
+
+        ACK 语义至关重要：如果回调（投递 dingtalk_inbound 任务到 Redis Streams）
+        失败仍 ACK，钉钉会认为消息已处理且不会重投——HUB 这边却没收到任务，
+        **入站消息被静默丢失**。所以业务回调失败时必须返回 STATUS_SYSTEM_EXCEPTION
+        让钉钉重投。
+
+        解析失败（比如 raw_payload 字段缺失）属于消息体本身有问题，重投也无意义；
+        这种 ack 掉避免无限重试。
+        """
         try:
             data = callback.data if hasattr(callback, "data") else (callback or {})
             ts_ms = data.get("createAt") or 0
@@ -60,13 +70,22 @@ class _HubChatbotHandler(ChatbotHandler):
                 timestamp=int(ts_ms // 1000),
                 raw_payload=data,
             )
-            if self._callback is not None:
-                await self._callback(msg)
-            else:
-                logger.warning("收到钉钉消息但未注册业务回调")
         except Exception:
-            logger.exception("钉钉入站消息处理异常")
-        # 无论成功失败都 ack（错误已记日志；具体重试由业务/任务队列负责）
+            logger.exception("钉钉入站消息解析异常（消息体本身有问题，ack 掉不重投）")
+            return AckMessage.STATUS_OK, "OK"
+
+        if self._callback is None:
+            logger.warning("收到钉钉消息但未注册业务回调")
+            return AckMessage.STATUS_OK, "OK"
+
+        try:
+            await self._callback(msg)
+        except Exception:
+            # 业务回调失败（如 Redis 短暂不可用 → runner.submit 抛错）：
+            # 不 ACK，让钉钉按其重投策略重新派发，避免消息丢失。
+            logger.exception("钉钉业务回调失败，返回 SYSTEM_EXCEPTION 让钉钉重投")
+            return AckMessage.STATUS_SYSTEM_EXCEPTION, "EX"
+
         return AckMessage.STATUS_OK, "OK"
 
 

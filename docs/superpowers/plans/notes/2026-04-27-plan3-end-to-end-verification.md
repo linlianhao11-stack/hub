@@ -5,13 +5,11 @@
 
 ## 验证项
 
-### 1. 单元测试（Plan 3 共 49 PASS）
+### 1. 单元测试（Plan 3 共 55 PASS）
 
 ```
 $ cd backend && .venv/bin/pytest -q
-......................................................................   [69%]
-................................                                         [100%]
-104 passed in 10.81s
+107 passed
 ```
 
 | 测试文件 | 数量 | 状态 |
@@ -19,17 +17,17 @@ $ cd backend && .venv/bin/pytest -q
 | `tests/test_erp4_adapter.py` | 5 | ✅ |
 | `tests/test_erp_active_cache.py` | 4 | ✅ |
 | `tests/test_identity_service.py` | 5 | ✅ |
-| `tests/test_dingtalk_stream_adapter.py` | 3 | ✅ |
+| `tests/test_dingtalk_stream_adapter.py` | 5 | ✅（含 review 加的回调失败/解析失败两条） |
 | `tests/test_dingtalk_sender.py` | 3 | ✅ |
-| `tests/test_binding_service.py` | 11 | ✅ |
-| `tests/test_dingtalk_inbound_handler.py` | 6 | ✅ |
+| `tests/test_binding_service.py` | 14 | ✅ |
+| `tests/test_dingtalk_inbound_handler.py` | 7 | ✅（含 review 加的 sender 失败异常向上冒泡） |
 | `tests/test_dingtalk_outbound_handler.py` | 3 | ✅ |
 | `tests/test_internal_callbacks.py` | 4 | ✅ |
 | `tests/test_dingtalk_user_sync.py` | 2 | ✅ |
 | `tests/test_dingtalk_connect.py` | 3 | ✅ |
-| **Plan 3 合计** | **49** | ✅ |
-| Plan 2 既有测试 | 55 | ✅ |
-| **总计** | **104** | ✅ |
+| **Plan 3 合计** | **55** | ✅ |
+| Plan 2 既有测试 | 52 | ✅ |
+| **总计** | **107** | ✅ |
 
 ### 2. docker compose 4 容器全绿
 

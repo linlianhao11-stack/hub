@@ -19,7 +19,10 @@ cp .env.example .env
 # 2. 启动 OrbStack（如未启动）
 orb start
 
-# 3. 启动 4 容器
+# 3. **首次部署或拉新代码后**：先 rebuild 镜像，再起容器
+#    （docker compose up -d 默认复用本地缓存镜像；如果代码新增了路由/迁移
+#    而镜像未重新 build，会出现 confirm-final 路由 404 或迁移表缺失等问题）
+docker compose build hub-gateway hub-worker hub-migrate
 docker compose up -d
 
 # 4. 看启动日志拿初始化 token
@@ -27,6 +30,11 @@ docker compose logs hub-gateway | grep -A5 "初始化 Token"
 
 # 5. 浏览器访问 http://<host>:8091/setup
 #    粘贴上面的 token，按向导走完
+
+# 拉新代码升级
+git pull
+docker compose build hub-gateway hub-worker hub-migrate
+docker compose up -d  # 自动重建有变化的容器
 ```
 
 ### 本地开发
