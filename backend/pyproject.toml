@@ -42,7 +42,7 @@ exclude = ["tests*", "migrations*"]
 [tool.aerich]
 tortoise_orm = "hub.database.TORTOISE_ORM"
 location = "./migrations"
-src_folder = "./hub"
+src_folder = "./."
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
