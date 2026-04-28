@@ -7,10 +7,15 @@
 
 ERP /products + /customers 接口的搜索参数名是 `keyword`（不是 `q`），见
 docs/integration/2026-04-27-fuzzy-search-audit.md（ERP 仓库）。
+
+熔断器（Plan 4）：5/30s 失败 → 60s 开 → half-open；只统计 ErpSystemError，
+4xx 业务错不计入避免污染熔断。历史价查询 3s 超时（spec §13.4）。
 """
 from __future__ import annotations
 
 import httpx
+
+from hub.circuit_breaker import CircuitBreaker
 
 
 class ErpAdapterError(Exception):
@@ -48,6 +53,11 @@ class Erp4Adapter:
         # transport 注入便于测试 mock
         self._client = httpx.AsyncClient(
             base_url=self.base_url, timeout=timeout, transport=transport,
+        )
+        # 熔断器：只统计 ErpSystemError，4xx 业务错不计入
+        self._breaker = CircuitBreaker(
+            threshold=5, window_seconds=30, open_seconds=60,
+            countable_exceptions=(ErpSystemError,),
         )
 
     async def aclose(self) -> None:
@@ -89,15 +99,36 @@ class Erp4Adapter:
             "/api/v1/customers", acting_as_user_id, params={"keyword": query},
         )
 
+    async def get_product(self, product_id: int, *, acting_as_user_id: int | None) -> dict:
+        """精确反查（不依赖 keyword 模糊搜索；PricingStrategy fallback 用）。"""
+        return await self._act_as_get(
+            f"/api/v1/products/{product_id}", acting_as_user_id,
+        )
+
     async def get_product_customer_prices(
         self, product_id: int, customer_id: int, limit: int = 5,
         *, acting_as_user_id: int | None,
     ) -> dict:
-        return await self._act_as_get(
-            f"/api/v1/products/{product_id}/customer-prices",
-            acting_as_user_id,
-            params={"customer_id": customer_id, "limit": limit},
-        )
+        """历史价查询：3s 超时（spec §13.4），超时抛 ErpSystemError 由上游降级处理。"""
+        if acting_as_user_id is None:
+            raise RuntimeError("acting_as_user_id 必填")
+
+        async def _do():
+            try:
+                r = await self._client.get(
+                    f"/api/v1/products/{product_id}/customer-prices",
+                    headers=self._act_as_headers(acting_as_user_id),
+                    params={"customer_id": customer_id, "limit": limit},
+                    timeout=3.0,
+                )
+                self._raise_for_status(r)
+                return r.json()
+            except httpx.TimeoutException as e:
+                raise ErpSystemError("历史价查询超时（3s）") from e
+            except httpx.RequestError as e:
+                raise ErpSystemError(f"网络错误: {e}") from e
+
+        return await self._breaker.call(_do)
 
     # ------------- 私有 HTTP 方法 -------------
 
@@ -108,36 +139,43 @@ class Erp4Adapter:
         return {"X-API-Key": self.api_key, "X-Acting-As-User-Id": str(acting_as)}
 
     async def _system_get(self, path: str, params: dict | None = None) -> dict:
-        try:
-            r = await self._client.get(path, headers=self._system_headers(), params=params)
-            self._raise_for_status(r)
-            return r.json()
-        except httpx.RequestError as e:
-            raise ErpSystemError(f"网络错误: {e}") from e
+        async def _do():
+            try:
+                r = await self._client.get(path, headers=self._system_headers(), params=params)
+                self._raise_for_status(r)
+                return r.json()
+            except httpx.RequestError as e:
+                raise ErpSystemError(f"网络错误: {e}") from e
+        return await self._breaker.call(_do)
 
     async def _system_post(self, path: str, json: dict) -> dict:
-        try:
-            r = await self._client.post(path, headers=self._system_headers(), json=json)
-            self._raise_for_status(r)
-            return r.json()
-        except httpx.RequestError as e:
-            raise ErpSystemError(f"网络错误: {e}") from e
+        async def _do():
+            try:
+                r = await self._client.post(path, headers=self._system_headers(), json=json)
+                self._raise_for_status(r)
+                return r.json()
+            except httpx.RequestError as e:
+                raise ErpSystemError(f"网络错误: {e}") from e
+        return await self._breaker.call(_do)
 
     async def _act_as_get(
         self, path: str, acting_as_user_id: int | None, params: dict | None = None,
     ) -> dict:
         if acting_as_user_id is None:
             raise RuntimeError(
-                "Erp4Adapter 业务调用必须传 acting_as_user_id（spec §11 模型 Y 强制）"
+                "Erp4Adapter 业务调用必须传 acting_as_user_id（spec §11 模型 Y 强制）",
             )
-        try:
-            r = await self._client.get(
-                path, headers=self._act_as_headers(acting_as_user_id), params=params,
-            )
-            self._raise_for_status(r)
-            return r.json()
-        except httpx.RequestError as e:
-            raise ErpSystemError(f"网络错误: {e}") from e
+
+        async def _do():
+            try:
+                r = await self._client.get(
+                    path, headers=self._act_as_headers(acting_as_user_id), params=params,
+                )
+                self._raise_for_status(r)
+                return r.json()
+            except httpx.RequestError as e:
+                raise ErpSystemError(f"网络错误: {e}") from e
+        return await self._breaker.call(_do)
 
     def _raise_for_status(self, r: httpx.Response) -> None:
         if r.status_code in (401, 403):

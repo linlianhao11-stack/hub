@@ -91,3 +91,75 @@ async def test_403_translated_to_permission_error():
     )
     with pytest.raises(ErpPermissionError):
         await adapter.search_products(query="x", acting_as_user_id=1)
+
+
+@pytest.mark.asyncio
+async def test_search_products_uses_keyword_param():
+    """ERP 搜索参数必须是 keyword（与 ERP-4 实际接口对齐），不是 q。"""
+    from hub.adapters.downstream.erp4 import Erp4Adapter
+
+    captured = {}
+
+    def handler(req):
+        captured["url"] = str(req.url)
+        return Response(200, json={"items": []})
+
+    adapter = Erp4Adapter(
+        base_url="http://x", api_key="k", transport=MockTransport(handler),
+    )
+    await adapter.search_products(query="SKU100", acting_as_user_id=1)
+    assert "keyword=SKU100" in captured["url"]
+    assert "q=SKU100" not in captured["url"]
+
+
+@pytest.mark.asyncio
+async def test_search_customers_uses_keyword_param():
+    from hub.adapters.downstream.erp4 import Erp4Adapter
+
+    captured = {}
+
+    def handler(req):
+        captured["url"] = str(req.url)
+        return Response(200, json={"items": []})
+
+    adapter = Erp4Adapter(
+        base_url="http://x", api_key="k", transport=MockTransport(handler),
+    )
+    await adapter.search_customers(query="阿里", acting_as_user_id=1)
+    assert "keyword=" in captured["url"]
+    assert "%E9%98%BF%E9%87%8C" in captured["url"] or "阿里" in captured["url"]
+
+
+@pytest.mark.asyncio
+async def test_circuit_opens_after_repeated_failures():
+    from hub.adapters.downstream.erp4 import Erp4Adapter
+    from hub.circuit_breaker import CircuitOpenError
+
+    def handler(req):
+        return Response(503)
+
+    adapter = Erp4Adapter(
+        base_url="http://x", api_key="k", transport=MockTransport(handler),
+    )
+    for _ in range(5):
+        with pytest.raises(Exception):
+            await adapter.search_products(query="x", acting_as_user_id=1)
+    with pytest.raises(CircuitOpenError):
+        await adapter.search_products(query="x", acting_as_user_id=1)
+
+
+@pytest.mark.asyncio
+async def test_customer_prices_timeout_raises_system_error():
+    """历史价查询走 3s 超时；mock 慢响应 → 抛 ErpSystemError。"""
+    from hub.adapters.downstream.erp4 import Erp4Adapter, ErpSystemError
+
+    def handler(req):
+        raise httpx.TimeoutException("timeout")
+
+    adapter = Erp4Adapter(
+        base_url="http://x", api_key="k", transport=MockTransport(handler),
+    )
+    with pytest.raises(ErpSystemError):
+        await adapter.get_product_customer_prices(
+            product_id=1, customer_id=2, acting_as_user_id=42,
+        )
