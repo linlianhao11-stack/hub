@@ -1,0 +1,117 @@
+networks:
+  hub-net:
+    driver: bridge
+
+services:
+  hub-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hub
+      POSTGRES_PASSWORD: ${HUB_POSTGRES_PASSWORD:-hub}
+      POSTGRES_DB: hub
+      TZ: Asia/Shanghai
+    volumes:
+      - hub_pgdata:/var/lib/postgresql/data
+    networks:
+      - hub-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    restart: unless-stopped
+
+  hub-redis:
+    image: redis:7
+    volumes:
+      - ./infra/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - hub_redisdata:/data
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    networks:
+      - hub-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+    restart: unless-stopped
+
+  # 一次性迁移容器：跑完 aerich upgrade 即退出
+  hub-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.migrate
+    environment:
+      HUB_DATABASE_URL: postgresql://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
+    depends_on:
+      hub-postgres:
+        condition: service_healthy
+    networks:
+      - hub-net
+    restart: "no"  # 跑完就退出，不重启
+
+  hub-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    env_file:
+      - .env
+    environment:
+      HUB_DATABASE_URL: postgresql://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
+      HUB_REDIS_URL: redis://hub-redis:6379/0
+    ports:
+      - "8091:8091"
+    depends_on:
+      hub-migrate:
+        condition: service_completed_successfully
+      hub-postgres:
+        condition: service_healthy
+      hub-redis:
+        condition: service_healthy
+    networks:
+      - hub-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    restart: unless-stopped
+
+  hub-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file:
+      - .env
+    environment:
+      HUB_DATABASE_URL: postgresql://hub:${HUB_POSTGRES_PASSWORD:-hub}@hub-postgres:5432/hub
+      HUB_REDIS_URL: redis://hub-redis:6379/0
+    depends_on:
+      hub-migrate:
+        condition: service_completed_successfully
+      hub-postgres:
+        condition: service_healthy
+      hub-redis:
+        condition: service_healthy
+    networks:
+      - hub-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    restart: unless-stopped
+
+volumes:
+  hub_pgdata:
+  hub_redisdata:
