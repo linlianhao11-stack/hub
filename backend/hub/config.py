@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     task_payload_ttl_days: int = Field(default=30)
     task_log_ttl_days: int = Field(default=365)
 
+    # --- 紧急运维 ApiKey ---
+    admin_key: str | None = Field(default=None, description="紧急 admin API Key（运维专用）")
+
     @field_validator("master_key")
     @classmethod
     def validate_master_key(cls, v: str) -> str:
