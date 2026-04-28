@@ -1,7 +1,15 @@
 """HUB 测试基础设施。"""
 import os
+import sys
+from pathlib import Path
+
 import pytest
 from tortoise import Tortoise
+
+# 让测试能 import backend/main.py（不在 hub/ 包内）
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(_BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_ROOT))
 
 
 # 测试数据库连接（CI 通常注入；本地用临时 postgres 5433）
