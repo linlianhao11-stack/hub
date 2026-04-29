@@ -352,3 +352,47 @@ async def test_confirm_final_revoked_binding_can_rebind():
     assert result.success is True
     binding = await ChannelUserBinding.filter(channel_userid="m_rebind").first()
     assert binding.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_confirm_final_attaches_to_existing_hub_user_with_erp_link_no_dingtalk():
+    """ERP user 已有 hub_user（admin 后台/setup wizard 创建）但没绑钉钉 →
+    confirm_final 应复用 hub_user 挂钉钉，不能创建新 hub_user 撞唯一约束 409。
+
+    回归 setup wizard step 3 → 钉钉 /绑定 闭环场景。
+    """
+    from hub.models import ChannelUserBinding, DownstreamIdentity, HubUser
+    from hub.seed import run_seed
+    from hub.services.binding_service import BindingService
+    await run_seed()
+
+    # setup wizard 创建的 admin：hub_user + downstream_identity，但没钉钉绑定
+    existing = await HubUser.create(display_name="setup-admin")
+    await DownstreamIdentity.create(
+        hub_user=existing, downstream_type="erp", downstream_user_id=2,
+    )
+
+    svc = BindingService(erp_adapter=AsyncMock())
+    result = await svc.confirm_final(
+        token_id=8888,
+        dingtalk_userid="m_attach", erp_user_id=2,
+        erp_username="1", erp_display_name="setup-admin",
+    )
+
+    assert result.success is True
+    assert result.note == "attached"
+    assert result.hub_user_id == existing.id
+
+    # 没有创建新 hub_user，只是给已有 hub_user 挂上钉钉绑定
+    users = await HubUser.all()
+    assert len(users) == 1
+    assert users[0].id == existing.id
+
+    binding = await ChannelUserBinding.filter(channel_userid="m_attach").first()
+    assert binding is not None
+    assert binding.hub_user_id == existing.id
+    assert binding.status == "active"
+
+    # downstream_identity 复用已有，不重复
+    dis = await DownstreamIdentity.filter(downstream_type="erp", downstream_user_id=2).all()
+    assert len(dis) == 1

@@ -161,6 +161,22 @@ class BindingService:
                     existing_binding.revoked_reason = None
                     await existing_binding.save()
                     note = "reactivated"
+                elif other_di:
+                    # 该 ERP user 已有 hub_user（admin 后台/setup wizard 创建的）
+                    # 但还没绑钉钉 → 复用 hub_user，挂上钉钉绑定。
+                    # 之前不该走 else 创建新 hub_user 因为 (downstream_type, downstream_user_id)
+                    # 唯一约束会在后面 di create 时撞 IntegrityError → 误抛 conflict_erp_user_owned。
+                    hub_user = await HubUser.get(id=other_di.hub_user_id)
+                    await ChannelUserBinding.create(
+                        hub_user=hub_user, channel_type="dingtalk",
+                        channel_userid=dingtalk_userid,
+                        display_meta={
+                            "erp_username": erp_username,
+                            "erp_display_name": erp_display_name,
+                        },
+                        status="active",
+                    )
+                    note = "attached"
                 else:
                     hub_user = await HubUser.create(display_name=erp_display_name)
                     await ChannelUserBinding.create(

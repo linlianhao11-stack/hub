@@ -66,8 +66,11 @@ async def confirm_final(
             },
         )
 
-    # 仅"首次成功创建/激活/换绑 ERP"才投递通知；replay / already_active 不重复发
-    if result.success and result.note in ("created", "reactivated", "reactivated_with_new_erp"):
+    # 仅"首次成功创建/激活/换绑 ERP / 复用已有 hub_user"才投递通知；
+    # replay / already_active 不重复发
+    if result.success and result.note in (
+        "created", "reactivated", "reactivated_with_new_erp", "attached",
+    ):
         runner = getattr(request.app.state, "task_runner", None)
         if runner:
             from hub import messages as msgs
