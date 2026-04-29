@@ -184,6 +184,53 @@ async def test_history_price_403_translates_to_perm_message():
 
 
 @pytest.mark.asyncio
+async def test_sender_failure_propagates_for_history_render():
+    """历史价渲染 send_text 失败时异常向上冒泡，不静默 ACK。
+
+    回归 P2：早期 _send/_send_message 吞 sender 异常 → 用户收不到回复但任务被 ACK。
+    """
+    erp = AsyncMock()
+    erp.search_customers = AsyncMock(return_value={
+        "items": [{"id": 9, "name": "阿里"}],
+    })
+    erp.search_products = AsyncMock(return_value={
+        "items": [{"id": 1, "sku": "SKU100", "name": "鼠标", "retail_price": "120"}],
+    })
+    erp.get_product_customer_prices = AsyncMock(return_value={"records": []})
+
+    pricing = AsyncMock()
+    pricing.get_price = AsyncMock(return_value=_price(unit_price="120.00", source="retail"))
+
+    sender = AsyncMock()
+    sender.send_text = AsyncMock(side_effect=RuntimeError("dingtalk down"))
+
+    uc = _make_uc(erp, sender, AsyncMock(), pricing)
+    with pytest.raises(RuntimeError, match="dingtalk down"):
+        await uc.execute(
+            sku_or_keyword="SKU100", customer_keyword="阿里",
+            dingtalk_userid="m1", acting_as=42,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sender_failure_propagates_for_error_path():
+    """错误路径（PERM/CIRCUIT/MATCH_NOT_FOUND 文案）的 send_text 失败也要上抛。"""
+    from hub.adapters.downstream.erp4 import ErpPermissionError
+
+    erp = AsyncMock()
+    erp.search_customers = AsyncMock(side_effect=ErpPermissionError("403"))
+    sender = AsyncMock()
+    sender.send_text = AsyncMock(side_effect=RuntimeError("dingtalk down"))
+
+    uc = _make_uc(erp, sender, AsyncMock())
+    with pytest.raises(RuntimeError, match="dingtalk down"):
+        await uc.execute(
+            sku_or_keyword="X", customer_keyword="X",
+            dingtalk_userid="m1", acting_as=42,
+        )
+
+
+@pytest.mark.asyncio
 async def test_circuit_open_returns_friendly():
     from hub.circuit_breaker import CircuitOpenError
     erp = AsyncMock()

@@ -199,22 +199,18 @@ class QueryCustomerHistoryUseCase:
         await self._send_message(dingtalk_userid, card)
 
     async def _send(self, userid: str, text: str) -> None:
-        try:
-            await self.sender.send_text(dingtalk_userid=userid, text=text)
-        except Exception:
-            logger.exception(f"send_text 失败 userid={userid}")
+        """发送失败让异常上抛，由 WorkerRuntime 转入死信流，不静默 ACK。"""
+        await self.sender.send_text(dingtalk_userid=userid, text=text)
 
     async def _send_message(self, userid: str, msg: OutboundMessage) -> None:
-        try:
-            if msg.type.value == "text":
-                await self.sender.send_text(dingtalk_userid=userid, text=msg.text or "")
-            elif msg.type.value == "markdown":
-                await self.sender.send_markdown(
-                    dingtalk_userid=userid, title="HUB", markdown=msg.markdown or "",
-                )
-            else:
-                await self.sender.send_action_card(
-                    dingtalk_userid=userid, actioncard=msg.actioncard or {},
-                )
-        except Exception:
-            logger.exception(f"send 失败 userid={userid}")
+        """同 _send：sender 异常向上抛，不吞掉。"""
+        if msg.type.value == "text":
+            await self.sender.send_text(dingtalk_userid=userid, text=msg.text or "")
+        elif msg.type.value == "markdown":
+            await self.sender.send_markdown(
+                dingtalk_userid=userid, title="HUB", markdown=msg.markdown or "",
+            )
+        else:
+            await self.sender.send_action_card(
+                dingtalk_userid=userid, actioncard=msg.actioncard or {},
+            )

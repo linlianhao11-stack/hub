@@ -3,9 +3,9 @@
 日期：2026-04-28
 执行人：Claude Opus 4.7（自动模式）
 
-## 单测验证（合计 188 PASS）
+## 单测验证（合计 192 PASS）
 
-### Plan 4 新增（84）
+### Plan 4 新增（85）
 
 | 测试文件 | 数量 | 状态 |
 |---|---|---|
@@ -20,11 +20,11 @@
 | `tests/test_conversation_state.py` | 4 | ✅ |
 | `tests/test_pricing_strategy.py` | 7 | ✅（含历史价 403 上抛） |
 | `tests/test_erp_breaker.py` | 6 | ✅（含 countable_exceptions） |
-| `tests/test_query_product_usecase.py` | 8 | ✅（含 execute_selected + fallback_retail_price 透传） |
-| `tests/test_query_customer_history_usecase.py` | 8 | ✅（含历史价 403 → PERM 翻译） |
+| `tests/test_query_product_usecase.py` | 10 | ✅（含 execute_selected + fallback_retail_price 透传 + send 失败上抛 2 条） |
+| `tests/test_query_customer_history_usecase.py` | 10 | ✅（含历史价 403 → PERM 翻译 + send 失败上抛 2 条） |
 | `tests/test_inbound_handler_with_intent.py` | 5 | ✅ |
 | `tests/test_erp4_adapter.py` 追加 | 4 | ✅（keyword 参数 + 熔断 + 历史价超时） |
-| **Plan 4 合计** | **81** | ✅ |
+| **Plan 4 合计** | **85** | ✅ |
 
 ### 既有 Plan 2-3（107，含本轮第六轮 review 修复后）
 
@@ -38,7 +38,7 @@
 
 ```
 $ pytest -q
-188 passed in 19.47s
+192 passed
 ```
 
 ### Lint

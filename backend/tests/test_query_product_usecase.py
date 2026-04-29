@@ -145,6 +145,47 @@ async def test_execute_selected_passes_fallback_retail_to_pricing():
 
 
 @pytest.mark.asyncio
+async def test_sender_failure_propagates_for_unique_render():
+    """sender.send_text 抛错（钉钉短暂故障）时，异常向上冒泡让 WorkerRuntime 转死信。
+
+    回归 P2：早期 _send/_send_message 吞 sender 异常 → 用户收不到卡片但任务被 ACK，
+    问题被掩盖。修复后任何发送失败都让上层转死信。
+    """
+    from hub.usecases.query_product import QueryProductUseCase
+
+    erp = AsyncMock()
+    erp.search_products = AsyncMock(return_value={
+        "items": [{"id": 1, "sku": "SKU100", "name": "鼠标", "retail_price": "120"}],
+    })
+    pricing = AsyncMock()
+    pricing.get_price = AsyncMock(return_value=_price())
+
+    sender = AsyncMock()
+    sender.send_text = AsyncMock(side_effect=RuntimeError("dingtalk down"))
+
+    uc = QueryProductUseCase(erp=erp, pricing=pricing, sender=sender, state=AsyncMock())
+
+    with pytest.raises(RuntimeError, match="dingtalk down"):
+        await uc.execute(sku_or_keyword="SKU100", dingtalk_userid="m1", acting_as=42)
+
+
+@pytest.mark.asyncio
+async def test_sender_failure_propagates_for_error_path():
+    """错误路径（PERM/CIRCUIT/ERP_TIMEOUT 文案）的 send_text 失败也要上抛。"""
+    from hub.adapters.downstream.erp4 import ErpPermissionError
+    from hub.usecases.query_product import QueryProductUseCase
+
+    erp = AsyncMock()
+    erp.search_products = AsyncMock(side_effect=ErpPermissionError("403"))
+    sender = AsyncMock()
+    sender.send_text = AsyncMock(side_effect=RuntimeError("dingtalk down"))
+
+    uc = QueryProductUseCase(erp=erp, pricing=AsyncMock(), sender=sender, state=AsyncMock())
+    with pytest.raises(RuntimeError, match="dingtalk down"):
+        await uc.execute(sku_or_keyword="X", dingtalk_userid="m1", acting_as=42)
+
+
+@pytest.mark.asyncio
 async def test_erp_5xx_uses_retry_friendly():
     from hub.adapters.downstream.erp4 import ErpSystemError
     from hub.usecases.query_product import QueryProductUseCase
