@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from hub.config import get_settings
 from hub.database import close_db, init_db
-from hub.routers import health, internal_callbacks, setup
+from hub.routers import health, internal_callbacks, setup, setup_full
 from hub.routers.admin import ai_providers as admin_ai_providers
 from hub.routers.admin import audit as admin_audit
 from hub.routers.admin import channels as admin_channels
@@ -159,6 +159,7 @@ app.add_middleware(
 # 路由注册
 app.include_router(health.router)
 app.include_router(setup.router)
+app.include_router(setup_full.router)
 app.include_router(internal_callbacks.router)
 app.include_router(admin_login.router)
 app.include_router(admin_users.router)

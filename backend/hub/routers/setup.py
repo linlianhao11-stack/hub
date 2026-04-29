@@ -1,7 +1,10 @@
 """初始化向导路由（仅在 system_initialized=false 时可用）。
 
-本 Plan 实现 step 1（自检）+ token 校验骨架。
-其余步骤（注册 ERP / 创建 admin / 钉钉 / AI / 完成）由 Plan 5 实现。
+包含步骤 1（welcome 自检）+ verify-token 校验 + status 查询。
+其余步骤（注册 ERP / 创建 admin / 钉钉 / AI / 完成）见 setup_full.py。
+
+Plan 5 把 session 存储改为 `app.state.active_setup_sessions`（dict），
+让 setup_full.py 与本模块共享同一份 session。
 """
 from __future__ import annotations
 
@@ -16,10 +19,6 @@ from hub.config import get_settings
 from hub.models import SystemConfig
 
 router = APIRouter(prefix="/hub/v1/setup", tags=["setup"])
-
-
-# 简单进程级 session 存储（PoC 阶段；Plan 5 升级为真正的 session）
-_active_setup_sessions: dict[str, bool] = {}
 
 
 async def _is_initialized() -> bool:
@@ -59,10 +58,15 @@ class VerifyTokenRequest(BaseModel):
 
 
 @router.post("/verify-token")
-async def verify_token_endpoint(payload: VerifyTokenRequest = Body(...)):
+async def verify_token_endpoint(
+    request: Request, payload: VerifyTokenRequest = Body(...),
+):
     """步骤 1.5：原子校验 + 消费初始化 token，通过后建立 setup session。
 
     并发安全：使用 verify_and_consume_token，两个并发请求同 token 只有一个赢。
+
+    session 存到 `app.state.active_setup_sessions: dict[str, bool]`，
+    让 setup_full.py 的步骤 2-6 endpoint 通过 X-Setup-Session 头校验。
     """
     if await _is_initialized():
         raise HTTPException(status_code=404, detail="HUB 已完成初始化")
@@ -71,7 +75,9 @@ async def verify_token_endpoint(payload: VerifyTokenRequest = Body(...)):
         raise HTTPException(status_code=401, detail="初始化 Token 错误或已过期")
 
     session_id = secrets.token_urlsafe(16)
-    _active_setup_sessions[session_id] = True
+    if not hasattr(request.app.state, "active_setup_sessions"):
+        request.app.state.active_setup_sessions = {}
+    request.app.state.active_setup_sessions[session_id] = True
     return {"session": session_id}
 
 
