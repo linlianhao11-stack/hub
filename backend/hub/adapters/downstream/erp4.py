@@ -65,6 +65,49 @@ class Erp4Adapter:
 
     # ------------- 系统级接口（system_calls scope） -------------
 
+    async def login(self, username: str, password: str) -> dict:
+        """调 ERP /auth/login（不需要 ApiKey，因为还没用户态）。"""
+        try:
+            r = await self._client.post(
+                "/api/v1/auth/login", json={"username": username, "password": password},
+            )
+            if r.status_code == 401:
+                raise ErpPermissionError("用户名或密码错误")
+            self._raise_for_status(r)
+            return r.json()
+        except httpx.RequestError as e:
+            raise ErpSystemError(f"网络错误: {e}") from e
+
+    async def get_me(self, jwt: str) -> dict:
+        """调 ERP /auth/me 用 JWT 拿当前用户信息。"""
+        try:
+            r = await self._client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {jwt}"},
+            )
+            self._raise_for_status(r)
+            return r.json()
+        except httpx.RequestError as e:
+            raise ErpSystemError(f"网络错误: {e}") from e
+
+    async def logout(self, jwt: str) -> None:
+        """调 ERP /auth/logout 让 JWT 失效（ERP 端递增 token_version）。
+
+        HUB logout 必须调它——否则用户登出后旧 cookie 内的 JWT 仍有效，
+        任何拿到旧 cookie 的请求仍能 /auth/me 通过。
+        """
+        try:
+            r = await self._client.post(
+                "/api/v1/auth/logout",
+                headers={"Authorization": f"Bearer {jwt}"},
+            )
+            # 401/204 都视为成功（JWT 已失效）
+            if r.status_code not in (200, 204, 401):
+                self._raise_for_status(r)
+        except httpx.RequestError:
+            # 网络失败不阻塞 logout 流程（HUB 仍清本地 cache）
+            pass
+
     async def health_check(self) -> bool:
         """健康检查：调一个不需要鉴权的 ERP endpoint。"""
         try:
