@@ -109,10 +109,20 @@ class Erp4Adapter:
             pass
 
     async def health_check(self) -> bool:
-        """健康检查：调一个不需要鉴权的 ERP endpoint。"""
+        """健康检查：调 ERP /health（根路径，不带 ApiKey，必须返 JSON 含 status=ready）。
+
+        注意：ERP-4 的 health endpoint 是 `/health` 不是 `/api/v1/meta/health`；
+        ERP 前端 SPA fallback 会把任何不存在的路径都返回 index.html + 200，
+        所以判定时必须严格校验 JSON body 的 status 字段，不能只看 HTTP 200。
+        """
         try:
-            r = await self._client.get("/api/v1/meta/health", timeout=2.0)
-            return r.status_code == 200
+            r = await self._client.get("/health", timeout=2.0)
+            if r.status_code != 200:
+                return False
+            try:
+                return r.json().get("status") == "ready"
+            except Exception:
+                return False
         except Exception:
             return False
 

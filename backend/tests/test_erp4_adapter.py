@@ -67,12 +67,21 @@ async def test_system_call_no_acting_as(erp_url):
 @pytest.mark.asyncio
 async def test_health_check_returns_bool(erp_url):
     from hub.adapters.downstream.erp4 import Erp4Adapter
+    # 200 + {"status": "ready"} → True
     adapter = Erp4Adapter(
         base_url=erp_url, api_key="k",
-        transport=MockTransport(lambda r: Response(200, json={"status": "ok"})),
+        transport=MockTransport(lambda r: Response(200, json={"status": "ready"})),
     )
     assert await adapter.health_check() is True
 
+    # 200 但 SPA fallback 返 HTML（无 status 字段）→ False（避免误判）
+    adapter_html = Erp4Adapter(
+        base_url=erp_url, api_key="k",
+        transport=MockTransport(lambda r: Response(200, text="<html>")),
+    )
+    assert await adapter_html.health_check() is False
+
+    # 503 → False
     adapter_down = Erp4Adapter(
         base_url=erp_url, api_key="k",
         transport=MockTransport(lambda r: Response(503)),
