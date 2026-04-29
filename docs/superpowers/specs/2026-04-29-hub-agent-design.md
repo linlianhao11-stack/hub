@@ -546,7 +546,6 @@ CREATE TABLE conversation_log (
     tokens_cost_yuan DECIMAL(10,4),  -- 估算成本
     final_status TEXT,  -- success / failed_user / failed_system / fallback_to_rule
     error_summary TEXT,
-    has_feedback BOOLEAN DEFAULT FALSE,
     INDEX idx_user_started (hub_user_id, started_at)
 );
 
@@ -905,8 +904,7 @@ dashboard 加 4 个新指标：
 ### 12.2 未知不确定性（需实施验证）
 
 - DeepSeek-V3 在 5 round 内能否稳定收敛复杂任务（合同生成需要 8-10 个 tool call）— 实施时实测
-- 中文业务词典覆盖度 — 第一版 50 条术语，跑一两周看用户反馈扩
-- 用户对反馈 UX 接受度 — 钉钉端 `[👍 有用] [👎 不对]` 按钮的形式可能要换图标
+- 中文业务词典覆盖度 — 第一版 50 条术语，跑一两周看实际命中率扩
 - Plan 6 在档 3 范围下的实际工作量是 6 周（按 5 round budget × 16 tool × 模板 / 审批 inbox 拆分）— 实施时按周 review
 
 ---
@@ -925,7 +923,7 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 | `ConversationStateRepository` | 升级成 ConversationContext |
 | `BindingService / 各 UseCase` | 仍由 RuleParser 直接调（兜底用）|
 | `ChainParser.rule` | 保留（处理 `/绑定` 等显式命令）|
-| HUB 后台 9 个 admin 路由 | 加 3 个审批子路由 + 1 个合同模板 + 1 个 AI 反馈，复用 SSE / 审计 / dashboard |
+| HUB 后台 9 个 admin 路由 | 加 3 个审批子路由 + 1 个合同模板，复用 SSE / 审计 / dashboard |
 | `cron 调度器` | 加 1 个 job：超 7 天未审批草稿钉钉催促 |
 | 6 步初始化向导 | 不变（钉钉 / AI 已配） |
 
