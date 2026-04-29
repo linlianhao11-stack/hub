@@ -29,6 +29,7 @@ async def main():
     from hub.intent.rule_parser import RuleParser
     from hub.match.conversation_state import ConversationStateRepository
     from hub.models import ChannelApp, DownstreamSystem
+    from hub.observability.live_stream import LiveStreamPublisher
     from hub.permissions import require_permissions
     from hub.services.binding_service import BindingService
     from hub.services.erp_active_cache import ErpActiveCache
@@ -38,6 +39,7 @@ async def main():
     from hub.usecases.query_product import QueryProductUseCase
 
     redis_client = Redis.from_url(settings.redis_url, decode_responses=False)
+    live_publisher = LiveStreamPublisher(redis=redis_client)
 
     # 钉钉 + ERP 配置必须**双双就绪**才能注册 dingtalk_inbound handler——
     # 否则 worker 启动 + 收到入站消息时 binding_service=None，handler 直接 return，
@@ -107,6 +109,7 @@ async def main():
             query_product_usecase=query_product,
             query_customer_history_usecase=query_customer,
             require_permissions=require_permissions,
+            live_publisher=live_publisher,
         )
 
     async def dingtalk_outbound_handler(task_data):

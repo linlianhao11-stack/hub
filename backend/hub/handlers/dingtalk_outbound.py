@@ -2,6 +2,10 @@
 
 业务侧（confirm-final / inbound handler / 告警等）投递此 task；
 worker 消费 → 调 DingTalkSender HTTP OpenAPI → 完成 push。
+
+Plan 5 task 6 备注：outbound 不需要 task_logger 包裹——业务侧已经有自己的
+task_log（如 inbound 触发的 outbound 是 inbound task 的下游 erp_call），
+此处仅完成 sender 调用即可。outbound 失败异常向上抛由 WorkerRuntime 死信兜底。
 """
 from __future__ import annotations
 

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from hub.auth.admin_perms import require_hub_perm
+
 # provider 类必须提到模块顶层（不能在 test_chat 函数内 import），
 # 否则 monkeypatch 这个模块下的 DeepSeekProvider/QwenProvider 不生效。
 from hub.capabilities.deepseek import DeepSeekProvider

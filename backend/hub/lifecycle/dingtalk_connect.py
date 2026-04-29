@@ -105,7 +105,7 @@ async def connect_with_reload(
                     await asyncio.wait_for(
                         reload_event.wait(), timeout=poll_interval_seconds,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 reload_event.clear()
                 continue

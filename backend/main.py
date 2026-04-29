@@ -13,10 +13,14 @@ from hub.config import get_settings
 from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup
 from hub.routers.admin import ai_providers as admin_ai_providers
+from hub.routers.admin import audit as admin_audit
 from hub.routers.admin import channels as admin_channels
+from hub.routers.admin import conversation as admin_conversation
+from hub.routers.admin import dashboard as admin_dashboard
 from hub.routers.admin import downstreams as admin_downstreams
 from hub.routers.admin import login as admin_login
 from hub.routers.admin import system_config as admin_system_config
+from hub.routers.admin import tasks as admin_tasks
 from hub.routers.admin import users as admin_users
 
 logger = logging.getLogger("hub")
@@ -162,3 +166,7 @@ app.include_router(admin_downstreams.router)
 app.include_router(admin_channels.router)
 app.include_router(admin_ai_providers.router)
 app.include_router(admin_system_config.router)
+app.include_router(admin_tasks.router)
+app.include_router(admin_conversation.router)
+app.include_router(admin_audit.router)
+app.include_router(admin_dashboard.router)
