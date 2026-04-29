@@ -1,10 +1,22 @@
-FROM python:3.11-slim
+# Stage 1：前端构建（Vite）
+FROM node:20-slim AS frontend-builder
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install --no-audit --no-fund
+COPY frontend/ ./
+# vite.config.js 中 build.outDir = "./dist"，由本阶段产出后由 Stage 2 拷到 backend/static
+RUN npx vite build --outDir ./dist
 
+# Stage 2：后端 + 前端产物
+FROM python:3.11-slim
 WORKDIR /app
 # 先 COPY 整个 backend 源码再安装（setuptools 需扫包结构）
 COPY backend/ ./
 
 RUN pip install --no-cache-dir -e .
+
+# 把前端构建产物拷到 backend/static
+COPY --from=frontend-builder /frontend/dist ./static
 
 ENV PYTHONUNBUFFERED=1 TZ=Asia/Shanghai
 EXPOSE 8091

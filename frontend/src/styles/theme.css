@@ -1,0 +1,93 @@
+/* ============================
+   Tailwind 4 Theme Configuration
+   Maps CSS custom properties from tokens.css -> Tailwind utility classes.
+   Usage: bg-primary, text-foreground, border-line, rounded-lg, shadow-md, etc.
+   ============================ */
+
+@theme {
+  /* ---- Colors ---- */
+
+  /* Primary brand: text-primary, bg-primary, border-primary */
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-active: var(--primary-active);
+  --color-primary-muted: var(--primary-muted);
+  --color-primary-ring: var(--primary-ring);
+
+  /* Semantic: text-success, bg-success, etc. */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-error: var(--error);
+  --color-destructive: var(--destructive);
+  --color-info: var(--info);
+
+  /* Surfaces: bg-canvas, bg-surface, bg-elevated, bg-sunken */
+  --color-background: var(--background);
+  --color-canvas: var(--background);
+  --color-surface: var(--surface);
+  --color-card: var(--card);
+  --color-elevated: var(--elevated);
+  --color-sunken: var(--sunken);
+  --color-sidebar: var(--sidebar-bg);
+
+  /* Foreground: text-foreground, text-secondary, text-muted */
+  --color-foreground: var(--foreground);
+  --color-secondary: var(--text-secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--text-muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  /* Borders: border-line, border-line-strong */
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-border: var(--border);
+  --color-input: var(--input);
+
+  /* Badge semantic — subtle bg + emphasis text */
+  --color-success-subtle: var(--success-subtle);
+  --color-success-emphasis: var(--success-emphasis);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-warning-emphasis: var(--warning-emphasis);
+  --color-error-subtle: var(--error-subtle);
+  --color-error-emphasis: var(--error-emphasis);
+  --color-info-subtle: var(--info-subtle);
+  --color-info-emphasis: var(--info-emphasis);
+  --color-purple-subtle: var(--purple-subtle);
+  --color-purple-emphasis: var(--purple-emphasis);
+  --color-gray-subtle: var(--gray-subtle);
+  --color-gray-emphasis: var(--gray-emphasis);
+  --color-orange-subtle: var(--orange-subtle);
+  --color-orange-emphasis: var(--orange-emphasis);
+
+  /* Interaction surfaces */
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-active: var(--surface-active);
+
+  /* On-color (text on colored backgrounds) */
+  --color-on-primary: var(--on-primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-white: var(--white);
+
+  /* Sidebar */
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  /* ---- Radius ---- */
+  --radius-none: var(--r-none);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+  --radius-pill: var(--r-pill);
+
+  /* ---- Shadows ---- */
+  --shadow-sm: var(--sh-sm);
+  --shadow-md: var(--sh-md);
+  --shadow-lg: var(--sh-lg);
+  --shadow-card-hover: var(--sh-card-hover);
+
+  /* ---- Fonts ---- */
+  --font-sans: 'Inter', system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'Geist Mono', 'JetBrains Mono', 'SF Mono', monospace;
+}

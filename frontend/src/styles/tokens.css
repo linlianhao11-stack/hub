@@ -1,0 +1,178 @@
+/* ============================
+   Design Tokens — Single Source of Truth
+   All values from the .pen design file.
+   Colors in hex, organized by category.
+   Light theme = :root, Dark theme = [data-theme="dark"]
+   ============================ */
+
+/* === Light Mode (default) === */
+:root {
+  /* ---- Colors ---- */
+
+  /* Primary */
+  --primary:        #3B63C9;
+  --primary-hover:  #2B51B1;
+  --primary-active: #223F8A;
+  --primary-muted:  #F0F4FF;
+  --primary-ring:   rgba(59, 99, 201, 0.25);
+  --primary-foreground: #FFFFFF;
+
+  /* Semantic */
+  --success:  #22C55E;
+  --warning:  #EAB308;
+  --error:    #EF4444;
+  --destructive: #EF4444;
+  --info:     #3B63C9;
+
+  /* Neutrals / Surfaces */
+  --background:     #F9FAFB;
+  --bg:             #F9FAFB;
+  --foreground:     #111827;
+  --surface:        #FFFFFF;
+  --card:           #FFFFFF;
+  --elevated:       #F3F4F6;
+  --sunken:         #E5E7EB;
+  --surface-hover:  #E5E7EB;
+  --surface-active: #D1D5DB;
+  --surface-translucent: rgba(255, 255, 255, 0.92);
+
+  /* Text */
+  --text:           #111827;
+  --text-secondary: #4B5563;
+  --text-muted:     #6B7280;
+
+  /* Borders */
+  --border:        #E5E7EB;
+  --border-strong: #D1D5DB;
+  --border-light:  #E5E7EB;
+  --input:         #D1D5DB;
+
+  /* Sidebar */
+  --sidebar-bg:               #FFFFFF;
+  --sidebar-foreground:       #6B7280;
+  --sidebar-accent-foreground: #111827;
+  --sidebar-border:           #E5E7EB;
+
+  /* Badge / Semantic — subtle bg + emphasis text */
+  --success-subtle:   #E6F9EE;
+  --success-emphasis:  #166534;
+  --warning-subtle:   #FFF8E6;
+  --warning-emphasis:  #854D0E;
+  --error-subtle:     #FEF2F2;
+  --error-emphasis:   #991B1B;
+  --info-subtle:      #F0F4FF;
+  --info-emphasis:    #3B63C9;
+  --purple-subtle:    #F3F0FF;
+  --purple-emphasis:  #5B21B6;
+  --gray-subtle:      #F3F4F6;
+  --gray-emphasis:    #4B5563;
+  --orange-subtle:    #FFF4E6;
+  --orange-emphasis:  #9A3412;
+
+  /* Fixed — text on colored backgrounds */
+  --on-primary: #FFFFFF;
+  --white:      #FFFFFF;
+
+  /* Secondary (Tailwind theme mapping) */
+  --secondary:            #F3F4F6;
+  --secondary-foreground: #4B5563;
+  --muted-foreground:     #6B7280;
+
+  /* ---- Radius ---- */
+  --r-none: 0px;
+  --r-sm:   4px;
+  --r-md:   6px;
+  --r-lg:   8px;
+  --r-xl:   12px;
+  --r-pill: 6px;
+
+  /* ---- Shadows ---- */
+  --sh-sm:         0 1px 2px rgba(0,0,0,0.04);
+  --sh-md:         0 4px 24px rgba(0,0,0,0.08);
+  --sh-lg:         0 24px 80px rgba(0,0,0,0.12), 0 0 1px rgba(0,0,0,0.1);
+  --sh-card-hover: 0 2px 12px rgba(0,0,0,0.06);
+
+  /* ---- Animation ---- */
+  --ease-out-expo:   cubic-bezier(0.16, 1, 0.3, 1);
+  --duration-fast:   150ms;
+  --duration-normal: 200ms;
+  --duration-slow:   300ms;
+}
+
+/* === Dark Mode === */
+[data-theme="dark"] {
+  /* Primary */
+  --primary:        #5B83E9;
+  --primary-hover:  #6B93F9;
+  --primary-active: #7BA3FF;
+  --primary-muted:  #1A2340;
+  --primary-ring:   rgba(91, 131, 233, 0.25);
+  --primary-foreground: #FFFFFF;
+
+  /* Semantic */
+  --success:  #22C55E;
+  --warning:  #EAB308;
+  --error:    #EF4444;
+  --destructive: #EF4444;
+  --info:     #5B83E9;
+
+  /* Neutrals / Surfaces */
+  --background:     #111827;
+  --bg:             #111827;
+  --foreground:     #EEF0F4;
+  --surface:        #1E2433;
+  --card:           #1E2433;
+  --elevated:       #2A3142;
+  --sunken:         #0D1117;
+  --surface-hover:  #333B4D;
+  --surface-active: #3D4659;
+  --surface-translucent: rgba(30, 36, 51, 0.92);
+
+  /* Text */
+  --text:           #EEF0F4;
+  --text-secondary: #B5BCC9;
+  --text-muted:     #8B95A5;
+
+  /* Borders */
+  --border:        #2A3142;
+  --border-strong: #374151;
+  --border-light:  #2A3142;
+  --input:         #374151;
+
+  /* Sidebar */
+  --sidebar-bg:               #1E2433;
+  --sidebar-foreground:       #8B95A5;
+  --sidebar-accent-foreground: #EEF0F4;
+  --sidebar-border:           #2A3142;
+
+  /* Badge / Semantic */
+  --success-subtle:   #14291E;
+  --success-emphasis:  #4ADE80;
+  --warning-subtle:   #29220E;
+  --warning-emphasis:  #FACC15;
+  --error-subtle:     #291414;
+  --error-emphasis:   #FCA5A5;
+  --info-subtle:      #1A2340;
+  --info-emphasis:    #5B83E9;
+  --purple-subtle:    #1E1433;
+  --purple-emphasis:  #C4B5FD;
+  --gray-subtle:      #2A3142;
+  --gray-emphasis:    #B5BCC9;
+  --orange-subtle:    #291E0E;
+  --orange-emphasis:  #FDBA74;
+
+  /* Fixed */
+  --on-primary: #FFFFFF;
+  --white:      #FFFFFF;
+
+  /* Secondary */
+  --secondary:            #2A3142;
+  --secondary-foreground: #B5BCC9;
+  --muted-foreground:     #8B95A5;
+
+  /* Dark mode shadows — stronger for visibility */
+  --sh-sm:         0 1px 3px rgba(0,0,0,0.2);
+  --sh-md:         0 4px 24px rgba(0,0,0,0.3);
+  --sh-lg:         0 24px 80px rgba(0,0,0,0.4), 0 0 1px rgba(0,0,0,0.3);
+  --sh-card-hover: 0 2px 12px rgba(0,0,0,0.2);
+}

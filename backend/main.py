@@ -6,8 +6,12 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from hub.config import get_settings
 from hub.database import close_db, init_db
@@ -192,3 +196,37 @@ app.include_router(admin_tasks.router)
 app.include_router(admin_conversation.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_dashboard.router)
+
+
+# ============================================================
+# 前端 SPA：StaticFiles + catch-all 必须在所有 router 注册之后
+# ============================================================
+STATIC_DIR = Path(__file__).parent / "static"
+ASSETS_DIR = STATIC_DIR / "assets"
+
+if ASSETS_DIR.exists():
+    # /assets/* 直接走 StaticFiles（vite 产物 hash 文件名）
+    app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+
+if STATIC_DIR.exists() and (STATIC_DIR / "index.html").exists():
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str):
+        """SPA fallback：所有非 API、非 /assets 的路径都返回 index.html，
+        让 Vue Router 处理 /setup, /login, /admin/* 等前端路由。
+
+        必须放在所有 app.include_router(...) 之后注册，否则会拦截 /hub/v1/* API 请求。
+        """
+        # 精确文件请求（如 /favicon.ico, /vite.svg）：如果 static 下有就直接返
+        if full_path:
+            target = STATIC_DIR / full_path
+            if target.is_file():
+                return FileResponse(target)
+        return FileResponse(STATIC_DIR / "index.html")
+else:
+    @app.get("/", include_in_schema=False)
+    async def no_frontend():
+        """前端尚未构建：提示去 frontend/ 跑 npm run build。"""
+        return Response(
+            "Frontend 未构建。请在 frontend/ 目录跑 npm run build，或用 docker compose build hub-gateway 触发多阶段构建。",
+            status_code=503,
+        )
