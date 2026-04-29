@@ -120,10 +120,31 @@ async def lifespan(app: FastAPI):
     )
     app.state.dingtalk_connect_task = connect_task
 
+    # 6. cron 调度器（Plan 5 Task 10）：每天 03:00 巡检 + 04:00 清理 payload
+    from hub.cron.jobs import run_daily_audit, run_payload_cleanup
+    from hub.cron.scheduler import CronScheduler
+    scheduler = CronScheduler()
+
+    @scheduler.at_hour(3)
+    async def _job_audit():
+        await run_daily_audit()
+
+    @scheduler.at_hour(4)
+    async def _job_cleanup():
+        await run_payload_cleanup()
+
+    scheduler.start()
+    app.state.scheduler = scheduler
+
     yield
 
     logger.info("HUB Gateway 关闭")
-    # 关闭顺序：先取消连接 task（task cancel 会自己 stop 当前 adapter），再 redis / db
+    # 关闭顺序：先停 scheduler、再取消连接 task、最后 redis / db
+    if hasattr(app.state, "scheduler"):
+        try:
+            await app.state.scheduler.stop()
+        except Exception:
+            logger.exception("cron scheduler 关闭异常")
     if not connect_task.done():
         connect_task.cancel()
         try:
