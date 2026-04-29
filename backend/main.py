@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from hub.config import get_settings
 from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup
+from hub.routers.admin import login as admin_login
 
 logger = logging.getLogger("hub")
 
@@ -27,6 +28,28 @@ async def lifespan(app: FastAPI):
     # 2. 跑种子数据
     from hub.seed import run_seed
     await run_seed()
+
+    # 2.5 装 ERP session 鉴权（admin login 用）
+    # ERP 下游配置就绪后才能初始化；初始化向导未完成时为 None，
+    # /admin/login 会返 503 提示先完成向导
+    from hub.adapters.downstream.erp4 import Erp4Adapter
+    from hub.auth.erp_session import ErpSessionAuth
+    from hub.crypto import decrypt_secret
+    from hub.models import DownstreamSystem
+    ds_for_session = await DownstreamSystem.filter(
+        downstream_type="erp", status="active",
+    ).first()
+    if ds_for_session is not None:
+        erp_api_key_for_session = decrypt_secret(
+            ds_for_session.encrypted_apikey, purpose="config_secrets",
+        )
+        erp_for_session = Erp4Adapter(
+            base_url=ds_for_session.base_url, api_key=erp_api_key_for_session,
+        )
+        app.state.session_auth = ErpSessionAuth(erp_adapter=erp_for_session)
+        app.state._session_erp_adapter = erp_for_session  # 留引用方便 shutdown 关闭
+    else:
+        app.state.session_auth = None
 
     # 3. 首启动检测：未初始化（system_initialized=false）且无未使用 token → 生成并打印
     from datetime import datetime
@@ -100,6 +123,12 @@ async def lifespan(app: FastAPI):
             await adapter.stop()
         except Exception:
             logger.exception("DingTalk adapter 停止异常")
+    sess_adapter = getattr(app.state, "_session_erp_adapter", None)
+    if sess_adapter is not None:
+        try:
+            await sess_adapter.aclose()
+        except Exception:
+            logger.exception("session ERP adapter 关闭异常")
     await redis_client.aclose()
     await close_db()
 
@@ -124,3 +153,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(setup.router)
 app.include_router(internal_callbacks.router)
+app.include_router(admin_login.router)
