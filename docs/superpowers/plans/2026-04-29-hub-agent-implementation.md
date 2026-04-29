@@ -141,7 +141,8 @@
 - `tool_call_log`（FK conversation_log，round_idx + tool_name 索引）
 - `user_memory` / `customer_memory` / `product_memory`（各自的 JSONB facts 字段）
 - `contract_template` / `contract_draft`
-- `voucher_draft` / `price_adjustment_request` / `stock_adjustment_request`
+- `voucher_draft`（**v3 round 2 新增 creating_started_at TIMESTAMPTZ NULL 字段** + status 五值：pending / creating / created / approved / rejected）
+- `price_adjustment_request` / `stock_adjustment_request`（沿用 pending / approved / rejected 三值）
 
 - [ ] **Step 1.5: 写 `observability/tool_logger.py`**
 
@@ -217,6 +218,9 @@ aerich 不能自动检测 JSONB index / GIN，所以手写：
 - conversation_log idx_user_started
 - tool_call_log idx_conv
 - voucher_draft / price_adjustment_request / stock_adjustment_request idx_pending（status, created_at）
+- voucher_draft.creating_started_at TIMESTAMPTZ NULL（v3 round 2 加：creating 状态租约时间戳）
+- voucher_draft idx_creating_lease（status, creating_started_at）— 崩溃恢复扫 status=creating + 租约过期的草稿用
+- voucher_draft.status CHECK 约束（pending / creating / created / approved / rejected 五值）
 
 - [ ] **Step 3: 更新 conftest.py**
 
@@ -452,13 +456,11 @@ class ToolRegistry:
         if not tool:
             raise ToolNotFoundError(name)
 
-        # ❶ 写类 tool 硬门禁（review P1-#1）
+        # ❶ 写类 tool 硬门禁（review v3 第二轮 P1：按 hub_user_id 隔离）
         if tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP):
             token = args.pop("confirmation_token", None)
-            # args 在校验前先归一（剔除 None / 排序 key）以保证 hash 稳定
-            normalized_args = self.confirm_gate.canonicalize(args)
             if not await self.confirm_gate.is_confirmed(
-                conversation_id, name, normalized_args, token,
+                conversation_id, hub_user_id, name, args, token,
             ):
                 # 记一条"未确认拦截"日志方便溯源
                 await self._log_blocked_call(conversation_id, round_idx, name, args,
@@ -522,6 +524,24 @@ class ToolRegistry:
         )
 ```
 
+> ⚠ **必要 import**：上面 ToolRegistry 完整实现块顶部的 import 完整列表为：
+>
+> ```python
+> import inspect
+> import time
+> from typing import Any, Callable, get_type_hints
+>
+> from hub.permissions import require_permissions, has_permission
+> from hub.observability.tool_logger import log_tool_call
+> from hub.agent.tools.types import (
+>     ToolType, ToolDef,
+>     UnconfirmedWriteToolError, ToolNotFoundError, ToolArgsValidationError,
+> )
+> from hub.agent.tools.confirm_gate import ConfirmGate
+> from hub.agent.tools.entity_extractor import EntityExtractor
+> from hub.agent.memory.session import SessionMemory
+> ```
+
 **配套类型 / Gate 完整实现** — `hub/agent/tools/types.py`：
 
 ```python
@@ -554,14 +574,29 @@ class ToolArgsValidationError(Exception): ...
 ```python
 import hashlib
 import json
+import uuid
 from redis.asyncio import Redis
 
 class ConfirmGate:
-    KEY_PREFIX = "hub:agent:confirmed:"
+    """写门禁 + pending_write 状态管理（按 conversation_id × hub_user_id 严格隔离）。
+
+    review v3 第二轮 P1：
+    - key/token 加 hub_user_id：群聊里 B 不能确认 A 的写
+    - pending 改 hash（action_id → pending data）：支持单 round 多个写 tool 一起 pending，
+      用户一次"是"全部确认；不会被后一次写覆盖
+    """
+    PENDING_KEY = "hub:agent:pending:"      # hash: {action_id: pending_json}
+    CONFIRMED_KEY = "hub:agent:confirmed:"  # set: {token, ...}
     TTL = 1800  # 30 min（与会话 memory 同 TTL）
 
     def __init__(self, redis: Redis):
         self.redis = redis
+
+    def _pending_key(self, conversation_id: str, hub_user_id: int) -> str:
+        return f"{self.PENDING_KEY}{conversation_id}:{hub_user_id}"
+
+    def _confirmed_key(self, conversation_id: str, hub_user_id: int) -> str:
+        return f"{self.CONFIRMED_KEY}{conversation_id}:{hub_user_id}"
 
     @staticmethod
     def canonicalize(args: dict) -> dict:
@@ -575,30 +610,85 @@ class ConfirmGate:
         return _norm(args)
 
     @staticmethod
-    def compute_token(conversation_id: str, tool_name: str, normalized_args: dict) -> str:
-        """token = sha256(conversation_id + tool_name + canonical_json(args))。"""
-        payload = f"{conversation_id}:{tool_name}:{json.dumps(normalized_args, sort_keys=True, ensure_ascii=False)}"
+    def compute_token(conversation_id: str, hub_user_id: int,
+                      tool_name: str, normalized_args: dict) -> str:
+        """token = sha256(conversation_id:hub_user_id:tool_name:canonical_json(args))[:32]。"""
+        payload = (
+            f"{conversation_id}:{hub_user_id}:{tool_name}:"
+            f"{json.dumps(normalized_args, sort_keys=True, ensure_ascii=False)}"
+        )
         return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
-    async def mark_confirmed(self, conversation_id: str, tool_name: str, args: dict) -> str:
-        """ChainAgent 在用户回'是'后调：把动作 token 写入 Redis SET。"""
+    # ====== pending（被门禁拦截的写动作）======
+    async def add_pending(self, conversation_id: str, hub_user_id: int,
+                          tool_name: str, args: dict) -> str:
+        """ChainAgent 在 tool 被门禁拦截时调；返回 action_id。同 round 多个写都能存。"""
+        action_id = uuid.uuid4().hex[:8]
         normalized = self.canonicalize(args)
-        token = self.compute_token(conversation_id, tool_name, normalized)
-        await self.redis.sadd(self.KEY_PREFIX + conversation_id, token)
-        await self.redis.expire(self.KEY_PREFIX + conversation_id, self.TTL)
+        await self.redis.hset(
+            self._pending_key(conversation_id, hub_user_id),
+            action_id,
+            json.dumps({
+                "tool_name": tool_name,
+                "args": args,
+                "normalized_args": normalized,
+            }, ensure_ascii=False),
+        )
+        await self.redis.expire(self._pending_key(conversation_id, hub_user_id), self.TTL)
+        return action_id
+
+    async def list_pending(self, conversation_id: str,
+                           hub_user_id: int) -> list[dict]:
+        """返回该 user 的所有 pending action（用户回'是'时由 ChainAgent 调）。"""
+        raw = await self.redis.hgetall(self._pending_key(conversation_id, hub_user_id))
+        out = []
+        for action_id, payload in (raw or {}).items():
+            data = json.loads(payload)
+            data["action_id"] = action_id.decode() if isinstance(action_id, bytes) else action_id
+            out.append(data)
+        return sorted(out, key=lambda d: d["action_id"])  # 稳定顺序
+
+    async def clear_pending(self, conversation_id: str, hub_user_id: int) -> None:
+        await self.redis.delete(self._pending_key(conversation_id, hub_user_id))
+
+    # ====== confirmed（用户已确认的 token）======
+    async def mark_confirmed(self, conversation_id: str, hub_user_id: int,
+                             tool_name: str, args: dict) -> str:
+        """把单个动作的 token 写 confirmed set。"""
+        normalized = self.canonicalize(args)
+        token = self.compute_token(conversation_id, hub_user_id, tool_name, normalized)
+        await self.redis.sadd(self._confirmed_key(conversation_id, hub_user_id), token)
+        await self.redis.expire(self._confirmed_key(conversation_id, hub_user_id), self.TTL)
         return token
 
-    async def is_confirmed(self, conversation_id: str, tool_name: str,
-                           args: dict, token: str | None) -> bool:
-        """ToolRegistry.call 入口检查。"""
+    async def confirm_all_pending(self, conversation_id: str,
+                                   hub_user_id: int) -> list[dict]:
+        """用户回'是' → 把所有 pending action 标 confirmed → 返 [{action_id, tool_name, args, token}, ...]。
+
+        ChainAgent 用这个返回值组装 system hint 让 LLM 重新调 tool 时填对 token。
+        pending 不主动清；ToolRegistry.call 在 tool 调用成功后由 ChainAgent 清掉对应 action_id。
+        """
+        pending = await self.list_pending(conversation_id, hub_user_id)
+        out = []
+        for p in pending:
+            token = await self.mark_confirmed(
+                conversation_id, hub_user_id, p["tool_name"], p["args"],
+            )
+            out.append({**p, "token": token})
+        return out
+
+    async def is_confirmed(self, conversation_id: str, hub_user_id: int,
+                           tool_name: str, args: dict, token: str | None) -> bool:
+        """ToolRegistry.call 入口检查（按 conversation_id × hub_user_id 隔离）。"""
         if not token:
             return False
         normalized = self.canonicalize(args)
-        expected = self.compute_token(conversation_id, tool_name, normalized)
+        expected = self.compute_token(conversation_id, hub_user_id, tool_name, normalized)
         if token != expected:
             return False
-        # Redis 兜底：token 必须真在 confirmed 集合（防伪造 token 头）
-        return bool(await self.redis.sismember(self.KEY_PREFIX + conversation_id, token))
+        return bool(await self.redis.sismember(
+            self._confirmed_key(conversation_id, hub_user_id), token,
+        ))
 ```
 
 **`hub/agent/tools/entity_extractor.py`**：
@@ -1327,29 +1417,35 @@ ChainAgent 主循环要点：
 ```python
 # hub/agent/chain_agent.py
 class ChainAgent:
-    PENDING_WRITE_KEY = "hub:agent:pending_write:"  # Redis hash
+    """关键设计（review v3 第二轮 P1）：pending 走 ConfirmGate（按 conversation × hub_user 隔离 + 支持多 pending），
+    ChainAgent 自身不直接管 Redis。同 round 多个 write tool 都被拦截 → 都进 pending list →
+    用户一次回'是' → confirm_all_pending 一并标 confirmed → 把 N 个 token 拼进 hint 让 LLM 重新调用。"""
 
     async def run(self, user_message, *, hub_user_id, conversation_id, acting_as,
                   user_just_confirmed: bool = False):
         """
-        user_just_confirmed: 由 inbound handler 在用户回"是/确认"时传 True，
-        让 ChainAgent 知道把上次 pending_write 标 confirmed 然后让 LLM 重试。
+        user_just_confirmed: inbound handler 识别 "是/确认" 时传 True；
+        ChainAgent 据此把该 user 在该 conversation 下所有 pending action 一起标 confirmed。
         """
         # ❶ 处理"用户已确认"路径
         confirm_hint = None
         if user_just_confirmed:
-            pending = await self._load_pending_write(conversation_id)
-            if pending:
-                # 把动作标 confirmed → 计算 token → 在下一 round 把 hint + token 注入
-                token = await self.confirm_gate.mark_confirmed(
-                    conversation_id, pending["tool_name"], pending["args"],
-                )
-                confirm_hint = (
-                    f"用户已确认上次的 {pending['tool_name']} 操作 "
-                    f"(参数：{json.dumps(pending['args'], ensure_ascii=False)[:200]})。"
-                    f"请用 confirmation_token=\"{token}\" 重新调用该 tool。"
-                )
-                await self._clear_pending_write(conversation_id)
+            confirmed_actions = await self.confirm_gate.confirm_all_pending(
+                conversation_id, hub_user_id,
+            )
+            if confirmed_actions:
+                # 把所有 pending 拼成结构化 hint（每条带 action_id + tool_name + args 摘要 + token）
+                lines = [f"用户已确认 {len(confirmed_actions)} 个写操作。请按下表重新调用对应 tool 并附 confirmation_token："]
+                for a in confirmed_actions:
+                    args_summary = json.dumps(a["args"], ensure_ascii=False)[:200]
+                    lines.append(
+                        f"  • action_id={a['action_id']}: {a['tool_name']} "
+                        f"args={args_summary} → token=\"{a['token']}\""
+                    )
+                confirm_hint = "\n".join(lines)
+                # 不在这里 clear_pending；让 ToolRegistry.call 调用成功后
+                # ChainAgent 在 tool result 接收时按 action_id 删对应 pending
+            # 没 pending：用户随口"是"，confirm_hint 留 None，正常进 LLM
 
         # ❷ 主循环
         for round_idx in range(self.MAX_ROUNDS):
@@ -1374,10 +1470,14 @@ class ChainAgent:
                             conversation_id=conversation_id, round_idx=round_idx,
                         )
                         self.history.append(ToolResult(call.id, result))
+                        # 写 tool 成功后，找到对应 pending action_id 删除（防 LLM 重复 confirm）
+                        await self._cleanup_consumed_pending(
+                            conversation_id, hub_user_id, call.name, call.args,
+                        )
                     except UnconfirmedWriteToolError as e:
-                        # 写门禁拦截 → 记 pending_write 让用户确认后能恢复
-                        await self._save_pending_write(
-                            conversation_id, call.name, call.args,
+                        # 写门禁拦截 → 加入 pending list（不覆盖之前的）
+                        await self.confirm_gate.add_pending(
+                            conversation_id, hub_user_id, call.name, call.args,
                         )
                         # 注入错误让 LLM 改用 text 预览给用户
                         self.history.append(ToolResult(call.id, {"error": str(e)}))
@@ -1389,21 +1489,30 @@ class ChainAgent:
 
         raise AgentMaxRoundsExceeded()
 
-    async def _save_pending_write(self, conversation_id, tool_name, args):
-        """记录 LLM 想调但被拦截的写 tool（用户回'是'时恢复）。"""
-        await self.redis.set(
-            self.PENDING_WRITE_KEY + conversation_id,
-            json.dumps({"tool_name": tool_name, "args": args}, ensure_ascii=False),
-            ex=1800,  # 30 min
-        )
-
-    async def _load_pending_write(self, conversation_id) -> dict | None:
-        raw = await self.redis.get(self.PENDING_WRITE_KEY + conversation_id)
-        return json.loads(raw) if raw else None
-
-    async def _clear_pending_write(self, conversation_id):
-        await self.redis.delete(self.PENDING_WRITE_KEY + conversation_id)
+    async def _cleanup_consumed_pending(self, conversation_id, hub_user_id,
+                                          tool_name, args):
+        """tool 调用成功后：从 pending hash 删除匹配的 action（按 args 内容比对）。"""
+        normalized = self.confirm_gate.canonicalize(args)
+        pending_list = await self.confirm_gate.list_pending(conversation_id, hub_user_id)
+        for p in pending_list:
+            if p["tool_name"] == tool_name and p["normalized_args"] == normalized:
+                await self.confirm_gate.redis.hdel(
+                    self.confirm_gate._pending_key(conversation_id, hub_user_id),
+                    p["action_id"],
+                )
+                return
 ```
+
+**单聊 vs 群聊 conversation_id 设计**：
+
+| 场景 | conversation_id 取值 | 隔离级别 |
+|---|---|---|
+| 钉钉 1:1 私聊 | `dingtalk:{senderStaffId}`（每个用户独立）| 天然单用户 |
+| 钉钉群聊 @ 机器人 | `dingtalk:{conversationId}`（群级）| 同 conversation 多用户 → **必须靠 hub_user_id 隔离** |
+
+ConfirmGate 用 `(conversation_id, hub_user_id)` 双键已经处理了群聊 B 不能确认 A 的写的情况：
+- A 在群 G 调 create_voucher_draft 被拦截 → pending 写到 `pending:G:hub_user_A`
+- B 在同群回 "是" → ChainAgent 找的是 `pending:G:hub_user_B` → 空 → confirm_hint=None → 正常进 LLM 处理
 
 **inbound handler 端识别"是/确认"**（在 Task 10 加入）：
 
@@ -1622,66 +1731,100 @@ async def create_price_adjustment_request(...) -> dict: ...
 async def create_stock_adjustment_request(...) -> dict: ...
 ```
 
-- [ ] **Step 2: admin/approvals.py 三个 inbox 子路由（review P1-#4 改进版：草稿状态机 + 幂等）**
+- [ ] **Step 2: admin/approvals.py 三个 inbox 子路由（review P1-#4 改进版：草稿状态机 + 幂等 + creating 崩溃恢复）**
 
-**review P1-#3 关键问题**：v2 写法仍是循环 N 次 `POST /vouchers` 创建 ERP，中途失败留下部分 ERP 副作用，重试还会重复创建。修复方案：**两阶段提交 + client_request_id 幂等键**。
+**review P1-#3 关键问题**：v2 写法仍是循环 N 次 `POST /vouchers` 创建 ERP，中途失败留下部分 ERP 副作用，重试还会重复创建。修复方案：**两阶段提交 + client_request_id 幂等键 + creating 状态租约**。
 
-**voucher_draft 状态机**：
+**voucher_draft 状态机（v3 round 2 加 creating 租约恢复）**：
 
 ```
-pending  ──[create succeeded]──▶  created (含 erp_voucher_id) ──[batch-approve]──▶ approved
-   │                                       │
-   └─[create failed]─▶ pending (重试)      └─[approve failed]─▶ created (重试 approve)
+pending  ──[lock to creating]──▶  creating  ──[ERP create OK]──▶ created
+   ▲                                  │                            │
+   │                                  │ ──[ERP create fail]──▶ pending（释放锁，可重试）
+   │                                  │
+   │                                  └─[进程崩溃]──▶ creating（卡住，但 lease 5 min 后过期）
+   │                                                       │
+   │                                                       │ ──[下次 batch 拿同 client_request_id 重试]
+   │                                                       │    ERP 用幂等键返已存在的 voucher
    │
-   └─[reject]──▶ rejected
+   └─[reject]──▶ rejected                              ──▶ created
+                                                            │
+                                                  ──[batch-approve]──▶ approved
+                                                            │
+                                                  ──[approve fail]──▶ created（保持，可重试 approve）
 ```
 
-**幂等键**：HUB 每条 voucher_draft 给一个 `idempotency_key = f"hub-draft-{draft.id}"` 塞入 ERP 创建请求 body 的 `client_request_id` 字段。ERP 端按这个字段做 unique 防重复创建（**Task 18 ERP 改动里加这个字段 + 唯一约束**）。
+**关键设计**：
+1. **`creating` 是租约状态**：进入 creating 时记 `creating_started_at`；下次 batch 看到 `now - creating_started_at > LEASE_TIMEOUT(5min)` 就视为崩溃残留，可重新拿锁继续。
+2. **`client_request_id` = `f"hub-draft-{draft.id}"`** 全程不变：进程崩溃后下次 batch 拿同 client_request_id 调 ERP，ERP 端唯一索引保证不会重复创建（Task 18 ERP 改动）。
+3. **乐观锁防并发同 batch**：`filter(status__in=["pending", "creating"], creating_started_at__lt=lease_cutoff or null) → update(status="creating", creating_started_at=now)`，update 行数=0 表示别的请求已抢先。
 
 ```python
+import datetime as dt
+
+LEASE_TIMEOUT = dt.timedelta(minutes=5)  # creating 租约过期时间
+
 @router.get("/voucher", deps=[require_hub_perm("usecase.create_voucher.approve")])
 async def list_voucher_drafts(status: str = "pending", ...): ...
 
 @router.post("/voucher/batch-approve",
              deps=[require_hub_perm("usecase.create_voucher.approve")])
 async def batch_approve_vouchers(req: BatchApproveRequest, request: Request):
-    """两阶段提交：
-       phase1: 把 status=pending 的转成 status=created（每条单独 POST，
-               用 client_request_id 幂等防重）
-       phase2: 把 status=created 的（含本次新转过来的）一次性调 batch-approve
+    """两阶段提交 + creating 崩溃恢复：
+       phase1: 把 status∈{pending, creating(租约过期)} 的转成 creating + 调 ERP create
+               （client_request_id 幂等键防重 → ERP 端唯一索引）
+       phase2: 把 status=created 的（含本次新创建的 + 入参原本 created）一次性调 batch-approve
     """
+    now = dt.datetime.utcnow()
+    lease_cutoff = now - LEASE_TIMEOUT
+
+    # 注意：drafts 入参允许 pending / creating(过期) / created（重试 approve）
     drafts = await VoucherDraft.filter(
         id__in=req.draft_ids,
-        status__in=["pending", "created"],  # 允许 created 状态重试 approve
+        status__in=["pending", "creating", "created"],
     ).all()
     if len(drafts) != len(req.draft_ids):
-        raise HTTPException(400, "包含已审或不存在的 draft_id")
+        raise HTTPException(400, "包含已审/已拒/不存在的 draft_id")
+
+    # 把 creating 但租约未过期的剔掉（别的进程还在处理）
+    drafts = [
+        d for d in drafts
+        if d.status != "creating" or (d.creating_started_at and d.creating_started_at < lease_cutoff)
+    ]
 
     actor = request.state.hub_user
     creation_failures = []
 
-    # ========== Phase 1: 把 pending 的草稿创建到 ERP（幂等）==========
-    pending_drafts = [d for d in drafts if d.status == "pending"]
-    for d in pending_drafts:
-        # 乐观锁：filter status="pending" + update → 防并发 batch
-        rows = await VoucherDraft.filter(id=d.id, status="pending").update(
-            status="creating",  # 中间态：标记本次正在处理
+    # ========== Phase 1: 把 pending / creating(过期) 的草稿创建到 ERP（幂等 + 租约）==========
+    todo_drafts = [d for d in drafts if d.status in ("pending", "creating")]
+    for d in todo_drafts:
+        # 乐观锁 + 租约：仅当 (status=pending) OR (status=creating AND lease 已过期) 时才能拿锁
+        rows = await VoucherDraft.filter(id=d.id).filter(
+            Q(status="pending")
+            | (Q(status="creating") & Q(creating_started_at__lt=lease_cutoff)),
+        ).update(
+            status="creating",
+            creating_started_at=now,
         )
         if rows == 0:
-            continue  # 别的请求已抢先，跳过
+            continue  # 别的请求/线程已抢先，跳过
 
         try:
             erp_resp = await erp.create_voucher(
                 voucher_data=d.voucher_data,
-                client_request_id=f"hub-draft-{d.id}",  # 幂等键
+                client_request_id=f"hub-draft-{d.id}",  # 幂等键，崩溃重试同样这个值
                 acting_as_user_id=...,
             )
+            # 注意：ERP 可能返 idempotent_replay=True（同 key 已存在），仍走成功分支
             d.erp_voucher_id = erp_resp["id"]
             d.status = "created"
+            d.creating_started_at = None  # 清租约
             await d.save()
         except (ErpAdapterError, ErpSystemError) as e:
-            # 创建失败 → 回滚状态到 pending 让下次能重试
-            await VoucherDraft.filter(id=d.id).update(status="pending")
+            # 创建失败 → 回滚 pending（释放租约让下次重试）
+            await VoucherDraft.filter(id=d.id).update(
+                status="pending", creating_started_at=None,
+            )
             creation_failures.append({"draft_id": d.id, "reason": str(e)})
 
     # 重新拉一次：这次包含 phase1 新创建的 + 入参中本来就 status=created 的
@@ -1753,32 +1896,35 @@ async def batch_reject_vouchers(req, request):
 ```
 
 **关键保证**：
-1. **不重复创建 ERP voucher**：`client_request_id` 唯一约束让 ERP 端拒重复（Task 18 ERP 加）；HUB 端乐观锁 + 中间态 `creating` 防并发同 batch
-2. **重试安全**：phase1 失败 → 回滚 pending（可重试创建）；phase2 失败 → 保持 created（可重试 approve），ERP voucher 不会重复创建
-3. **部分失败可恢复**：返回详细 `creation_failures + approve_failures`，admin UI 显示 → 用户可只重试失败的子集
+1. **不重复创建 ERP voucher**：`client_request_id` 唯一约束让 ERP 端拒重复（Task 18 ERP 加）；HUB 端乐观锁 + 中间态 `creating` 租约防并发同 batch
+2. **崩溃恢复**：phase1 调 ERP 时进程崩溃 → draft 卡在 `creating` 状态。下次 batch 看到 `creating_started_at` 已过 5min 租约，重新拿锁继续；ERP 收同 client_request_id 后通过唯一索引判幂等返回已存在的 voucher（不会重复创建）
+3. **重试安全**：phase1 显式失败 → 回滚 pending（可重试创建）；phase2 失败 → 保持 created（可重试 approve），ERP voucher 不会重复创建
+4. **部分失败可恢复**：返回详细 `creation_failures + approve_failures`，admin UI 显示 → 用户可只重试失败的子集
 
 **Task 18 ERP 改动**配套（plan Task 18 加这一条）：
 - `Voucher` 表加 `client_request_id` 字段（VARCHAR 64，NULL OK）+ partial unique index（仅当 client_request_id NOT NULL 时唯一）
 - `POST /api/v1/vouchers` body 接受 `client_request_id` 字段；冲突时返已存在的 voucher（HTTP 200 + 标记 idempotent_replay=True）
 
-- [ ] **Step 3: 测试 14 case**
+- [ ] **Step 3: 测试 16 case（含 creating 租约恢复）**
 
 | # | 场景 | 期望 |
 |---|---|---|
-| 1 | 创建凭证草稿成功 | voucher_draft 写入 + status=pending |
+| 1 | 创建凭证草稿成功 | voucher_draft 写入 + status=pending + creating_started_at=NULL |
 | 2 | 创建超金额上限 | 拦截 + ¥1M 错误信息 |
 | 3 | 必填字段校验 | 拒绝 + schema error |
-| 4 | 批量通过：phase1+phase2 全成功 | 全部 approved + audit log |
-| 5 | phase1 创建部分失败（ERP 5xx）| 失败的回滚 pending，成功的进 phase2 |
+| 4 | 批量通过：phase1+phase2 全成功 | 全部 approved + audit log + creating_started_at 清空 |
+| 5 | phase1 创建部分失败（ERP 5xx）| 失败的回滚 pending（清 creating_started_at），成功的进 phase2 |
 | 6 | phase2 batch-approve 部分失败 | 失败的保持 created（不回 pending）|
 | 7 | phase2 全失败（ERP 5xx）| 全部保持 created |
 | 8 | 重试（同 draft_id 二次 batch-approve）| created 状态跳过 phase1，只走 phase2 |
-| 9 | 重试（用同 client_request_id）| ERP 返已存在的 voucher（idempotent）+ HUB draft 不重复创建 |
+| 9 | 重试（用同 client_request_id）| ERP 返已存在的 voucher（idempotent_replay=True）+ HUB draft 不重复创建 |
 | 10 | 批量通过含 approved/rejected draft | 400 |
 | 11 | 批量拒绝 pending → status=rejected | OK |
 | 12 | 批量拒绝 created（已落 ERP）→ 400 | "请到 ERP 反审" |
 | 13 | 无审批权限 | 403 |
-| 14 | 同 draft_id 并发 batch-approve | 第二次乐观锁失败，跳过该条 |
+| 14 | 同 draft_id 并发 batch-approve | 第二次乐观锁失败，跳过该条（status=creating + 租约未过期）|
+| 15 | **崩溃恢复（租约过期）**：人为造一条 status=creating + creating_started_at=10 分钟前 → 再次 batch-approve 同 draft_id | 视为崩溃残留，重新进 phase1 + 同 client_request_id 调 ERP；ERP 返 idempotent_replay → 标 created → 进 phase2 |
+| 16 | **租约未过期跳过**：status=creating + creating_started_at=2 分钟前 → 再次 batch-approve | 当作"另一个进程在处理"，本次跳过该条不进 phase1 |
 
 - [ ] **Step 4: 提交**
 
@@ -2295,9 +2441,12 @@ git commit -m "feat(hub): Plan 6 Task 17（seed 加 14 权限码 + 2 新角色 +
 **Files (ERP 仓库):**
 - Create: `backend/app/routers/customer_price_rules.py`
 - Modify: `backend/app/routers/inventory.py`（加 /aging）
-- Migrations: customer_price_rule 表
+- Modify: `backend/app/models/voucher.py`（加 client_request_id 字段）
+- Modify: `backend/app/routers/vouchers.py`（接 client_request_id + 幂等回放）
+- Modify: `backend/app/schemas/voucher.py`（VoucherCreate 加 client_request_id 可选字段）
+- Migrations: `backend/migrations/models/N_xxx_plan6_erp.py`（手写：customer_price_rule 表 + voucher.client_request_id 列 + 部分唯一索引）
 
-- [ ] **Step 1: customer_price_rules.py**
+- [ ] **Step 1: customer_price_rules.py（HUB tool `create_price_adjustment_request` 落库依赖）**
 
 ```python
 @router.post("")
@@ -2310,7 +2459,7 @@ async def update_price_rule(...): ...
 async def list_price_rules(customer_id, product_id): ...
 ```
 
-- [ ] **Step 2: /api/v1/inventory/aging endpoint**
+- [ ] **Step 2: /api/v1/inventory/aging endpoint（HUB tool `get_inventory_aging` 依赖）**
 
 按库龄聚合：
 ```python
@@ -2320,11 +2469,103 @@ async def inventory_aging(threshold_days: int = 90, warehouse_id: int = None):
     return {"items": [{product_id, sku, name, total_stock, age_days, value}]}
 ```
 
-- [ ] **Step 3: 在 ERP 仓库提交**
+- [ ] **Step 3: Voucher.client_request_id 幂等键（HUB Task 8 两阶段提交 + 崩溃恢复依赖）**
+
+> **强阻塞**：没有这一步，HUB 端 phase1 调 ERP create_voucher 进程崩溃后下次 batch 重试会重复创建 ERP voucher（脏数据）。
+
+**3.1 Model 层加字段**：
+
+```python
+# backend/app/models/voucher.py（Tortoise ORM）
+class Voucher(Model):
+    id = fields.IntField(pk=True)
+    # ... 既有字段 ...
+    client_request_id = fields.CharField(max_length=64, null=True)
+    # 部分唯一索引在迁移里建（Tortoise 不支持 partial unique meta）
+
+    class Meta:
+        table = "voucher"
+```
+
+**3.2 手写迁移加部分唯一索引**：
+
+```python
+# backend/migrations/models/N_xxx_plan6_erp.py
+async def upgrade(db) -> str:
+    return """
+    -- customer_price_rule 表（Step 1）
+    CREATE TABLE customer_price_rule (...);
+    -- voucher.client_request_id（Step 3）
+    ALTER TABLE voucher ADD COLUMN client_request_id VARCHAR(64);
+    -- 部分唯一索引：仅当 NOT NULL 时唯一（允许历史 voucher 全部为 NULL）
+    CREATE UNIQUE INDEX idx_voucher_client_request_id_unique
+        ON voucher (client_request_id)
+        WHERE client_request_id IS NOT NULL;
+    """
+```
+
+**3.3 Schema 接收字段**：
+
+```python
+# backend/app/schemas/voucher.py
+class VoucherCreate(BaseModel):
+    # ... 既有字段 ...
+    client_request_id: str | None = Field(
+        default=None, max_length=64,
+        description="HUB 调用方传入的幂等键。同一 key 重复 POST 返已存在的 voucher（200 + idempotent_replay=True）。",
+    )
+```
+
+**3.4 Router 幂等回放语义**：
+
+```python
+# backend/app/routers/vouchers.py
+@router.post("", response_model=VoucherResponse)
+async def create_voucher(payload: VoucherCreate, ...):
+    # 幂等回放：先按 client_request_id 查
+    if payload.client_request_id:
+        existing = await Voucher.filter(
+            client_request_id=payload.client_request_id,
+        ).first()
+        if existing:
+            # 直接返已存在的 voucher，标 idempotent_replay；
+            # 注意：不是 409 而是 200，让 HUB 端继续往下走（不破坏 phase1 流程）
+            return VoucherResponse(
+                **existing.to_dict(),
+                idempotent_replay=True,
+            )
+
+    # 正常创建路径
+    voucher = await Voucher.create(
+        **payload.dict(exclude_unset=True),
+        # client_request_id 一并写入
+    )
+    # 唯一索引兜底：如果两个并发请求同时进到这里、且 ORM 层没catch 到第一个，
+    # PostgreSQL UNIQUE 索引会抛 IntegrityError → 应捕获后重新查询返回已存在的（同上）
+    return VoucherResponse(**voucher.to_dict(), idempotent_replay=False)
+```
+
+**3.5 测试 case（ERP 仓库 backend/tests/test_voucher_idempotent.py）**：
+
+| # | 场景 | 期望 |
+|---|---|---|
+| 1 | 不传 client_request_id 创建 | 正常 200 + idempotent_replay=False |
+| 2 | 传新 client_request_id 创建 | 200 + voucher 持久化含此 key |
+| 3 | 重复传相同 client_request_id | 200 + 返第 1 次的 voucher + idempotent_replay=True |
+| 4 | 不同 voucher_data 但同 client_request_id | 200 + 返第 1 次的 voucher（不更新 voucher_data；幂等保证一致性，不接受第二次输入） |
+| 5 | 历史 voucher（client_request_id NULL） | 不互相冲突（部分唯一索引允许多 NULL）|
+
+- [ ] **Step 4: 在 ERP 仓库提交**
 
 ```bash
 cd /Users/lin/Desktop/ERP-4
-git commit -m "feat: 加 customer-price-rules CRUD + inventory/aging（HUB Plan 6 依赖）"
+git add backend/app/models/voucher.py \
+        backend/app/schemas/voucher.py \
+        backend/app/routers/vouchers.py \
+        backend/app/routers/customer_price_rules.py \
+        backend/app/routers/inventory.py \
+        backend/migrations/models/
+git commit -m "feat: ERP for HUB Plan 6（customer-price-rules CRUD + inventory/aging + voucher.client_request_id 幂等键）"
 ```
 
 ---
@@ -2389,20 +2630,29 @@ git commit -m "docs(hub): Plan 6 端到端验证记录"
 | §9 成本控制 | Task 6（5 阈值 + 调用前裁剪）+ Task 14（仪表盘）| ✓ |
 | §10 测试策略 | Task 16（eval）+ 各 Task 单测（合计 ~140）| ✓ |
 | §11 不在范围 | 各 Task 没引入 | ✓ |
-| §14 ERP 改动 | Task 18 | ✓ |
+| §14 ERP 改动（含 Plan 6 新增 voucher.client_request_id 幂等键）| Task 18 | ✓ |
 
-### Placeholder Scan
+### Placeholder Scan（实事求是版）
 
-- ✓ 无 TBD / TODO / "类似 X" 占位
+- ✓ 无 "TBD" / "TODO" / "implement later" / "fill in details" 等纯占位词
+- ✓ 无 "类似 Task N" 这种引用其他 Task 才能理解的省略
 - ✓ 每个 Task 都有明确 Files / Steps / commit msg
-- ✓ 每个 Step 都有可执行命令 / 测试断言
+- ✓ 每个 Step 都有可执行命令 / 测试断言或测试表
+- ⚠️ **完整实现 vs 设计骨架的区分**：
+  - 「**完整实现**」（执行者照抄即可）：Task 1（tool_logger 全实现 + migration 关键 SQL）、Task 2（ToolRegistry 全实现含写门禁 + ConfirmGate）、Task 4（SessionMemory + UserMemory 全实现）、Task 6（ChainAgent.run 全实现含 ContextBuilder + RE_CONFIRM 链路 + 5 阈值）、Task 8（batch_approve_vouchers 含两阶段提交 + creating 租约恢复全实现）、Task 17（seed.py 14 权限码 + 2 角色 + 业务词典 dict 全列出）、Task 18（ERP voucher.client_request_id 模型 + 迁移 + router 全实现）
+  - 「**设计骨架**」（执行者需照 spec + 同 Task 测试用例补完，不是占位）：Task 3 各 ERP read tool 函数体（套路一致：调 erp_adapter + 包装）、Task 4 CustomerMemory / ProductMemory（schema 与 UserMemory 同型）、Task 5 PromptBuilder（few-shots 列表照 spec §3.5 抄）、Task 7 generate_contract / generate_excel_query（按测试 case + 文件目录骨架照抄）、Task 9 analyze_top_customers / analyze_slow_moving_products（聚合套路 spec §4.4 已给）、Task 10 handle_inbound 升级（Plan 5 已有 inbound handler 全文，仅插入 ChainAgent 调用）、Task 11-15 admin UI（Vue SFC + 路由，参考 Plan 5 既有 admin 页风格）、Task 16 EvalRunner（标准 LLM 评测框架，不是新发明）
+
+- 上述「设计骨架」类 Task 都明确给了：(1) 文件路径 (2) 测试用例表（执行者 TDD 时先写测试就能反推实现） (3) spec 对应章节锚点。这与 "TODO: implement"（无任何细节）有本质区别。
 
 ### 类型一致性
 
-- ✓ ToolRegistry.call() 签名跨 Task 一致（hub_user_id / acting_as / conversation_id / round_idx）
+- ✓ ToolRegistry.call() 签名跨 Task 一致（hub_user_id / acting_as / conversation_id / round_idx + 可选 confirmation_token in args）
 - ✓ AgentResult 类型跨 Task 6 / Task 10 一致
-- ✓ Memory dataclass 字段跨 Task 4 / Task 5 / Task 6 一致
-- ✓ ToolDef.fn 必须 async + 必须有 acting_as_user_id 参数
+- ✓ Memory dataclass 字段跨 Task 4 / Task 5 / Task 6 一致（SessionContext / UserMemory / CustomerMemory / ProductMemory）
+- ✓ ToolDef.fn 必须 async + 必须有 acting_as_user_id 参数（ToolRegistry.register 校验签名）
+- ✓ ConfirmGate (conversation_id, hub_user_id) 二元组隔离 + action_id 多 pending 支持 — 跨 Task 2 / Task 6 / Task 10 一致
+- ✓ voucher_draft 状态机 5 值（pending / creating / created / approved / rejected）跨 spec §5.4 / Task 1 / Task 8 / Task 18 一致
+- ✓ client_request_id 命名：HUB 端 `f"hub-draft-{draft.id}"` 与 ERP schema VARCHAR(64) NULL 一致
 
 ### 范围检查
 
@@ -2439,6 +2689,14 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
 ---
 
 **Plan 6 v3 结束（应用第二轮 review 6 条反馈：实现块完整化 / 确认链路端到端 / 批量审批两阶段提交幂等 / ContextBuilder must_keep 拆分 / should_extract 签名修正 / 占位 + 反馈口径全清）**
+
+**Plan 6 v4 结束（应用第三轮 review 6 条反馈）**：
+- P1 #1：ConfirmGate 按 (conversation_id, hub_user_id) 二元组隔离 + action_id 支持单 round 多 pending（跨 Task 2 / 6 / 10 端到端打通）
+- P1 #2：Task 18 加 ERP `voucher.client_request_id` 字段 + 部分唯一索引 + 幂等回放（Task 8 强阻塞依赖）
+- P1 #3：Task 8 加 `creating_started_at` 5 min 租约 + 崩溃恢复路径（status=creating 过期则重新拿锁，client_request_id 不变让 ERP 唯一索引兜底防重复创建）
+- P2 #4：ToolRegistry 全实现块补 imports 起手块
+- P2 #5：spec §4.2 / §14 同步两阶段 + 幂等 + 租约恢复语义（§14 把 voucher 从"已有可复用"挪到"需要修改"）
+- P3 #6：Self-Review Placeholder Scan 改为实事求是版（区分"完整实现" vs "设计骨架"，并标注每类骨架 Task 的可执行性来源）
 
 总计：
 - 19 个 Task

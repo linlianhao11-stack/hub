@@ -432,15 +432,31 @@ agent: 发 docx 文件到钉钉 + "合同草稿已生成，请确认"
 agent: search_orders(type=expense_reimburse, since=this_week)
        → 12 条
 agent: 按规则匹配凭证模板（差旅 → 借：管理费用-差旅 / 贷：库存现金）
-       create_voucher_draft × 12（每条单独草稿）
+       create_voucher_draft × 12（每条单独草稿；ChainAgent 单 round 内可批量调）
 agent: 钉钉提醒："本周差旅 12 张凭证草稿已生成，请到 HUB 后台『待审批』审核。"
        同时发钉钉链接：http://hub.example.com/admin/approvals/voucher
 ```
 
-**审批 inbox**：会计登 HUB 后台 → 「待审批」页 → 列表 12 条 → 全选 → 一键通过 → HUB 调 ERP `POST /api/v1/vouchers` × 12 → 落 ERP。
+**审批 inbox**（两阶段提交 + 幂等键 + creating 租约恢复）：
+
+会计登 HUB 后台 → 「待审批」页 → 列表 12 条 → 全选 → 一键通过 → HUB `POST /admin/approvals/voucher/batch-approve`：
+
+**Phase 1（pending → creating → created）**：HUB 端给每条 draft 拿乐观锁标记 `status=creating + creating_started_at=now`，逐个调 ERP `POST /api/v1/vouchers`，body 里塞 `client_request_id="hub-draft-{id}"`：
+- 创建成功：`erp_voucher_id=...`、`status=created`、清 `creating_started_at`
+- 创建失败：回滚 `status=pending` + 清 `creating_started_at`（下次重试可继续）
+- HUB 进程崩溃：draft 卡在 `creating`，下次 batch 看到 `creating_started_at` 已过 5 min 租约就接管，仍用同 `client_request_id`；ERP 端 `voucher.client_request_id` 唯一索引保证不会重复创建（返 `idempotent_replay=True` 的已存在 voucher）
+
+**Phase 2（created → approved）**：所有 phase 1 落 ERP 的 + 入参中本来 status=created 的（重试场景）一次性调 ERP `POST /api/v1/vouchers/batch-approve`：
+- 通过：`status=approved + approved_by_hub_user_id + approved_at`
+- 失败：保持 `status=created`，可重试 phase 2（不会回到 pending，避免重复创建）
+
+**关键不变量**：
+1. 一条 voucher_draft 全程最多对应一条 ERP voucher（client_request_id + 部分唯一索引）
+2. 任何中间状态崩溃都可恢复（pending / creating-with-expired-lease / created 都能继续推进）
+3. 拒绝（rejected）只能从 pending 走（已 created 的要去 ERP 反审）
 
 涉及 tool：`search_orders / create_voucher_draft`
-涉及表：`voucher_draft`（HUB 新增）+ ERP `voucher`（已有）
+涉及表：`voucher_draft`（HUB 新增，含 status / creating_started_at / erp_voucher_id）+ ERP `voucher`（**Plan 6 加 client_request_id 字段 + 部分唯一索引 + 幂等回放语义**，见 §14.2）
 
 ### 4.3 销售主管审批调价（部分 D 阶段）
 
@@ -626,15 +642,25 @@ CREATE TABLE voucher_draft (
     requester_hub_user_id INT NOT NULL,
     voucher_data JSONB NOT NULL,  -- 凭证内容（科目/金额/摘要）
     rule_matched TEXT,  -- 匹配的凭证模板
-    status TEXT DEFAULT 'pending',  -- pending / approved / rejected
+    -- 状态机（v3 round 2 加 creating 租约）：
+    --   pending → creating → created → approved
+    --                      ↘  pending（创建失败回滚）
+    --   pending → rejected
+    --   creating（崩溃残留，5 min 租约过期后下次 batch 接管）→ created
+    status TEXT DEFAULT 'pending',
+    creating_started_at TIMESTAMPTZ,  -- creating 状态进入时间，用于 5 min 租约判断；created/pending/rejected 时为 NULL
     approved_by_hub_user_id INT,
     approved_at TIMESTAMPTZ,
     rejection_reason TEXT,
-    erp_voucher_id INT,  -- 落 ERP 后的 voucher ID
+    erp_voucher_id INT,  -- 落 ERP 后的 voucher ID（status>=created 时非空）
     conversation_id TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    INDEX idx_pending (status, created_at)
+    INDEX idx_pending (status, created_at),
+    INDEX idx_creating_lease (status, creating_started_at)  -- 崩溃恢复扫描用
 );
+-- 注：HUB 端发到 ERP 创建 voucher 时塞 client_request_id = "hub-draft-{id}"
+-- ERP 端给 voucher 表加 client_request_id 字段 + 部分唯一索引（NOT NULL 时唯一）做幂等
+-- 见 §14.2 ERP 改动清单
 
 CREATE TABLE price_adjustment_request (
     id SERIAL PRIMARY KEY,
@@ -943,21 +969,23 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 | `get_customer_balance` | `GET /api/v1/finance/customer-statement/{customer_id}` | ✅ |
 | `check_inventory` | `GET /api/v1/products/{id}`（含 stocks 字段）| ✅ |
 | `create_stock_adjustment_request → 落 ERP` | `POST /api/v1/stock/adjust` | ✅ |
-| `create_voucher_draft → 落 ERP` | `POST /api/v1/vouchers` | ✅ |
-| 凭证批量审批落地 | `POST /api/v1/vouchers/batch-approve` | ✅（甚至已有批量能力）|
+| 凭证批量审批落地 | `POST /api/v1/vouchers/batch-approve` | ✅（已有批量能力）|
 
-### 14.2 ERP 需要新增 endpoint（Plan 6 阻塞依赖）
+### 14.2 ERP 需要新增/修改（Plan 6 阻塞依赖）
 
-| HUB tool | 需要的 ERP endpoint | 估时 |
+| HUB tool / 场景 | 需要的 ERP 改动 | 估时 |
 |---|---|---|
+| **凭证两阶段提交幂等键**（HUB Task 8 强阻塞）| `voucher` 表加 `client_request_id VARCHAR(64) NULL` + 部分唯一索引（NOT NULL 时唯一）；`POST /api/v1/vouchers` body 接收 `client_request_id` 可选字段；冲突时返已存在的 voucher（HTTP 200 + `idempotent_replay=True`） | 0.5 天 |
 | `create_price_adjustment_request → 落 ERP` | `POST/PATCH /api/v1/customer-price-rules`（客户专属定价规则）| 1-2 天（ERP 侧）|
 | `get_inventory_aging` | `GET /api/v1/inventory/aging`（按库龄聚合）| 0.5 天 |
 | `analyze_top_customers` | 可用现有 `/api/v1/orders` + `/api/v1/customers` 在 HUB 端聚合，**不阻塞** | 0 |
 | `analyze_slow_moving_products` | 同上，HUB 端聚合 | 0 |
 
+> **凭证幂等键为 Plan 6 强阻塞**：没有这一步，HUB phase 1 调 ERP create_voucher 进程崩溃后下次 batch 重试会重复创建 ERP voucher（脏数据）。详见 §4.2 + plan Task 18 Step 3。
+
 ### 14.3 ERP 仓库改动估时
 
-约 **1.5-2.5 天 ERP 工作量**。Plan 6 的 ERP 部分单独成 commit 提交（在 ERP-4 仓库），HUB 这边可以先做不依赖这两个 endpoint 的 tool；最后两个 tool 等 ERP merge 后再做。
+约 **2-3 天 ERP 工作量**（含 voucher 幂等键改动）。Plan 6 的 ERP 部分单独成 commit 提交（在 ERP-4 仓库）；HUB 这边可以先做不依赖这些改动的 tool（读类的 search_*、check_inventory 等都能先做），最后写类 tool（凭证草稿审批 / 调价 / 库龄）等 ERP merge 后再做。
 
 ---
 
@@ -975,4 +1003,9 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 
 ---
 
-**Spec 结束**
+**Spec 结束（v4）**
+
+> v4 改动（同步 plan 第三轮 review 6 条修复）：
+> - §4.2 凭证审批场景改为两阶段提交 + 幂等键 + creating 5 min 租约恢复语义
+> - §5.4 voucher_draft 加 creating_started_at 字段 + status 五值（含 creating）+ idx_creating_lease 索引
+> - §14.2 把 ERP voucher 从"已有可直接复用"挪到"需要修改"，明确 client_request_id 字段为 Plan 6 强阻塞依赖
