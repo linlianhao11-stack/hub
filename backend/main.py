@@ -13,6 +13,7 @@ from hub.config import get_settings
 from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup
 from hub.routers.admin import login as admin_login
+from hub.routers.admin import users as admin_users
 
 logger = logging.getLogger("hub")
 
@@ -154,3 +155,4 @@ app.include_router(health.router)
 app.include_router(setup.router)
 app.include_router(internal_callbacks.router)
 app.include_router(admin_login.router)
+app.include_router(admin_users.router)
