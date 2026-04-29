@@ -42,9 +42,9 @@
 
 ```
 $ pytest -q
-314 passed in 35.33s
+314 passed in 35.62s
 
-$ ruff check hub/ tests/
+$ ruff check .   # 全量（含 main.py / worker.py / 仓库根级文件）
 All checks passed!
 ```
 

@@ -37,6 +37,21 @@ docker compose build hub-gateway hub-worker hub-migrate
 docker compose up -d  # 自动重建有变化的容器
 ```
 
+### 后台改了配置之后
+
+worker 进程在启动时一次性读取 ERP ApiKey、AI Provider 等配置构造客户端，**运行中不会自动重载**。
+所以以下 admin 后台操作之后必须重启 worker 才能让机器人立即用上新配置：
+
+| admin 后台操作 | 需要重启 |
+|---|---|
+| 改 ERP ApiKey / 改 base_url / 停用 ERP | ✅ `docker compose restart hub-worker` |
+| 切换 active AI Provider / 改 AI ApiKey | ✅ `docker compose restart hub-worker` |
+| 钉钉应用改 AppKey/AppSecret/robot_id | ❌ gateway 后台 task 自动 reload，无需重启 |
+| 用户/角色/权限/账号关联 | ❌ 即时生效（每次请求查 DB） |
+| 系统设置 key-value（告警接收人 / TTL 等） | ❌ 调用方读 DB 时即时生效 |
+
+gateway 进程不持有 ERP/AI 凭证（鉴权 cookie 走 ERP /auth/me 即时校验），所以这两类改动不影响 gateway。
+
 ### 本地开发
 
 ```bash
@@ -45,6 +60,7 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
+ruff check .   # 全量 lint（含 main.py / worker.py）
 ```
 
 ### 项目结构

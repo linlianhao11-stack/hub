@@ -104,8 +104,10 @@ const groups = [
     title: '运行时',
     items: [
       { to: '/admin/tasks', label: '任务列表', icon: ListChecks, perm: 'platform.tasks.read' },
-      { to: '/admin/conversation/live', label: '实时会话', icon: Activity, perm: 'platform.tasks.read' },
-      { to: '/admin/conversation/history', label: '历史会话', icon: History, perm: 'platform.tasks.read' },
+      // ↓ 后端 /admin/conversation/live + /history 要 platform.conversation.monitor，
+      //   之前误用 tasks.read 会让 platform_ops/viewer 看到入口但点了 403
+      { to: '/admin/conversation/live', label: '实时会话', icon: Activity, perm: 'platform.conversation.monitor' },
+      { to: '/admin/conversation/history', label: '历史会话', icon: History, perm: 'platform.conversation.monitor' },
       { to: '/admin/audit', label: '审计日志', icon: ClipboardList, perm: 'platform.audit.read' },
     ],
   },

@@ -3,6 +3,11 @@
     <h1 class="hub-page__title">AI 提供商</h1>
     <p class="hub-page__hint">同时只允许一个 active。新建后默认为 active，会自动停用其他。</p>
 
+    <div class="hub-page__notice hub-page__notice--warning">
+      ⚠️ 切换 active 提供商或改 API Key 后，正在运行的 worker 仍用旧 provider。需要在主机执行
+      <code>docker compose restart hub-worker</code> 让 LLMParser 用上新配置（gateway 不受影响）。
+    </div>
+
     <div v-if="error" class="hub-page__error">{{ error }}</div>
 
     <div class="hub-toolbar">
@@ -189,6 +194,23 @@ onMounted(() => {
   border-radius: 6px;
   padding: 8px 10px;
   font-size: 12px;
+}
+.hub-page__notice {
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.hub-page__notice--warning {
+  background: color-mix(in srgb, var(--warning, #eab308) 14%, transparent);
+  color: var(--warning-emphasis, #854d0e);
+  border: 1px solid color-mix(in srgb, var(--warning, #eab308) 35%, transparent);
+}
+.hub-page__notice code {
+  font-family: var(--font-mono);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  padding: 1px 6px;
+  border-radius: 4px;
 }
 .hub-toolbar { display: flex; align-items: center; gap: 8px; }
 .hub-toolbar__spacer { flex: 1; }
