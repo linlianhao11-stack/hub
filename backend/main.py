@@ -12,7 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from hub.config import get_settings
 from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup
+from hub.routers.admin import ai_providers as admin_ai_providers
+from hub.routers.admin import channels as admin_channels
+from hub.routers.admin import downstreams as admin_downstreams
 from hub.routers.admin import login as admin_login
+from hub.routers.admin import system_config as admin_system_config
 from hub.routers.admin import users as admin_users
 
 logger = logging.getLogger("hub")
@@ -80,15 +84,18 @@ async def lifespan(app: FastAPI):
     from redis.asyncio import Redis
 
     from hub.adapters.channel.dingtalk_stream import DingTalkStreamAdapter
-    from hub.lifecycle import connect_dingtalk_stream_when_ready
+    from hub.lifecycle import connect_with_reload
     from hub.queue import RedisStreamsRunner
     redis_client = Redis.from_url(settings.redis_url, decode_responses=False)
     runner = RedisStreamsRunner(redis_client=redis_client)
     app.state.redis = redis_client
     app.state.task_runner = runner
-    app.state.dingtalk_adapter = None
 
-    # 5. 后台 task：等钉钉应用配置就绪后连 Stream（连上即退出 task）
+    # reload event + state holder：admin 改 ChannelApp 后 set() → 后台 task 重启 adapter
+    app.state.dingtalk_reload_event = asyncio.Event()
+    app.state.dingtalk_state = {}  # holder：{"adapter": DingTalkStreamAdapter | None}
+
+    # 5. 后台 task：循环模式连接钉钉 Stream（不退出，监听 reload event）
     async def _on_inbound(msg):
         await runner.submit("dingtalk_inbound", {
             "channel_type": msg.channel_type,
@@ -98,32 +105,27 @@ async def lifespan(app: FastAPI):
             "timestamp": msg.timestamp,
         })
 
-    async def _bg_connect():
-        adapter = await connect_dingtalk_stream_when_ready(
+    connect_task = asyncio.create_task(
+        connect_with_reload(
             on_inbound=_on_inbound,
             adapter_factory=DingTalkStreamAdapter,
-        )
-        app.state.dingtalk_adapter = adapter
-
-    connect_task = asyncio.create_task(_bg_connect(), name="dingtalk_connect")
+            reload_event=app.state.dingtalk_reload_event,
+            state_holder=app.state.dingtalk_state,
+        ),
+        name="dingtalk_connect",
+    )
     app.state.dingtalk_connect_task = connect_task
 
     yield
 
     logger.info("HUB Gateway 关闭")
-    # 关闭顺序：先取消连接 task，再 stop adapter，最后 redis / db
+    # 关闭顺序：先取消连接 task（task cancel 会自己 stop 当前 adapter），再 redis / db
     if not connect_task.done():
         connect_task.cancel()
         try:
             await connect_task
         except (asyncio.CancelledError, Exception):
             pass
-    adapter = getattr(app.state, "dingtalk_adapter", None)
-    if adapter is not None:
-        try:
-            await adapter.stop()
-        except Exception:
-            logger.exception("DingTalk adapter 停止异常")
     sess_adapter = getattr(app.state, "_session_erp_adapter", None)
     if sess_adapter is not None:
         try:
@@ -156,3 +158,7 @@ app.include_router(setup.router)
 app.include_router(internal_callbacks.router)
 app.include_router(admin_login.router)
 app.include_router(admin_users.router)
+app.include_router(admin_downstreams.router)
+app.include_router(admin_channels.router)
+app.include_router(admin_ai_providers.router)
+app.include_router(admin_system_config.router)
