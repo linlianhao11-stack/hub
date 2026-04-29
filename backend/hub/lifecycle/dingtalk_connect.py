@@ -125,16 +125,43 @@ async def connect_with_reload(
                 app_key=app_key, app_secret=app_secret, robot_id=channel_app.robot_id,
             )
             adapter.on_message(on_inbound)
-            await adapter.start()
+            # ❗ adapter.start() 是 SDK 长连接 block 调用永不返回（WebSocket 循环），
+            #    所以**必须在 start() 之前**就把 adapter 装入 state_holder，否则 health
+            #    endpoint 永远看不到 connected 状态
             current_adapter = adapter
             if state_holder is not None:
                 state_holder["adapter"] = adapter
-            logger.info("钉钉 Stream 已连接（reload 模式）")
+            logger.info("钉钉 Stream 配置加载，开始长连接")
 
-            # 等 reload event 或被取消
-            await reload_event.wait()
-            reload_event.clear()
-            logger.info("收到 reload 信号，准备重新加载 ChannelApp")
+            # adapter.start() 与 reload event 并行：reload event 触发时取消 start()
+            start_task = asyncio.create_task(adapter.start(), name="dingtalk_adapter_start")
+            reload_task = asyncio.create_task(reload_event.wait(), name="dingtalk_reload_wait")
+            done, pending = await asyncio.wait(
+                {start_task, reload_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if reload_task in done:
+                logger.info("收到 reload 信号，准备重新加载 ChannelApp")
+                reload_event.clear()
+                # 取消正在跑的 start_task；adapter.stop() 在循环顶部处理
+                if not start_task.done():
+                    start_task.cancel()
+                    try:
+                        await start_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            else:
+                # adapter.start() 自己结束了（异常断连）→ 让 except 路径重试
+                if not reload_task.done():
+                    reload_task.cancel()
+                    try:
+                        await reload_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                # 取出 start_task 的异常（如果有）触发外层 except 重连
+                exc = start_task.exception()
+                if exc is not None:
+                    raise exc
+                logger.info("钉钉 Stream 长连接结束，准备重连")
 
         except asyncio.CancelledError:
             logger.info("connect_with_reload 被取消，关闭 Stream")
