@@ -308,8 +308,8 @@ async def test_write_tool_with_wrong_token_raises():
                  perm="usecase.create_voucher.use",
                  tool_type=ToolType.WRITE_DRAFT,
                  description="...")
-    # 先确认一个不同 args 的动作
-    await reg.confirm_gate.mark_confirmed("c1", "create_voucher_draft",
+    # 先确认一个不同 args 的动作（mark_confirmed 按 (conv, hub_user_id) 隔离）
+    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft",
                                           {"amount": 999})
     with pytest.raises(UnconfirmedWriteToolError):
         await reg.call("create_voucher_draft", {"amount": 1000},
@@ -327,12 +327,56 @@ async def test_write_tool_with_correct_token_passes():
                  perm="usecase.create_voucher.use",
                  tool_type=ToolType.WRITE_DRAFT, description="...")
     args = {"amount": 1000}
-    await reg.confirm_gate.mark_confirmed("c1", "create_voucher_draft", args)
-    token = reg.confirm_gate.compute_token("c1", "create_voucher_draft", args)
+    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft", args)
+    token = reg.confirm_gate.compute_token("c1", 1, "create_voucher_draft", args)
     result = await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
                             hub_user_id=1, acting_as=2,
                             conversation_id="c1", round_idx=0)
     assert result is not None
+
+# === token 一次性消费（2 case，对应 review v4 第三轮 P1）===
+async def test_write_tool_token_is_one_time_use():
+    """同 token 第二次调用被拒（防 LLM 重试 / 同对话回合内复用）。"""
+    reg = ToolRegistry()
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    args = {"amount": 1000}
+    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft", args)
+    token = reg.confirm_gate.compute_token("c1", 1, "create_voucher_draft", args)
+
+    # 第一次：成功执行 + 消费 token
+    result1 = await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
+                              hub_user_id=1, acting_as=2,
+                              conversation_id="c1", round_idx=0)
+    assert result1 is not None
+
+    # 第二次（同 token 同 args）：is_confirmed → False（已 SREM）→ 拦截
+    with pytest.raises(UnconfirmedWriteToolError):
+        await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
+                       hub_user_id=1, acting_as=2,
+                       conversation_id="c1", round_idx=1)
+
+
+async def test_write_tool_token_preserved_when_tool_fails():
+    """tool fn 抛异常时 token 不消费，下次重试可继续用（提升用户体验）。"""
+    reg = ToolRegistry()
+    async def flaky(amount, **_): raise RuntimeError("ERP 5xx")
+    reg.register("create_voucher_draft", flaky,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    args = {"amount": 1000}
+    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft", args)
+    token = reg.confirm_gate.compute_token("c1", 1, "create_voucher_draft", args)
+
+    # 第一次：tool 失败 → token 保留
+    with pytest.raises(RuntimeError):
+        await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
+                       hub_user_id=1, acting_as=2,
+                       conversation_id="c1", round_idx=0)
+    assert await reg.confirm_gate.is_confirmed(
+        "c1", 1, "create_voucher_draft", args, token,
+    ) is True  # token 仍在 confirmed set 内
 
 # === 实体写入路径（2 case，对应 review P2-#8）===
 async def test_call_extracts_customer_id_from_result():
@@ -355,7 +399,7 @@ async def test_call_validates_args_against_schema():
 async def test_schema_for_user_caches_per_user():
 ```
 
-合计 **13 case**。
+合计 **15 case**（含 v4 第三轮 P1 加的 token 一次性消费 2 case）。
 
 - [ ] **Step 2: 实现 ToolRegistry**
 
@@ -363,13 +407,21 @@ async def test_schema_for_user_caches_per_user():
 # hub/agent/tools/registry.py
 from __future__ import annotations
 import inspect
-from typing import Callable, get_type_hints
+import logging
+import time
+from typing import Any, Callable, get_type_hints
+
 from hub.permissions import require_permissions, has_permission
 from hub.observability.tool_logger import log_tool_call
-from hub.agent.tools.types import ToolType, ToolDef, UnconfirmedWriteToolError, ToolNotFoundError
+from hub.agent.tools.types import (
+    ToolType, ToolDef,
+    UnconfirmedWriteToolError, ToolNotFoundError, ToolArgsValidationError,
+)
 from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.agent.tools.entity_extractor import EntityExtractor
 from hub.agent.memory.session import SessionMemory
+
+logger = logging.getLogger("hub.agent.tools.registry")
 
 
 class ToolRegistry:
@@ -451,12 +503,13 @@ class ToolRegistry:
 
     async def call(self, name: str, args: dict, *, hub_user_id: int,
                    acting_as: int, conversation_id: str, round_idx: int) -> Any:
-        """统一入口：写门禁 → 权限 → schema 校验 → 调 fn → 提取实体 → 记 log。"""
+        """统一入口：写门禁 → 权限 → schema 校验 → 调 fn → 消费 token → 提取实体 → 记 log。"""
         tool = self._tools.get(name)
         if not tool:
             raise ToolNotFoundError(name)
 
         # ❶ 写类 tool 硬门禁（review v3 第二轮 P1：按 hub_user_id 隔离）
+        token: str | None = None
         if tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP):
             token = args.pop("confirmation_token", None)
             if not await self.confirm_gate.is_confirmed(
@@ -466,9 +519,9 @@ class ToolRegistry:
                 await self._log_blocked_call(conversation_id, round_idx, name, args,
                                               reason="unconfirmed_write")
                 raise UnconfirmedWriteToolError(
-                    f"写类 tool '{name}' 必须先经用户确认。"
+                    f"写类 tool '{name}' 必须先经用户确认（或 token 已被消费过）。"
                     "请用 text 把操作预览发给用户，"
-                    "用户回'是'后由 ChainAgent 自动注入 confirmation_token 重试。"
+                    "用户回'是'后由 ChainAgent 自动注入新 confirmation_token 重试。"
                 )
 
         # ❷ 权限校验
@@ -496,7 +549,23 @@ class ToolRegistry:
             result = await tool.fn(**kwargs)
             ctx.set_result(result)
 
-            # ❺ 提取实体引用写回 session memory（review P2-#8）
+            # ❺ 写类 tool 成功执行后：原子消费 token（review v4 第三轮 P1：一次性使用）
+            #    - 失败时不消费：tool fn 抛异常会跳过这里，token 保留可重试，免去用户二次确认
+            #    - 成功时立刻消费：LLM 在 30 min TTL 内拿同 token 重复调被 is_confirmed 拦截
+            #    - SREM 原子：并发场景下只有第一个真正消费成功（次要兜底；主要 LLM flow 是单线程）
+            if token is not None:
+                consumed = await self.confirm_gate.consume_token(
+                    conversation_id, hub_user_id, token,
+                )
+                if not consumed:
+                    # 罕见：tool 执行期间另一并发调用消费了；执行已发生，写一条 warning
+                    logger.warning(
+                        "confirmation_token already consumed by concurrent path "
+                        "(conv=%s user=%s tool=%s)",
+                        conversation_id, hub_user_id, name,
+                    )
+
+            # ❻ 提取实体引用写回 session memory（review P2-#8）
             refs = self.entity_extractor.extract(result)
             if refs.has_any():
                 await self.session_memory.add_entity_refs(
@@ -523,24 +592,6 @@ class ToolRegistry:
             error=f"blocked: {reason}",
         )
 ```
-
-> ⚠ **必要 import**：上面 ToolRegistry 完整实现块顶部的 import 完整列表为：
->
-> ```python
-> import inspect
-> import time
-> from typing import Any, Callable, get_type_hints
->
-> from hub.permissions import require_permissions, has_permission
-> from hub.observability.tool_logger import log_tool_call
-> from hub.agent.tools.types import (
->     ToolType, ToolDef,
->     UnconfirmedWriteToolError, ToolNotFoundError, ToolArgsValidationError,
-> )
-> from hub.agent.tools.confirm_gate import ConfirmGate
-> from hub.agent.tools.entity_extractor import EntityExtractor
-> from hub.agent.memory.session import SessionMemory
-> ```
 
 **配套类型 / Gate 完整实现** — `hub/agent/tools/types.py`：
 
@@ -679,7 +730,11 @@ class ConfirmGate:
 
     async def is_confirmed(self, conversation_id: str, hub_user_id: int,
                            tool_name: str, args: dict, token: str | None) -> bool:
-        """ToolRegistry.call 入口检查（按 conversation_id × hub_user_id 隔离）。"""
+        """ToolRegistry.call 入口检查（按 conversation_id × hub_user_id 隔离）。
+
+        只读：检查 token 形式正确 + 在 confirmed set 中。
+        不消费 token —— 消费由 consume_token 在 tool 成功执行后做。
+        """
         if not token:
             return False
         normalized = self.canonicalize(args)
@@ -689,6 +744,23 @@ class ConfirmGate:
         return bool(await self.redis.sismember(
             self._confirmed_key(conversation_id, hub_user_id), token,
         ))
+
+    async def consume_token(self, conversation_id: str, hub_user_id: int,
+                            token: str) -> bool:
+        """原子消费 token（review v4 第三轮 P1：一次性使用，防 LLM 重试/记忆复用）。
+
+        Redis SREM 是原子操作 —— 同一 token 并发 N 次调用，只有 1 次返 1（成功消费）。
+        ToolRegistry.call 在 tool 成功执行后调；调用方应在确认成功后立即消费，
+        避免 30 min TTL 内被 LLM 在下一 round / 下一对话回合用同 token 重复触发同写操作。
+
+        返：True = 我们刚消费的（合法一次性使用）；False = 已被消费或不存在（重试/篡改）。
+        """
+        if not token:
+            return False
+        removed = await self.redis.srem(
+            self._confirmed_key(conversation_id, hub_user_id), token,
+        )
+        return bool(removed)
 ```
 
 **`hub/agent/tools/entity_extractor.py`**：
@@ -1786,11 +1858,26 @@ async def batch_approve_vouchers(req: BatchApproveRequest, request: Request):
     if len(drafts) != len(req.draft_ids):
         raise HTTPException(400, "包含已审/已拒/不存在的 draft_id")
 
-    # 把 creating 但租约未过期的剔掉（别的进程还在处理）
-    drafts = [
-        d for d in drafts
-        if d.status != "creating" or (d.creating_started_at and d.creating_started_at < lease_cutoff)
-    ]
+    # 把 creating 但租约未过期的标"in_progress"，单独返让 UI 显示"处理中"
+    # （review v4 第三轮 P2-#3：不能静默吞掉，否则用户看到 approved=0 / failed=[] 没法判断到底发生了什么）
+    in_progress: list[dict] = []
+    actionable_drafts: list = []
+    for d in drafts:
+        if d.status == "creating" and (
+            d.creating_started_at is None or d.creating_started_at >= lease_cutoff
+        ):
+            in_progress.append({
+                "draft_id": d.id,
+                "since": d.creating_started_at.isoformat() if d.creating_started_at else None,
+                "lease_expires_at": (
+                    (d.creating_started_at + LEASE_TIMEOUT).isoformat()
+                    if d.creating_started_at else None
+                ),
+                "reason": "另一会话正在处理此草稿，请稍后重试或等租约自动过期",
+            })
+        else:
+            actionable_drafts.append(d)
+    drafts = actionable_drafts
 
     actor = request.state.hub_user
     creation_failures = []
@@ -1836,6 +1923,7 @@ async def batch_approve_vouchers(req: BatchApproveRequest, request: Request):
         return {
             "approved_count": 0, "approved_draft_ids": [],
             "failed": creation_failures,
+            "in_progress": in_progress,  # 让 UI 区分"处理中"vs"全部失败"
         }
 
     # ========== Phase 2: 一次性调 ERP batch-approve（事务）==========
@@ -1870,12 +1958,14 @@ async def batch_approve_vouchers(req: BatchApproveRequest, request: Request):
             "approved": approved_draft_ids,
             "creation_failed": creation_failures,
             "approve_failed": approve_failures,
+            "in_progress": [p["draft_id"] for p in in_progress],
         },
     )
     return {
         "approved_count": len(approved_draft_ids),
         "approved_draft_ids": approved_draft_ids,
         "failed": creation_failures + approve_failures,
+        "in_progress": in_progress,  # review v4 第三轮 P2-#3：让 UI 显示"处理中"
     }
 
 
@@ -1905,7 +1995,7 @@ async def batch_reject_vouchers(req, request):
 - `Voucher` 表加 `client_request_id` 字段（VARCHAR 64，NULL OK）+ partial unique index（仅当 client_request_id NOT NULL 时唯一）
 - `POST /api/v1/vouchers` body 接受 `client_request_id` 字段；冲突时返已存在的 voucher（HTTP 200 + 标记 idempotent_replay=True）
 
-- [ ] **Step 3: 测试 16 case（含 creating 租约恢复）**
+- [ ] **Step 3: 测试 17 case（含 creating 租约恢复 + in_progress 暴露）**
 
 | # | 场景 | 期望 |
 |---|---|---|
@@ -1924,7 +2014,8 @@ async def batch_reject_vouchers(req, request):
 | 13 | 无审批权限 | 403 |
 | 14 | 同 draft_id 并发 batch-approve | 第二次乐观锁失败，跳过该条（status=creating + 租约未过期）|
 | 15 | **崩溃恢复（租约过期）**：人为造一条 status=creating + creating_started_at=10 分钟前 → 再次 batch-approve 同 draft_id | 视为崩溃残留，重新进 phase1 + 同 client_request_id 调 ERP；ERP 返 idempotent_replay → 标 created → 进 phase2 |
-| 16 | **租约未过期跳过**：status=creating + creating_started_at=2 分钟前 → 再次 batch-approve | 当作"另一个进程在处理"，本次跳过该条不进 phase1 |
+| 16 | **租约未过期跳过**：status=creating + creating_started_at=2 分钟前 → 再次 batch-approve | 当作"另一个进程在处理"，**该条不进 phase1，但出现在 response.in_progress 中**（含 since / lease_expires_at / 中文 reason），UI 可显示"处理中"区别于"全部失败" |
+| 17 | **混合 in_progress + 正常**：3 张 draft 中 1 张 creating(2min 前 lease 未过)，2 张 pending → batch-approve 全部 | 2 张正常进 phase1+phase2 → approved_count=2；in_progress 数组含那 1 条；失败列表为空 |
 
 - [ ] **Step 4: 提交**
 
@@ -2520,28 +2611,59 @@ class VoucherCreate(BaseModel):
 
 ```python
 # backend/app/routers/vouchers.py
+from tortoise.exceptions import IntegrityError
+
 @router.post("", response_model=VoucherResponse)
 async def create_voucher(payload: VoucherCreate, ...):
-    # 幂等回放：先按 client_request_id 查
+    """凭证创建（含幂等回放）。
+
+    幂等语义（review v4 第三轮 P1：实际处理并发唯一冲突）：
+    - 不传 client_request_id：按普通创建走（idempotent_replay=False）
+    - 传 client_request_id：
+        1. 先查：命中 → 直接返已存在 voucher（idempotent_replay=True）
+        2. 未命中 → 尝试 INSERT
+        3. 并发场景：两个请求同时走到 #2，第一个 INSERT 成功，第二个被
+           PostgreSQL UNIQUE 索引拒（IntegrityError）；catch + 重新查询 → 返已存在
+        4. 状态码统一 200：不是 409，让 HUB 端 phase1 流程不被打断
+
+    返回：始终 200 + idempotent_replay 字段标识本次是否实际创建。
+    """
     if payload.client_request_id:
+        # 幂等回放：先按 client_request_id 查
         existing = await Voucher.filter(
             client_request_id=payload.client_request_id,
         ).first()
         if existing:
-            # 直接返已存在的 voucher，标 idempotent_replay；
-            # 注意：不是 409 而是 200，让 HUB 端继续往下走（不破坏 phase1 流程）
             return VoucherResponse(
                 **existing.to_dict(),
                 idempotent_replay=True,
             )
 
-    # 正常创建路径
-    voucher = await Voucher.create(
-        **payload.dict(exclude_unset=True),
-        # client_request_id 一并写入
-    )
-    # 唯一索引兜底：如果两个并发请求同时进到这里、且 ORM 层没catch 到第一个，
-    # PostgreSQL UNIQUE 索引会抛 IntegrityError → 应捕获后重新查询返回已存在的（同上）
+        # 未命中 → 尝试 INSERT；并发场景下唯一索引可能抛 IntegrityError
+        try:
+            voucher = await Voucher.create(
+                **payload.dict(exclude_unset=True),
+            )
+        except IntegrityError as exc:
+            # 并发兜底：另一并发请求刚刚用同 client_request_id 创建成功
+            # → 本次的 INSERT 撞上唯一索引 → 重新查询 → 返已存在
+            # 必须确认是 client_request_id 唯一冲突，而非其他约束
+            if "client_request_id" not in str(exc).lower():
+                raise  # 其他唯一约束冲突照常向上抛
+            existing = await Voucher.filter(
+                client_request_id=payload.client_request_id,
+            ).first()
+            if not existing:
+                # 极罕见：抛了 IntegrityError 但又查不到 → ORM/DB 层异常状态，向上抛
+                raise
+            return VoucherResponse(
+                **existing.to_dict(),
+                idempotent_replay=True,
+            )
+        return VoucherResponse(**voucher.to_dict(), idempotent_replay=False)
+
+    # 不传 client_request_id：普通路径
+    voucher = await Voucher.create(**payload.dict(exclude_unset=True))
     return VoucherResponse(**voucher.to_dict(), idempotent_replay=False)
 ```
 
@@ -2551,9 +2673,30 @@ async def create_voucher(payload: VoucherCreate, ...):
 |---|---|---|
 | 1 | 不传 client_request_id 创建 | 正常 200 + idempotent_replay=False |
 | 2 | 传新 client_request_id 创建 | 200 + voucher 持久化含此 key |
-| 3 | 重复传相同 client_request_id | 200 + 返第 1 次的 voucher + idempotent_replay=True |
+| 3 | 重复传相同 client_request_id（顺序两次）| 200 + 返第 1 次的 voucher + idempotent_replay=True |
 | 4 | 不同 voucher_data 但同 client_request_id | 200 + 返第 1 次的 voucher（不更新 voucher_data；幂等保证一致性，不接受第二次输入） |
 | 5 | 历史 voucher（client_request_id NULL） | 不互相冲突（部分唯一索引允许多 NULL）|
+| 6 | **并发同 client_request_id（asyncio.gather 两个 POST）** | 两次都返 200；其中一个 idempotent_replay=False（赢），另一个 idempotent_replay=True（被 IntegrityError catch 后回查）；DB 中只有 1 条 voucher |
+| 7 | 客户端 mock：第一次 INSERT 抛 IntegrityError（but 'client_request_id' 字样在 exc 里），回查能查到 | 走 except 分支 + 返 idempotent_replay=True |
+| 8 | 客户端 mock：抛 IntegrityError 但 exc 不含 'client_request_id'（其他唯一约束）| 直接 reraise，路由返 5xx 让 ERP 客户端 retry |
+| 9 | 客户端 mock：抛 IntegrityError 但回查不到（数据库状态异常）| 直接 reraise，不假装成功 |
+
+**测试 6 的并发模式**（pytest-asyncio）：
+```python
+async def test_concurrent_idempotent_replay():
+    payload = {"client_request_id": "hub-draft-99", "voucher_data": {...}}
+    # asyncio.gather 让两个 POST 同时走（HTTP 客户端独立 connection）
+    r1, r2 = await asyncio.gather(
+        client.post("/api/v1/vouchers", json=payload),
+        client.post("/api/v1/vouchers", json=payload),
+    )
+    assert r1.status_code == r2.status_code == 200
+    bodies = [r1.json(), r2.json()]
+    replays = [b["idempotent_replay"] for b in bodies]
+    assert sorted(replays) == [False, True]  # 一个赢，一个被 catch 回查
+    assert bodies[0]["id"] == bodies[1]["id"]  # 返同一 voucher
+    assert await Voucher.filter(client_request_id="hub-draft-99").count() == 1
+```
 
 - [ ] **Step 4: 在 ERP 仓库提交**
 
@@ -2653,6 +2796,8 @@ git commit -m "docs(hub): Plan 6 端到端验证记录"
 - ✓ ConfirmGate (conversation_id, hub_user_id) 二元组隔离 + action_id 多 pending 支持 — 跨 Task 2 / Task 6 / Task 10 一致
 - ✓ voucher_draft 状态机 5 值（pending / creating / created / approved / rejected）跨 spec §5.4 / Task 1 / Task 8 / Task 18 一致
 - ✓ client_request_id 命名：HUB 端 `f"hub-draft-{draft.id}"` 与 ERP schema VARCHAR(64) NULL 一致
+- ✓ confirmation_token 一次性消费语义跨 ConfirmGate.consume_token / ToolRegistry.call 一致（v5 加），含失败不消费的细则
+- ✓ ERP idempotent_replay 字段语义跨 Task 8（HUB phase1 调用方）/ Task 18（ERP router 返回方）/ ChainAgent confirm hint 一致
 
 ### 范围检查
 
@@ -2697,6 +2842,12 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
 - P2 #4：ToolRegistry 全实现块补 imports 起手块
 - P2 #5：spec §4.2 / §14 同步两阶段 + 幂等 + 租约恢复语义（§14 把 voucher 从"已有可复用"挪到"需要修改"）
 - P3 #6：Self-Review Placeholder Scan 改为实事求是版（区分"完整实现" vs "设计骨架"，并标注每类骨架 Task 的可执行性来源）
+
+**Plan 6 v5 结束（应用第四轮 review 4 条反馈，专注写操作安全/幂等的边界）**：
+- P1 #1：confirmation_token **一次性消费** —— ConfirmGate 加 `consume_token` 原子 SREM；ToolRegistry.call 在 tool 成功执行后消费 token（失败不消费便于重试）；Task 2 加 2 个测试 case（"同 token 第二次调用被拒" + "tool 失败时 token 保留"），全 Task 测试 13 → 15 case
+- P1 #2：ERP 幂等回放**真正处理并发唯一冲突** —— Task 18 router 实现块改为实际 `try/except IntegrityError + requery + idempotent_replay=True`（含分支：非 client_request_id 唯一冲突照常 reraise / IntegrityError 后回查不到也 reraise），测试 case 5 → 9（含 asyncio.gather 并发测）
+- P2 #3：creating 租约未过期的草稿不再静默吞掉 —— batch-approve 返回新增 `in_progress` 数组（含 draft_id / since / lease_expires_at / 中文 reason），UI 可显示"处理中"区别于"全部失败"，audit log 同步含 in_progress draft_id；Task 8 测试 16 → 17 case
+- P2 #4：ToolRegistry imports 完整列表搬进实现块顶部（含 `import time` / `Any` / `ToolArgsValidationError` / `logging.getLogger`），删掉块外的"必要 import"footnote
 
 总计：
 - 19 个 Task
