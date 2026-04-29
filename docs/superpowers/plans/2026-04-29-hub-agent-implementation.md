@@ -117,65 +117,139 @@
 
 ---
 
-## Task 1：数据模型迁移 + Models 层
+## Task 1：数据模型迁移 + Models 层 + tool_logger
 
 **Files:**
 - Create: `backend/hub/models/conversation.py`
 - Create: `backend/hub/models/memory.py`
 - Create: `backend/hub/models/contract.py`
 - Create: `backend/hub/models/draft.py`
-- Modify: `backend/hub/models/__init__.py`（注册 10 张新表）
+- Create: `backend/hub/observability/tool_logger.py` （Plan 5 task_logger 的姊妹模块）
+- Modify: `backend/hub/models/__init__.py`（注册 9 张新表）
 - Create: `backend/migrations/models/2_xxx_plan6_agent_tables.py`（手写）
+- Test: `tests/test_tool_logger.py`（5 case）
 
-- [ ] **Step 1: 写 10 张表的 ORM models**
+- [ ] **Step 1: 写 9 张表的 ORM models**
 
-按 spec §5 的 schema 写 Tortoise model：
+按 spec §5 的 schema 写 Tortoise model（**已剔除 agent_feedback 表**，用户决策不做反馈）：
 - `conversation_log`（PK conversation_id TEXT，索引 hub_user_id+started_at）
 - `tool_call_log`（FK conversation_log，round_idx + tool_name 索引）
-- `agent_feedback`
 - `user_memory` / `customer_memory` / `product_memory`（各自的 JSONB facts 字段）
 - `contract_template` / `contract_draft`
 - `voucher_draft` / `price_adjustment_request` / `stock_adjustment_request`
 
+- [ ] **Step 1.5: 写 `observability/tool_logger.py`**
+
+参考 Plan 5 已有 `observability/task_logger.py` 的 context manager pattern。**不复用 task_logger**（task 是入站消息级，tool_call 是 round 内 tool 级；二者结构不同），但风格对齐：
+
+```python
+# hub/observability/tool_logger.py
+from contextlib import asynccontextmanager
+from datetime import datetime, UTC
+import time
+import logging
+from hub.models.conversation import ToolCallLog
+
+logger = logging.getLogger("hub.observability.tool_logger")
+
+@asynccontextmanager
+async def log_tool_call(*, conversation_id: str, round_idx: int,
+                        tool_name: str, args: dict):
+    """Context manager：进入时无操作，出口写一行 tool_call_log。
+
+    用法：
+        async with log_tool_call(conversation_id=..., round_idx=..., tool_name=..., args=...) as ctx:
+            result = await tool.fn(...)
+            ctx.set_result(result)
+    """
+    started = time.monotonic()
+    ctx = _ToolCallContext()
+    raised = None
+    try:
+        yield ctx
+    except Exception as e:
+        raised = e
+        ctx._error = str(e)[:500]
+    finally:
+        try:
+            await ToolCallLog.create(
+                conversation_id=conversation_id,
+                round_idx=round_idx,
+                tool_name=tool_name,
+                args_json=args,
+                result_json=ctx._result,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                error=ctx._error,
+                called_at=datetime.now(UTC),
+            )
+        except Exception:
+            logger.exception("tool_call_log 写入失败（不阻塞业务）")
+        if raised is not None:
+            raise raised
+
+
+class _ToolCallContext:
+    def __init__(self):
+        self._result = None
+        self._error = None
+
+    def set_result(self, result):
+        # truncate result_json 防 JSONB 写过大；保留 schema + 数量级
+        self._result = _truncate_for_log(result, max_size_kb=10)
+```
+
+测试：
+- 成功调用 → 写一行 tool_call_log
+- tool 抛异常 → tool_call_log.error 有值且异常上抛
+- 大 result（> 10KB）→ result_json 被截断（保留 keys + first N items）
+- conversation_id 不存在 → tool_call_log 写入仍成功（无 FK 约束依赖；FK 用 conversation_id 字符串而非数字 ID）
+- 并发同 conversation 多 tool → 各自独立行
+
 - [ ] **Step 2: 写手写迁移**
 
 aerich 不能自动检测 JSONB index / GIN，所以手写：
-- 10 张表 CREATE
+- 9 张表 CREATE（已剔除 agent_feedback）
 - conversation_log idx_user_started
 - tool_call_log idx_conv
-- voucher_draft / price_adjustment_request idx_pending（status, created_at）
+- voucher_draft / price_adjustment_request / stock_adjustment_request idx_pending（status, created_at）
 
 - [ ] **Step 3: 更新 conftest.py**
 
-`TABLES_TO_TRUNCATE` 加 10 张新表（顺序：先草稿、后引用、最后 conversation_log）。
+`TABLES_TO_TRUNCATE` 加 9 张新表（顺序：先草稿、后引用、最后 conversation_log）。
 
 - [ ] **Step 4: 提交**
 
 ```bash
-git add backend/hub/models/ backend/migrations/ backend/tests/conftest.py
-git commit -m "feat(hub): Plan 6 Task 1（10 张新表 + 手写迁移）"
+git add backend/hub/models/ backend/migrations/ backend/hub/observability/tool_logger.py \
+        backend/tests/conftest.py backend/tests/test_tool_logger.py
+git commit -m "feat(hub): Plan 6 Task 1（9 张新表 + 手写迁移 + tool_logger）"
 ```
 
 ---
 
-## Task 2：ToolRegistry + Schema 自动生成
+## Task 2：ToolRegistry + Schema 自动生成 + 写门禁 + 实体写入
 
 **Files:**
 - Create: `backend/hub/agent/__init__.py`
 - Create: `backend/hub/agent/tools/__init__.py`
 - Create: `backend/hub/agent/tools/registry.py`
+- Create: `backend/hub/agent/tools/types.py`（ToolType / UnconfirmedWriteToolError 等）
+- Create: `backend/hub/agent/tools/confirm_gate.py`（confirmation_token 计算 / Redis 已确认动作存储）
+- Create: `backend/hub/agent/tools/entity_extractor.py`（tool result 中提取 customer_id / product_id 写回 session）
 - Test: `backend/tests/test_tool_registry.py`
 
-ToolRegistry 是整个 agent 的核心。从 Python 函数签名 + docstring + type hints 自动生成 OpenAI function schema。参考 ERP `schema_registry.py` 的思路。
+ToolRegistry 是整个 agent 的核心。Plan 6 review v1 强化项：写门禁前置硬校验 + 实体引用写入路径。从 Python 函数签名 + docstring + type hints 自动生成 OpenAI function schema。参考 ERP `schema_registry.py` 的思路。
 
 - [ ] **Step 1: 写测试（先定义 contract）**
 
 ```python
 # tests/test_tool_registry.py
+from hub.agent.tools.registry import ToolRegistry
+from hub.agent.tools.types import ToolType, UnconfirmedWriteToolError
+
+# === schema 自动生成 + 权限过滤（4 case）===
 async def test_register_extracts_openai_schema():
     """注册后 schema_for_user 返回 OpenAI function schema 格式。"""
-    from hub.agent.tools.registry import ToolRegistry
-
     async def search_products(query: str, limit: int = 10) -> list[dict]:
         """搜索商品。
 
@@ -188,44 +262,91 @@ async def test_register_extracts_openai_schema():
     reg = ToolRegistry()
     reg.register("search_products", search_products,
                  perm="usecase.query_product.use",
+                 tool_type=ToolType.READ,
                  description="搜索商品列表")
 
-    # mock has_permission → True
-    schema = await reg.schema_for_user(hub_user_id=1)
-    assert len(schema) == 1
+    schema = await reg.schema_for_user(hub_user_id=1)  # mock has_permission=True
     assert schema[0]["function"]["name"] == "search_products"
-    assert "query" in schema[0]["function"]["parameters"]["properties"]
     assert schema[0]["function"]["parameters"]["required"] == ["query"]
 
 
 async def test_schema_for_user_filters_by_permission():
     """没权限的 tool 不在返回列表里。"""
-    # ...
 
 async def test_call_checks_permission():
     """call() 调用前先 require_permissions，缺权限抛 BizError。"""
-    # ...
-
-async def test_call_records_tool_call_log():
-    """每次 call() 写一条 tool_call_log。"""
-    # ...
 
 async def test_call_handles_tool_exception():
     """tool 抛错 → tool_call_log 记 error，向上抛。"""
-    # ...
 
+# === 写门禁硬校验（4 case，对应 review P1-#1）===
+async def test_write_tool_without_confirmation_token_raises():
+    """无 confirmation_token 调用 WRITE_DRAFT/WRITE_ERP tool → UnconfirmedWriteToolError。"""
+    reg = ToolRegistry()
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT,
+                 description="创建凭证草稿")
+    with pytest.raises(UnconfirmedWriteToolError):
+        await reg.call("create_voucher_draft", {"amount": 1000},
+                       hub_user_id=1, acting_as=2,
+                       conversation_id="c1", round_idx=0)
+
+async def test_write_tool_with_wrong_token_raises():
+    """confirmation_token 不匹配 → 拦截。"""
+    reg = ToolRegistry()
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT,
+                 description="...")
+    # 先确认一个不同 args 的动作
+    await reg.confirm_gate.mark_confirmed("c1", "create_voucher_draft",
+                                          {"amount": 999})
+    with pytest.raises(UnconfirmedWriteToolError):
+        await reg.call("create_voucher_draft", {"amount": 1000},
+                       hub_user_id=1, acting_as=2,
+                       conversation_id="c1", round_idx=0,
+                       _hidden_token="token-for-amount-999")
+
+async def test_write_tool_with_args_changed_after_confirm_raises():
+    """用户确认 args A → LLM 偷偷改成 args B 调用 → 拦截（防 args 篡改攻击）。"""
+
+async def test_write_tool_with_correct_token_passes():
+    """正确 token + 一致 args → 通过。"""
+    reg = ToolRegistry()
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    args = {"amount": 1000}
+    await reg.confirm_gate.mark_confirmed("c1", "create_voucher_draft", args)
+    token = reg.confirm_gate.compute_token("c1", "create_voucher_draft", args)
+    result = await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
+                            hub_user_id=1, acting_as=2,
+                            conversation_id="c1", round_idx=0)
+    assert result is not None
+
+# === 实体写入路径（2 case，对应 review P2-#8）===
+async def test_call_extracts_customer_id_from_result():
+    """tool 返回含 customer_id → 写回 session.referenced_entities。"""
+    reg = ToolRegistry()
+    async def fake_search(): return {"items": [{"id": 9, "name": "阿里"}, {"id": 10}]}
+    reg.register("search_customers", fake_search,
+                 perm=..., tool_type=ToolType.READ, description="...")
+    await reg.call("search_customers", {}, hub_user_id=1, acting_as=2,
+                   conversation_id="c1", round_idx=0)
+    refs = await reg.session_memory.get_entity_refs("c1")
+    assert refs.customer_ids == {9, 10}
+
+async def test_call_extracts_product_id_from_nested_result():
+    """从嵌套 items[].product_id 提取。"""
+
+# === 其他基础测试 ===
 async def test_register_validates_signature():
-    """注册时函数必须是 async + 有 type hints + 第一个参数不是 self。"""
-    # ...
-
 async def test_call_validates_args_against_schema():
-    """args 不符 schema → 拒绝调用。"""
-    # ...
-
 async def test_schema_for_user_caches_per_user():
-    """同一 user 多次调 schema_for_user 用缓存（5min TTL），不重复查 DB。"""
-    # ...
 ```
+
+合计 **13 case**。
 
 - [ ] **Step 2: 实现 ToolRegistry**
 
@@ -467,15 +588,20 @@ class MemoryLoader:
         )
 ```
 
-- [ ] **Step 4: MemoryWriter（异步抽事实）**
+- [ ] **Step 4: MemoryWriter（异步抽事实，带 should_extract gate）**
 
 ```python
 class MemoryWriter:
-    async def extract_and_write(self, conversation_id: str, full_history: list,
-                                 ai_provider) -> None:
-        """对话结束后异步触发：LLM mini round 抽事实回写。"""
-        prompt = build_extraction_prompt(full_history)
-        result = await ai_provider.parse_intent(  # 复用 LLMParser 的 schema-guided
+    async def extract_and_write(self, conversation_id: str,
+                                conversation_log_id: int,
+                                tool_call_logs: list,
+                                ai_provider) -> None:
+        """对话结束后异步触发：先 should_extract gate，再 LLM mini round 抽事实回写。"""
+        if not self.should_extract(tool_call_logs):
+            return  # 闲聊 / 失败查询 / 无业务对话 → 跳过抽取，省成本
+
+        prompt = build_extraction_prompt(...)
+        result = await ai_provider.parse_intent(
             text=prompt,
             schema={
                 "user_facts": [{"fact": "string", "confidence": "float"}],
@@ -484,6 +610,47 @@ class MemoryWriter:
             }
         )
         # 三个 layer 分别 upsert
+
+    @staticmethod
+    def should_extract(tool_call_logs: list) -> bool:
+        """重要性 gate（review P2-#7）。任一满足即抽：
+        1. ≥ 1 次 search_*/get_* tool 命中实体（result 含 customer_id/product_id）
+        2. ≥ 1 次 write_draft tool 调用（凭证 / 调价 / 库存调整）
+        3. ≥ 1 次 generate_* tool 调用（合同 / 报价 / Excel）
+        4. round_count ≥ 4
+        否则跳过抽取。"""
+        if len(tool_call_logs) >= 4:
+            return True
+        for log in tool_call_logs:
+            if log.tool_name.startswith(("create_", "generate_")):
+                return True
+            result = log.result_json or {}
+            if "customer_id" in str(result) or "product_id" in str(result):
+                return True
+        return False
+```
+
+测试覆盖：
+- 闲聊单 round 无 tool → `should_extract=False`，不调 LLM
+- search_customers 命中 1 个客户 → `should_extract=True`，抽取并写库
+- 写 tool（create_voucher_draft）→ `should_extract=True`
+- 5 round 但全是 unknown intent → `should_extract=True`（长对话兜底）
+
+- [ ] **Step 5: 引用实体写入路径（review P2-#8）**
+
+`MemoryLoader.load_referenced` 依赖 session 中已有的 `referenced_entities`。这个写入由 **Task 2 的 ToolRegistry.call** 在 tool 返回后统一提取（见 Task 2 entity_extractor.py）。Task 4 这边的工作：
+
+```python
+# memory/session.py
+class SessionMemory:
+    async def add_entity_refs(self, conversation_id: str, *,
+                              customer_ids: set[int] = (),
+                              product_ids: set[int] = ()):
+        """ToolRegistry 在 call() 后调用，把本次 result 中的实体引用写回。"""
+        # 用 Redis SADD `hub:agent:conv:<id>:refs:customers` / refs:products
+
+    async def get_entity_refs(self, conversation_id: str) -> EntityRefs:
+        """MemoryLoader 加载客户/商品 memory 时调用。"""
 ```
 
 - [ ] **Step 5: 测试 + 提交**
@@ -639,28 +806,112 @@ async def test_concurrent_calls_use_separate_conversation_ids():
     """并发用户的对话不串。"""
 ```
 
-- [ ] **Step 2: 实现 ChainAgent**
+- [ ] **Step 2: 实现 ChainAgent + ContextBuilder（调用前裁剪）**
 
-按 spec §3.2 的伪代码实现。要点：
-- 用 `asyncio.wait_for(timeout=30)` 包 LLM 调用
-- 每 round 累加 `tokens_used`
-- tool call 抛 LLMServiceError / 5xx → 注入 error 消息让 LLM 决定重试或放弃（不立即抛）
-- max_rounds=5 / max_token=20000 / timeout=30 都从 system_config 读，可调
+按 spec §3.2 实现。**review P2-#5 关键**：必须有 ContextBuilder 在每 round 调 LLM 前估算 + 裁剪，不能等响应回来才发现超 context。
 
-- [ ] **Step 3: 提交**
+```python
+# hub/agent/context_builder.py
+import tiktoken  # 用 cl100k_base 做估算（DeepSeek/Qwen 都接近这个 tokenizer）
+
+class ContextBuilder:
+    def __init__(self, budget_token: int = 18_000, encoding="cl100k_base"):
+        self._enc = tiktoken.get_encoding(encoding)
+        self.budget = budget_token
+
+    async def build_round(self, *, round_idx, base_memory, tools_schema,
+                          conversation_history, latest_user_message,
+                          budget_token=None) -> list[dict]:
+        budget = budget_token or self.budget
+
+        # 1. 必保层（固定塞入）
+        sections = []
+        sections.append(("system_prompt", build_system_prompt(base_memory.user, tools_schema), priority=10))
+
+        # 2. 必保 + 当前 round 上下文
+        if latest_user_message:
+            sections.append(("user_msg", latest_user_message, priority=10))
+        # 最近 1 round LLM 输出 + tool result
+        sections.append(("recent_round", conversation_history[-2:], priority=10))
+
+        # 3. 高优先级：客户 / 商品 memory
+        sections.append(("entity_memory", base_memory.customers + base_memory.products, priority=7))
+
+        # 4. 中优先级：3 round 之前 tool result（摘要后注入）
+        old_results = self._summarize_old_tool_results(conversation_history[:-2])
+        sections.append(("old_results_summary", old_results, priority=5))
+
+        # 5. 低优先级：4 round 之前对话历史（压成 1 句/round）
+        old_history = self._summarize_old_history(conversation_history[:-4])
+        sections.append(("old_history_summary", old_history, priority=2))
+
+        # 6. 估算 + 裁剪
+        return self._fit_to_budget(sections, budget)
+
+    def _count_tokens(self, content: str | list) -> int:
+        if isinstance(content, str):
+            return len(self._enc.encode(content))
+        # list of messages
+        return sum(self._count_tokens(m.get("content", "")) for m in content)
+
+    def _fit_to_budget(self, sections, budget):
+        """从低优先级开始裁，直到 total ≤ budget。"""
+        sections.sort(key=lambda x: x[2])  # 低优先级排前
+        while sum(self._count_tokens(c) for _, c, _ in sections) > budget:
+            if not sections:
+                raise PromptTooLargeError("即使裁完所有可裁内容仍超出 budget")
+            # 裁掉优先级最低的
+            sections.pop(0)
+        return self._compose_messages(sections)
+
+    def _summarize_old_tool_results(self, history):
+        """旧 tool result 压缩：单条 > 500 token 的，保留 type/count，删 items 明细。"""
+
+    def _summarize_old_history(self, history):
+        """4 round 前的 tool calls 压成 1 句：'调了 search_customers 拿到 3 个候选'。"""
+```
+
+ChainAgent 主循环要点：
+- 每 round 入口先调 `ContextBuilder.build_round` 拿裁剪后的 messages
+- LLM 调用 `asyncio.wait_for(timeout=30)`
+- tool call 抛 LLMServiceError / 5xx → 注入 error 让 LLM 重试或放弃
+- tool call 抛 UnconfirmedWriteToolError → error message 注入 LLM（让它走"先用 text 预览给用户"路径）
+- max_rounds=5 / budget_token=18000 / timeout=30 都从 system_config 读，可调
+
+- [ ] **Step 3: 测试新增**
+
+补 Task 6 测试（P2-#5 review 要求的"大 tool result 测试"）：
+
+```python
+async def test_large_tool_result_summarized_before_next_round():
+    """tool 返 1000 个商品 → 下 round prompt 中的 result 被摘要（不全量塞）。"""
+
+async def test_token_overflow_truncates_low_priority_first():
+    """memory 多客户 / 长历史 → 优先裁 old_history_summary，必保最近 round。"""
+
+async def test_prompt_too_large_after_max_truncation_raises():
+    """裁完仍超 budget（罕见）→ PromptTooLargeError → fallback rule。"""
+```
+
+测试合计：原 12 + 新 4 = **16 case**。
+
+- [ ] **Step 4: 提交**
 
 ```bash
-git commit -m "feat(hub): Plan 6 Task 6（ChainAgent 主循环：5 round / 20K token / 30s timeout）"
+git add backend/hub/agent/chain_agent.py backend/hub/agent/context_builder.py \
+        backend/tests/test_chain_agent.py
+git commit -m "feat(hub): Plan 6 Task 6（ChainAgent + ContextBuilder 调用前 token 裁剪）"
 ```
 
 ---
 
-## Task 7：生成型 tool（合同 / Excel / 报价）
+## Task 7：生成型 tool（合同 / Excel / 报价）+ DingTalkSender.send_file
 
 **Files:**
 - Create: `backend/hub/agent/tools/generate_tools.py`
 - Create: `backend/hub/agent/document/{contract,excel,storage}.py`
-- Test: `tests/test_generate_tools.py`（12 case）
+- Modify: `backend/hub/adapters/channel/dingtalk_sender.py`（新增 send_file + 媒体上传）
+- Test: `tests/test_generate_tools.py`（10 case）+ `tests/test_dingtalk_sender_file.py`（5 case）
 
 - [ ] **Step 1: contract.py 合同模板渲染**
 
@@ -685,7 +936,65 @@ class ContractRenderer:
 - 第一版：写到 `contract_draft.rendered_file_bytes`（bytea，AES-GCM 加密）
 - 后续可以换 S3 / OSS
 
-- [ ] **Step 4: generate_tools.py 三个 tool**
+- [ ] **Step 4: DingTalkSender 新增 send_file（review P1-#3）**
+
+钉钉文件下发是**两步**：媒体上传拿 media_id → batchSend 用 sampleFile：
+
+```python
+# hub/adapters/channel/dingtalk_sender.py 追加
+class DingTalkSender:
+    async def send_file(self, *, dingtalk_userid: str, file_bytes: bytes,
+                        file_name: str, file_type: str = "docx") -> None:
+        """发文件给单个用户（合同 docx / Excel / PDF 等）。"""
+        media_id = await self._upload_media(file_bytes, file_name, file_type)
+        await self._send_oto(
+            user_ids=[dingtalk_userid],
+            msg_key="sampleFile",
+            msg_param={"mediaId": media_id, "fileName": file_name, "fileType": file_type},
+        )
+
+    async def _upload_media(self, file_bytes: bytes, file_name: str,
+                             file_type: str, *, max_retry: int = 1) -> str:
+        """调 https://oapi.dingtalk.com/media/upload 拿 media_id。
+
+        - 5xx → 重试 max_retry 次
+        - 4xx（鉴权失败 / 文件类型不支持）→ 立即抛 DingTalkSendError
+        - 文件大小 > 20MB → 立即抛（钉钉硬上限）
+        """
+        if len(file_bytes) > 20 * 1024 * 1024:
+            raise DingTalkSendError("文件超过钉钉 20MB 上限")
+        token = await self._get_access_token()
+        url = "https://oapi.dingtalk.com/media/upload"
+        for attempt in range(max_retry + 1):
+            try:
+                files = {"media": (file_name, file_bytes,
+                                    f"application/{file_type}")}
+                r = await self._client.post(
+                    url, params={"access_token": token, "type": "file"},
+                    files=files,
+                )
+                if r.status_code == 200:
+                    body = r.json()
+                    if body.get("errcode") == 0:
+                        return body["media_id"]
+                    raise DingTalkSendError(f"上传失败: {body}")
+                if r.status_code >= 500 and attempt < max_retry:
+                    continue  # 5xx 重试
+                raise DingTalkSendError(f"上传 {r.status_code}: {r.text[:200]}")
+            except httpx.RequestError as e:
+                if attempt < max_retry:
+                    continue
+                raise DingTalkSendError(f"网络错误: {e}") from e
+```
+
+测试（5 case）：
+- 上传 + batchSend 全成功（mock httpx）
+- 上传 5xx → 重试 1 次成功
+- 上传 4xx（鉴权失败）→ 立即抛错不重试
+- 文件 > 20MB → 立即抛 DingTalkSendError
+- batchSend 失败 → 抛 DingTalkSendError
+
+- [ ] **Step 5: generate_tools.py 三个 tool**
 
 ```python
 async def generate_contract_draft(template_id: int, customer_id: int,
@@ -702,9 +1011,14 @@ async def generate_contract_draft(template_id: int, customer_id: int,
         rendered_file_storage_key=storage_key,
         conversation_id=conversation_id,
     )
-    # 通过 DingTalkSender 发文件给用户
-    sender.send_file(dingtalk_userid=..., file_bytes=docx_bytes,
-                     file_name=f"销售合同_{customer['name']}_{date}.docx")
+    # 通过 DingTalkSender.send_file 发文件给用户（注意 await）
+    binding = await ChannelUserBinding.filter(hub_user_id=hub_user_id, status="active").first()
+    await sender.send_file(
+        dingtalk_userid=binding.channel_userid,
+        file_bytes=docx_bytes,
+        file_name=f"销售合同_{customer['name']}_{date.today()}.docx",
+        file_type="docx",
+    )
     return {"draft_id": draft.id, "file_sent": True}
 
 async def generate_price_quote(...) -> dict: ...
@@ -712,6 +1026,11 @@ async def generate_price_quote(...) -> dict: ...
 async def export_to_excel(table_data: list[dict], file_name: str,
                           *, hub_user_id, ...) -> dict: ...
 ```
+
+测试覆盖 generate_contract_draft 端到端：
+- 模板渲染成功 + send_file 调用 + 文件名规范
+- send_file 失败（钉钉宕机）→ 草稿仍持久化，但抛错让 worker 转死信
+- 模板渲染失败（占位符缺）→ 提前拒绝，不调 send_file
 
 - [ ] **Step 5: 提交**
 
@@ -744,32 +1063,102 @@ async def create_price_adjustment_request(...) -> dict: ...
 async def create_stock_adjustment_request(...) -> dict: ...
 ```
 
-- [ ] **Step 2: admin/approvals.py 三个 inbox 子路由**
+- [ ] **Step 2: admin/approvals.py 三个 inbox 子路由（review P1-#4 用 ERP batch-approve 单调用）**
+
+ERP 已有 `POST /api/v1/vouchers/batch-approve` body=`{voucher_ids: [int]}`，返
+`{success: [int], failed: [{id, reason}]}`，事务内逐条审。**HUB 一次调用即可**，不要循环 N 次。
+
+流程：
+```
+HUB voucher_draft 表（状态 pending）
+   ↓ admin 在 inbox 勾选 N 张 → 点"批量通过"
+HUB POST /admin/approvals/voucher/batch-approve { draft_ids: [...] }
+   ↓
+HUB 内部：
+  1. 取出对应 draft 的 voucher_data，先批量 POST /api/v1/vouchers
+     创建 ERP voucher（取得 erp_voucher_ids）
+  2. 一次性调 ERP /api/v1/vouchers/batch-approve { voucher_ids: erp_voucher_ids }
+  3. 把 ERP 返的 success/failed 反向写回 HUB voucher_draft.status
+     （成功 → approved；失败 → 仍 pending + rejection_reason）
+  4. 返 admin UI: { approved: [...], failed: [{ draft_id, reason }] }
+```
 
 ```python
 @router.get("/voucher", deps=[require_hub_perm("usecase.create_voucher.approve")])
 async def list_voucher_drafts(status: str = "pending", ...): ...
 
-@router.post("/voucher/batch-approve", deps=[require_hub_perm("usecase.create_voucher.approve")])
-async def batch_approve_vouchers(draft_ids: list[int], request: Request):
-    """批量通过：循环调 ERP /api/v1/vouchers POST 落库。"""
+@router.post("/voucher/batch-approve",
+             deps=[require_hub_perm("usecase.create_voucher.approve")])
+async def batch_approve_vouchers(req: BatchApproveRequest, request: Request):
+    """批量通过：先 POST /vouchers 批量创建，再调 ERP batch-approve（单次调用，事务）。"""
+    drafts = await VoucherDraft.filter(id__in=req.draft_ids, status="pending").all()
+    if len(drafts) != len(req.draft_ids):
+        raise HTTPException(400, "包含已审或不存在的 draft_id")
+
+    # Step 1: 批量创建 ERP voucher（每条单独 POST，因为 ERP 暂没批量创建接口）
+    # 后续可优化：在 ERP 加 POST /api/v1/vouchers/batch-create
+    erp_voucher_ids = []
+    creation_failures = []
+    for d in drafts:
+        try:
+            r = await erp.create_voucher(d.voucher_data, acting_as_user_id=...)
+            erp_voucher_ids.append({"draft_id": d.id, "erp_id": r["id"]})
+        except (ErpAdapterError, ErpSystemError) as e:
+            creation_failures.append({"draft_id": d.id, "reason": str(e)})
+
+    # Step 2: 一次性调 ERP batch-approve（事务）
+    if erp_voucher_ids:
+        result = await erp.batch_approve_vouchers(
+            voucher_ids=[x["erp_id"] for x in erp_voucher_ids],
+            acting_as_user_id=...,
+        )
+        # result = {success: [...], failed: [{id, reason}]}
+        approved_set = set(result["success"])
+        failed_map = {f["id"]: f["reason"] for f in result["failed"]}
+        for x in erp_voucher_ids:
+            d = next(d for d in drafts if d.id == x["draft_id"])
+            if x["erp_id"] in approved_set:
+                d.status = "approved"
+                d.erp_voucher_id = x["erp_id"]
+                d.approved_by_hub_user_id = request.state.hub_user.id
+                d.approved_at = now_utc()
+            else:
+                d.rejection_reason = failed_map.get(x["erp_id"], "ERP 拒绝（未知原因）")
+            await d.save()
+
     # 写 audit_log
+    await AuditLog.create(...)
+
+    return {
+        "approved_count": len([x for x in erp_voucher_ids if x["erp_id"] in approved_set]),
+        "failed": creation_failures + [
+            {"draft_id": x["draft_id"], "reason": failed_map.get(x["erp_id"])}
+            for x in erp_voucher_ids if x["erp_id"] not in approved_set
+        ],
+    }
+
 
 @router.post("/voucher/batch-reject")
 async def batch_reject_vouchers(...): ...
 
-# 类似 /price /stock 各 3 个 endpoint
+# /price /stock 类似（这两个先不用 ERP batch endpoint，因 ERP 暂无对应 batch；
+#  Plan 6 Task 18 ERP 改动里加 customer-price-rules 时考虑加 batch）
 ```
 
-- [ ] **Step 3: 测试**
+**幂等性**：
+- HUB voucher_draft.status 用乐观锁（filter status="pending" 同时 update）
+- 同一个 draft_id batch 两次 → 第二次 filter 返 0（status 已变）→ 400 拒绝
+- ERP voucher 创建失败时 voucher_draft.status 保持 pending（不写 erp_voucher_id），下次审批仍可重试
+
+- [ ] **Step 3: 测试 12 case**
 
 涵盖：
-- 创建草稿
-- 金额硬上限拦截
-- 必填字段校验
-- 批量通过：调 ERP × N 全成功 / 部分失败 / 全部失败
+- 创建草稿（3 种）+ 金额硬上限拦截 + 必填字段校验
+- 批量通过：ERP 全成功 / ERP 部分失败 / ERP 5xx 全失败
+- 批量通过含已审 draft → 400
 - 批量拒绝
 - 无审批权限 → 403
+- 同 draft_id 并发批量审批 → 第二次 400
 
 - [ ] **Step 4: 提交**
 
@@ -787,25 +1176,83 @@ git commit -m "feat(hub): Plan 6 Task 8（凭证/调价/库存调整草稿 tool 
 
 档 3 高级能力：内部组合多个读 tool，HUB 端做聚合，**不直连 ERP DB**。
 
-- [ ] **Step 1: 写两个聚合 tool**
+- [ ] **Step 1: 写两个聚合 tool（review P2-#6 bounded pagination）**
+
+聚合 tool 不能无限拉 ERP 订单（1000+ 单聚合慢且部分页）。加硬上限 + partial_result 标记：
 
 ```python
 async def analyze_top_customers(period: str = "last_month", top_n: int = 10,
                                  *, acting_as_user_id, ...) -> dict:
-    """top N 客户销售排行。"""
-    orders = await erp.search_orders(since=parse_period(period),
-                                      acting_as_user_id=acting_as_user_id)
-    # group by customer_id + sum(total)
-    # sort + limit top_n
-    return {"items": [...]}
+    """top N 客户销售排行（bounded）。"""
+    MAX_ORDERS = 1000
+    MAX_PERIOD_DAYS = 90
+    PER_PAGE = 200
+
+    days = min(parse_period_days(period), MAX_PERIOD_DAYS)
+    partial_period = (parse_period_days(period) > MAX_PERIOD_DAYS)
+
+    orders = []
+    page = 1
+    truncated = False
+    while len(orders) < MAX_ORDERS:
+        resp = await erp.search_orders(
+            since=now_utc() - timedelta(days=days),
+            page=page, page_size=PER_PAGE,
+            acting_as_user_id=acting_as_user_id,
+        )
+        orders.extend(resp["items"])
+        if len(resp["items"]) < PER_PAGE:
+            break
+        page += 1
+    if len(orders) >= MAX_ORDERS:
+        # 还有更多 → 标记 truncated
+        truncated = (resp.get("total", len(orders)) > MAX_ORDERS)
+        orders = orders[:MAX_ORDERS]
+
+    # 聚合 group by customer
+    aggregated = sorted(
+        [{"customer_id": cid, "total": sum(o["total"] for o in orders if o["customer_id"] == cid),
+          "order_count": ...} for cid in set(o["customer_id"] for o in orders)],
+        key=lambda x: x["total"], reverse=True,
+    )[:top_n]
+
+    return {
+        "items": aggregated,
+        "partial_result": truncated or partial_period,
+        "data_window": f"近 {days} 天，{len(orders)} 单",
+        "notes": (
+            "结果不完整：实际订单超 1000 单，仅基于最近 1000 单聚合"
+            if truncated else
+            f"实际请求 period 超 {MAX_PERIOD_DAYS} 天，已截断到最近 {MAX_PERIOD_DAYS} 天"
+            if partial_period else
+            None
+        ),
+    }
+
 
 async def analyze_slow_moving_products(threshold_days: int = 90,
                                         *, acting_as_user_id, ...) -> dict:
-    """库龄超 N 天的滞销商品。"""
-    aging = await erp.get_inventory_aging(acting_as_user_id=acting_as_user_id)
-    # filter age_days >= threshold_days
-    # sort by stock_value desc
+    """库龄超 N 天的滞销商品（依赖 ERP /api/v1/inventory/aging，Task 18 加）。"""
+    aging = await erp.get_inventory_aging(
+        threshold_days=threshold_days,
+        acting_as_user_id=acting_as_user_id,
+    )
+    # ERP /aging 端点本身已聚合，HUB 只是过滤 + 排序
+    items = sorted(
+        [p for p in aging["items"] if p["age_days"] >= threshold_days],
+        key=lambda p: p["stock_value"], reverse=True,
+    )[:50]
+    return {"items": items, "partial_result": False}
 ```
+
+agent system prompt 加：当 tool 返 `partial_result=True` 时，**必须**在最终回复中明确告诉用户"结果不完整，仅基于 X"，不能掩盖。
+
+测试覆盖：
+- ≤ 200 单 → 一页拉完，partial_result=False
+- 1500 单 → 拉到 1000 截断，partial_result=True，notes 含"超 1000 单"
+- 用户问 "今年" → period 截断到 90 天，notes 含"截断到 90 天"
+
+**长期改进**（不在 Plan 6 范围）：spec §14 提议 ERP 加 analytics endpoint（数据库 GROUP BY 直接出聚合结果）让 HUB 不做聚合。
 
 - [ ] **Step 2: 提交**
 
@@ -988,10 +1435,8 @@ git commit -m "feat(hub): Plan 6 Task 12（审批 inbox UI：三 tab + 批量勾
   },
   "tool_calls": [  # 新加（按 round_idx 排序）
     {"round_idx": 0, "tool_name": "search_customers", "args": {...}, "result": {...}, "duration_ms": 230},
-    {"round_idx": 1, "tool_name": "get_customer_history", ...},
-    ...
-  ],
-  "feedback": null  # 或 {rating: 1, text: "..."}
+    {"round_idx": 1, "tool_name": "get_customer_history", ...}
+  ]
 }
 ```
 
@@ -999,53 +1444,16 @@ git commit -m "feat(hub): Plan 6 Task 12（审批 inbox UI：三 tab + 批量勾
 
 - 时间线节点扩展：除 5 步固定流程外，增加 "LLM Round N: 决策→调 tool X" 节点
 - 显示 cost
-- 显示 user 反馈（如果有）
 
 - [ ] **Step 3: 提交**
 
 ```bash
-git commit -m "feat(hub): Plan 6 Task 13（task detail 显示 agent 决策链：rounds / tool calls / cost / 反馈）"
+git commit -m "feat(hub): Plan 6 Task 13（task detail 显示 agent 决策链：rounds / tool calls / cost）"
 ```
 
 ---
 
-## Task 14：用户反馈收集
-
-**Files:**
-- Modify: `backend/hub/handlers/dingtalk_inbound.py`（识别 👍 👎）
-- Create: `backend/hub/routers/admin/agent_feedback.py`
-- Create: `frontend/src/views/admin/AgentFeedbackView.vue`
-- Test: `tests/test_admin_agent_feedback.py`（5）
-
-- [ ] **Step 1: inbound 识别反馈消息**
-
-agent 完成后给消息加："[👍 有用] [👎 不对] / 回复文字给我意见"。
-inbound handler 加 RE_FEEDBACK_LIKE / RE_FEEDBACK_DISLIKE 正则匹配；命中即写 agent_feedback 表。
-
-- [ ] **Step 2: admin/agent_feedback.py 统计 API**
-
-```python
-@router.get("/agent-feedback")
-async def list_feedback(since_days: int = 7): ...
-
-@router.get("/agent-feedback/summary")
-async def feedback_summary(): 
-    # 满意度 / top 失败 tool / top 失败 intent
-```
-
-- [ ] **Step 3: 前端 AgentFeedbackView.vue**
-
-按时段聚合 + 列表显示。
-
-- [ ] **Step 4: 提交**
-
-```bash
-git commit -m "feat(hub): Plan 6 Task 14（用户反馈：钉钉端 👍/👎 + admin 后台统计页）"
-```
-
----
-
-## Task 15：Dashboard 加成本指标
+## Task 14：Dashboard 加成本指标
 
 **Files:**
 - Modify: `backend/hub/routers/admin/dashboard.py`
@@ -1074,12 +1482,12 @@ git commit -m "feat(hub): Plan 6 Task 14（用户反馈：钉钉端 👍/👎 + 
 - [ ] **Step 4: 提交**
 
 ```bash
-git commit -m "feat(hub): Plan 6 Task 15（dashboard 加 LLM 成本指标 + 80% 预算告警）"
+git commit -m "feat(hub): Plan 6 Task 14（dashboard 加 LLM 成本指标 + 80% 预算告警）"
 ```
 
 ---
 
-## Task 16：cron 草稿催促
+## Task 15：cron 草稿催促
 
 **Files:**
 - Create: `backend/hub/cron/draft_reminder.py`
@@ -1108,12 +1516,12 @@ async def draft_reminder_job():
 - [ ] **Step 3: 提交**
 
 ```bash
-git commit -m "feat(hub): Plan 6 Task 16（cron：超 7 天未审批草稿钉钉催促）"
+git commit -m "feat(hub): Plan 6 Task 15（cron：超 7 天未审批草稿钉钉催促）"
 ```
 
 ---
 
-## Task 17：LLM Eval 框架
+## Task 16：LLM Eval 框架
 
 **Files:**
 - Create: `backend/hub/agent/eval/{gold_set.yaml,runner.py}`
@@ -1144,12 +1552,12 @@ class EvalRunner:
 - [ ] **Step 4: 提交**
 
 ```bash
-git commit -m "feat(hub): Plan 6 Task 17（LLM Eval：gold set 30 条 + 集成 CI 阈值 80%）"
+git commit -m "feat(hub): Plan 6 Task 16（LLM Eval：gold set 30 条 + 集成 CI 阈值 80%）"
 ```
 
 ---
 
-## Task 18：seed.py 升级（14 权限码 + 2 新角色 + 词典）
+## Task 17：seed.py 升级（14 权限码 + 2 新角色 + 词典）
 
 **Files:**
 - Modify: `backend/hub/seed.py`
@@ -1172,12 +1580,12 @@ NEW_ROLES_PLAN6 = {
 - [ ] **Step 2: 提交**
 
 ```bash
-git commit -m "feat(hub): Plan 6 Task 18（seed 加 14 权限码 + 2 新角色 + 业务词典默认数据）"
+git commit -m "feat(hub): Plan 6 Task 17（seed 加 14 权限码 + 2 新角色 + 业务词典默认数据）"
 ```
 
 ---
 
-## Task 19：ERP 仓库改动（跨仓库依赖）
+## Task 18：ERP 仓库改动（跨仓库依赖）
 
 **Files (ERP 仓库):**
 - Create: `backend/app/routers/customer_price_rules.py`
@@ -1216,7 +1624,7 @@ git commit -m "feat: 加 customer-price-rules CRUD + inventory/aging（HUB Plan 
 
 ---
 
-## Task 20：自审 + 端到端验证 + 验证记录
+## Task 19：自审 + 端到端验证 + 验证记录
 
 - [ ] **Step 1: 跑全部测试**
 
@@ -1264,7 +1672,7 @@ git commit -m "docs(hub): Plan 6 端到端验证记录"
 | §3.2 ChainAgent | Task 6 | ✓ |
 | §3.3 Memory 三层 | Task 4 | ✓ |
 | §3.4 失败兜底 B+D | Task 6 + Task 10 | ✓ |
-| §3.5 ERP 借鉴 10 项 | Task 5（词典/同义/few-shots/temp=0）+ Task 14（反馈）+ Task 7（Excel）| ✓ |
+| §3.5 ERP 借鉴 10 项（已剔除反馈，剩 9 项）| Task 5（词典/同义/few-shots/temp=0）+ Task 7（Excel）| ✓ |
 | §4.1 合同生成场景 | Task 7 + Task 11（模板管理）| ✓ |
 | §4.2 凭证审批场景 | Task 8 + Task 12（UI）| ✓ |
 | §4.3 调价审批场景 | Task 8 + Task 12 | ✓ |
@@ -1272,11 +1680,11 @@ git commit -m "docs(hub): Plan 6 端到端验证记录"
 | §5 数据模型 10 表 | Task 1 | ✓ |
 | §6 后台 UI | Task 11 + 12 + 13 + 14 + 15 | ✓ |
 | §7 钉钉端 UX | Task 10 + 14 | ✓ |
-| §8 安全权限 | Task 18（seed 14 权限码）+ Task 8（金额上限）| ✓ |
-| §9 成本控制 | Task 6（5 阈值）+ Task 15（仪表盘）| ✓ |
-| §10 测试策略 | Task 17（eval）+ 各 Task 单测 | ✓ |
+| §8 安全权限 | Task 17（seed 14 权限码）+ Task 8（金额上限）+ **Task 2（写门禁硬校验）**| ✓ |
+| §9 成本控制 | Task 6（5 阈值 + 调用前裁剪）+ Task 14（仪表盘）| ✓ |
+| §10 测试策略 | Task 16（eval）+ 各 Task 单测（合计 ~140）| ✓ |
 | §11 不在范围 | 各 Task 没引入 | ✓ |
-| §14 ERP 改动 | Task 19 | ✓ |
+| §14 ERP 改动 | Task 18 | ✓ |
 
 ### Placeholder Scan
 
@@ -1326,11 +1734,25 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
 
 ---
 
-**Plan 6 v1 结束**
+**Plan 6 v2 结束（应用 9 条 review 反馈，删除反馈功能，加强写门禁/裁剪/批量审批/聚合分页）**
 
 总计：
-- 20 个 Task
+- 19 个 Task（v1 删 Task 14 反馈收集）
 - 估时 5-7 周
 - ~30 个新文件 + 12 个修改文件
-- ~150 单元测试 + 30 eval gold set
+- ~140 单元测试 + 30 eval gold set
 - 跨仓库：HUB（主）+ ERP（约 1.5-2.5 天）
+
+## v2 Review 修复清单（review 第一轮）
+
+| # | 反馈优先级 | 问题 | 修复 |
+|---|---|---|---|
+| 1 | P1 | 写操作只靠 prompt 教 LLM 自觉 | Task 2 加 ToolType 元数据 + ConfirmGate（前置硬校验 + confirmation_token + Redis 已确认动作）+ 4 case 测试（无 token / 错 token / args 篡改 / 正确通过）|
+| 2 | P1 | tool_logger 缺实施来源 | Task 1 明确创建 `hub/observability/tool_logger.py`（不复用 task_logger 但风格对齐）+ 5 case 测试 |
+| 3 | P1 | 合同文件发送链路不完整 | Task 7 明确 DingTalkSender.send_file 实施（媒体上传 + sampleFile + 重试 + 4xx 不重试 + 文件大小硬上限）+ 5 case 测试 |
+| 4 | P1 | 批量审批循环 N 次 ERP 调用 | Task 8 改用 ERP `POST /api/v1/vouchers/batch-approve` 单次调用 + 透传 success/failed + 乐观锁防并发 |
+| 5 | P2 | token 上限缺调用前裁剪策略 | Task 6 加 ContextBuilder（每 round 调 LLM 前用 tiktoken 估算 + 优先级裁剪：摘要 tool result / 裁旧 memory / 压缩历史）+ 4 case 测试 |
+| 6 | P2 | 聚合分析缺分页和性能边界 | Task 9 加 bounded pagination（MAX_ORDERS=1000 / MAX_PERIOD=90d / partial_result + notes）|
+| 7 | P2 | Memory 抽取每轮都跑成本偏高 | Task 4 加 should_extract gate（实体命中 / 写 tool / 长对话 任一满足才抽）|
+| 8 | P2 | 引用实体没有写入路径 | Task 2 entity_extractor.py 在每次 tool call 后从 result 提取 customer_id/product_id 写回 session.referenced_entities + 2 case 测试 |
+| 9 | P3 | 反馈 UX 用户决策"不要" | **完全删除**：Task 14（反馈收集）+ §6.4 AI 反馈页 + §7.2 反馈 UX + agent_feedback 表 + 5 测试；Task 编号 14-20 顺移成 14-19 |
