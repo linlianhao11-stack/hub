@@ -173,11 +173,14 @@ class ToolRegistry:
                     f"写类 tool '{name}' 未确认 / token 错 / args 篡改 / 已被并发领取。"
                 )
 
-        # ❸ 调 fn；失败 → restore_action（confirmed + pending 都还回去）；成功路径无需 cleanup
+        # ❸ 写 tool 把 action_id 注入 fn（v8 round 2 P1：fn 必须用它做幂等键 + DB 唯一索引）
+        if is_write:
+            kwargs["confirmation_action_id"] = action_id
         try:
-            return await tool.fn(**args, ...)
+            return await tool.fn(**args, **kwargs)
         except Exception:
             if is_write and bundle:
+                # restore 让用户重试；安全前提是 fn 内部用 action_id 做了幂等查询/唯一索引
                 await self.confirm_gate.restore_action(
                     conversation_id, hub_user_id, action_id, bundle,
                 )
@@ -698,10 +701,20 @@ CREATE TABLE voucher_draft (
     rejection_reason TEXT,
     erp_voucher_id INT,  -- 落 ERP 后的 voucher ID（status>=created 时非空）
     conversation_id TEXT,
+    -- v8 round 2 P1：confirmation_action_id 作为写入幂等键（restore-on-failure 重试不重复创建）
+    --   ToolRegistry 在调写 tool fn 时把 ConfirmGate 的 action_id 注入；
+    --   tool fn 用它做"先查后插 + IntegrityError catch"幂等保护
+    confirmation_action_id VARCHAR(16),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     INDEX idx_pending (status, created_at),
     INDEX idx_creating_lease (status, creating_started_at)  -- 崩溃恢复扫描用
 );
+-- 部分唯一索引：仅当 confirmation_action_id 非空时唯一；同 (requester_hub_user_id, action_id) 唯一
+-- 历史 draft（confirmation_action_id NULL）允许并存
+CREATE UNIQUE INDEX idx_voucher_draft_action_id_unique
+    ON voucher_draft (requester_hub_user_id, confirmation_action_id)
+    WHERE confirmation_action_id IS NOT NULL;
+
 -- 注：HUB 端发到 ERP 创建 voucher 时塞 client_request_id = "hub-draft-{id}"
 -- ERP 端给 voucher 表加 client_request_id 字段 + 部分唯一索引（NOT NULL 时唯一）做幂等
 -- 见 §14.2 ERP 改动清单
@@ -720,11 +733,15 @@ CREATE TABLE price_adjustment_request (
     approved_at TIMESTAMPTZ,
     rejection_reason TEXT,
     conversation_id TEXT,
+    confirmation_action_id VARCHAR(16),  -- v8 round 2 P1：幂等键（同上）
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE UNIQUE INDEX idx_price_adj_action_id_unique
+    ON price_adjustment_request (requester_hub_user_id, confirmation_action_id)
+    WHERE confirmation_action_id IS NOT NULL;
 
 CREATE TABLE stock_adjustment_request (
-    -- 类似 price_adjustment_request
+    -- 类似 price_adjustment_request；同样含 confirmation_action_id VARCHAR(16) + 部分唯一索引
 );
 ```
 
@@ -876,6 +893,12 @@ bot_user_finance       → 加 create_voucher.use（已有）+ adjust_stock.use
     - 失败 restore 也是原子 Lua（confirmed 和 pending 都还回去）
     - 权限校验 / schema 校验**移到 claim 之前**（v6 round 2 P1-#1）：失败时不消费 confirmed token
     - **不依赖 LLM 自觉**；asyncio.gather 并发同 token 也只能跑 1 次 tool.fn
+- **写 tool 重试幂等性（v8 round 2 P1，关键）**：claim_action restore 让用户用同 token 重试的设计前提是写 tool fn 真幂等：
+    - ToolRegistry 把 `confirmation_action_id` 作为内部参数注入所有 WRITE_DRAFT / WRITE_ERP tool（不暴露给 LLM 但 fn 必须声明）
+    - 所有 HUB 写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）加 `confirmation_action_id VARCHAR(16)` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
+    - 写 tool fn 必须实现"先查（按 user+action_id）→ 命中返 idempotent_replay → 否则 INSERT → IntegrityError catch 回查"三段幂等保护
+    - tool fn 已 commit DB 但 commit 后副作用（钉钉通知 / 文件写入 / 后续 RPC）抛错时，restore + 重试不会重复创建草稿
+    - ERP 写（batch_approve_vouchers 内部 phase1 调 ERP create_voucher）已用 `client_request_id="hub-draft-{draft.id}"` 做 ERP 端幂等键（与本层互补；见 §14.2）
 - **金额硬上限**：单凭证金额上限 ¥1M（system_config 可调），超限 agent 直接拒绝创建
 - **客户/产品 ID 必须从 search_* 结果引用**：不能 LLM 自己编 ID — 如果 LLM 把没出现在过去 tool result 的 customer_id 传进来，记 warning 但仍由 ERP 端 404 兜底（HUB 端不做白名单校验，因为分页/上下文裁剪后旧 result 可能丢）
 
@@ -1054,7 +1077,7 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 
 ---
 
-**Spec 结束（v5）**
+**Spec 结束（v6）**
 
 > v4 改动（同步 plan 第三轮 review 6 条修复）：
 > - §4.2 凭证审批场景改为两阶段提交 + 幂等键 + creating 5 min 租约恢复语义
@@ -1066,3 +1089,8 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 > - §3.1 ToolRegistry.call 顺序明确：require_permissions + schema 校验**移到 claim 前**（失败不消费 confirmed token）
 > - §3.1 测试覆盖列表扩到 11 项（含权限失败不消费 token / schema 失败不消费 token / claim 原子删 pending 防重复 confirm 等 v6 round 2 加固项）
 > - §8.4 防 LLM 幻觉描述同步 v6 round 2 加固版（claim_action / restore_action / 三重一致性校验 / 权限+schema 前置）
+>
+> v6 改动（同步 plan v9 review 第八轮 写 tool 真幂等）：
+> - §3.1 ToolRegistry.call 伪代码加 action_id 注入：`kwargs["confirmation_action_id"] = action_id`
+> - §5.4 三张写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）加 `confirmation_action_id VARCHAR(16)` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
+> - §8.4 加"写 tool 重试幂等性"条目：作为 restore-on-failure 设计的安全前提；写 tool fn 必须用 action_id 做"先查后插 + IntegrityError catch"幂等保护
