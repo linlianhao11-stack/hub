@@ -182,3 +182,58 @@ async def test_can_truncate_drops_low_priority_when_no_room():
     system_msgs = [m for m in messages if m["role"] == "system"]
     old_history_msgs = [m for m in system_msgs if "old_history_summary" in m.get("content", "")]
     assert len(old_history_msgs) == 0, "budget 紧张时 old_history_summary 应被丢弃"
+
+
+@pytest.mark.asyncio
+async def test_tools_schema_counted_in_budget():
+    """v2 加固（review I-2）：大 tools_schema 计入 must_keep budget → 超限抛 PromptTooLargeError。"""
+    builder = ContextBuilder()
+    memory = _empty_memory()
+
+    # 构造 10 个 tool，每个含约 200 token 的 description
+    big_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{i}",
+                "description": "这是一个非常详细的工具描述，用于测试 tools_schema 是否被计入 token budget。" * 5,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "param1": {"type": "string", "description": "参数一说明"},
+                        "param2": {"type": "integer", "description": "参数二说明"},
+                    },
+                },
+            },
+        }
+        for i in range(10)
+    ]
+
+    # budget 极小（2500），包含 system_prompt + tools_schema 必然超限
+    with pytest.raises(PromptTooLargeError):
+        await builder.build_round(
+            round_idx=0,
+            base_memory=memory,
+            tools_schema=big_tools,
+            conversation_history=[],
+            latest_user_message="hi",
+            confirm_state_hint=None,
+            budget_token=2500,
+        )
+
+    # budget 充足（10000）→ 不抛；返回的 messages 不含 tools_schema_estimate section
+    messages = await builder.build_round(
+        round_idx=0,
+        base_memory=memory,
+        tools_schema=big_tools,
+        conversation_history=[],
+        latest_user_message="hi",
+        confirm_state_hint=None,
+        budget_token=10_000,
+    )
+    # tools_schema_estimate 不应出现在 messages 里
+    for m in messages:
+        content = m.get("content", "") or ""
+        assert "tools_schema_estimate" not in content, (
+            "tools_schema_estimate section 不应出现在 messages 中"
+        )

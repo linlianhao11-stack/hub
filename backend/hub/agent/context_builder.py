@@ -64,7 +64,13 @@ class ContextBuilder:
                           latest_user_message: str | None,
                           confirm_state_hint: str | None = None,
                           budget_token: int | None = None) -> list[dict]:
-        """组装本 round 的 OpenAI messages 列表（已裁剪到 budget 内）。"""
+        """组装本 round 的 OpenAI messages（已裁剪到 budget 内）。
+
+        Plan §1944 列 priority 7 的 entity_memory（customers + products）section，
+        本实现简化为：customer/product memory 由 PromptBuilder._render_memory()
+        在 build system_prompt 阶段已经渲染进 system 段，本层不再单独装填。
+        避免重复注入 prompt。
+        """
         budget = budget_token if budget_token is not None else self.budget
 
         # ❶ MUST_KEEP
@@ -74,11 +80,17 @@ class ContextBuilder:
         sp = self.prompt_builder.build(memory=base_memory, tools_schema=tools_schema)
         must_keep.append(self._mk_section("system_prompt", sp))
 
+        # v2 加固（review I-2）：tools_schema 也计入 budget
+        # OpenAI chat completions 把 tools= 字段当 input token 算
+        if tools_schema:
+            tools_json = json.dumps(tools_schema, ensure_ascii=False)
+            must_keep.append(self._mk_section("tools_schema_estimate", tools_json))
+
         if latest_user_message:
             must_keep.append(self._mk_section("user_msg", latest_user_message))
 
-        # 最近 1 round（last 2 messages：assistant + tool result）
-        recent = conversation_history[-2:] if len(conversation_history) >= 2 else conversation_history[:]
+        # 最近 1 round（边界感知切片：确保 OpenAI 协议完整）
+        recent = self._slice_recent_round(conversation_history)
         if recent:
             must_keep.append(self._mk_section("recent_round", recent))
 
@@ -127,11 +139,37 @@ class ContextBuilder:
             total = 0
             for m in content:
                 if isinstance(m, dict):
-                    total += _estimate_tokens(str(m.get("content", "")))
+                    # v2 加固（review M-3）：assistant tool_calls 消息 content=None，
+                    # 但 tool_calls 字段含 function name + args 占 token
+                    content_str = str(m.get("content") or "")
+                    tool_calls_str = json.dumps(m.get("tool_calls") or [], ensure_ascii=False)
+                    total += _estimate_tokens(content_str) + _estimate_tokens(tool_calls_str)
                 else:
                     total += _estimate_tokens(str(m))
             return total
         return _estimate_tokens(str(content))
+
+    @staticmethod
+    def _slice_recent_round(history: list[dict]) -> list[dict]:
+        """从 history 末尾向前找最近一个 user/assistant 边界，含进去。
+
+        v2 加固（review M-2）：确保 OpenAI 协议完整：
+        tool 消息必须紧跟 assistant.tool_calls 消息。
+        多 tool_calls round 时，原 [-2:] 切片可能截到孤儿 tool 消息。
+        本方法从末尾反向扫，遇到 user 停止，保证完整 round 边界。
+        """
+        if not history:
+            return []
+        out: list[dict] = []
+        for msg in reversed(history):
+            if not isinstance(msg, dict):
+                out.insert(0, msg)
+                continue
+            out.insert(0, msg)
+            role = msg.get("role")
+            if role == "user":
+                break
+        return out
 
     @staticmethod
     def _summarize_old_tool_results(history: list[dict]) -> str:
@@ -182,7 +220,10 @@ class ContextBuilder:
     def _compose_messages(sections: list[Section]) -> list[dict]:
         messages: list[dict] = []
         for s in sections:
-            if s.name in ("system_prompt", "confirm_hint"):
+            if s.name == "tools_schema_estimate":
+                # v2 加固（review I-2）：仅用于 budget 估算，tools 真正透传给 LLM 走 chat(tools=...) 参数
+                continue
+            elif s.name in ("system_prompt", "confirm_hint"):
                 messages.append({"role": "system", "content": str(s.content)})
             elif s.name == "user_msg":
                 messages.append({"role": "user", "content": str(s.content)})

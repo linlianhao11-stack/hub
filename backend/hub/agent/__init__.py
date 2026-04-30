@@ -5,7 +5,6 @@ from hub.agent.types import (
     ToolCall,
     AgentMaxRoundsExceeded,
     PromptTooLargeError,
-    LLMTokenBudgetExceeded,
 )
 from hub.agent.llm_client import AgentLLMClient
 from hub.agent.context_builder import ContextBuilder
@@ -17,7 +16,6 @@ __all__ = [
     "ToolCall",
     "AgentMaxRoundsExceeded",
     "PromptTooLargeError",
-    "LLMTokenBudgetExceeded",
     "AgentLLMClient",
     "ContextBuilder",
     "ChainAgent",

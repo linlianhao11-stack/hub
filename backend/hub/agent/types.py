@@ -29,10 +29,19 @@ class AgentLLMResponse:
 
     @property
     def is_clarification(self) -> bool:
-        """text 含问号视作 clarification（业务 heuristic；可配置）。"""
-        if self.text is None:
+        """判断是否是反问澄清（启发式）。
+
+        v2 加固（review M-1）：仅当满足以下全部条件才视作 clarification：
+        1. text 非空
+        2. text 末尾含 ? 或 ？
+        3. 长度 < 200（短反问；防长复述含问号被误判）
+        4. 不含 tool_calls（带 tool_call 的不算 clarification）
+        """
+        if not self.text or self.tool_calls:
             return False
-        return "?" in self.text or "？" in self.text
+        if len(self.text) >= 200:
+            return False
+        return self.text.rstrip().endswith(("?", "？"))
 
 
 # ===== Agent 最终结果 =====
@@ -64,5 +73,3 @@ class AgentMaxRoundsExceeded(Exception):
 class PromptTooLargeError(Exception):
     """ContextBuilder 必保上下文已超 budget；外层应降级 RuleParser。"""
 
-class LLMTokenBudgetExceeded(Exception):
-    """单 round LLM 返回 token > MAX_TOKENS_PER_RESPONSE → 抛此错。"""

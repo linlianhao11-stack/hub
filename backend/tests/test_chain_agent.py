@@ -25,7 +25,8 @@ from hub.agent.tools.types import MissingConfirmationError, ClaimFailedError
 from hub.agent.types import (
     AgentResult, AgentLLMResponse, ToolCall, AgentMaxRoundsExceeded,
 )
-from hub.capabilities.deepseek import LLMServiceError
+from hub.capabilities.deepseek import LLMServiceError, LLMParseError
+from hub.error_codes import BizError
 
 
 REDIS_URL = "redis://localhost:6380/0"
@@ -64,12 +65,12 @@ async def redis_client_bytes():
     await client.aclose()
 
 
-@pytest_asyncio.fixture
+@pytest.fixture
 def confirm_gate(redis_client):
     return ConfirmGate(redis_client)
 
 
-@pytest_asyncio.fixture
+@pytest.fixture
 def session_memory(redis_client_bytes):
     return SessionMemory(redis_client_bytes)
 
@@ -494,3 +495,107 @@ async def test_concurrent_calls_use_separate_conversation_ids():
     assert log_b.hub_user_id == 2
     # 确认两个 log 是不同记录
     assert log_a.id != log_b.id
+
+
+@pytest.mark.asyncio
+async def test_records_tokens_used_correctly():
+    """v2 加固（review I-3）：tokens_used 精确等于所有 round usage 累加。"""
+    # mock LLM 第 1 round 返 (prompt=100, completion=20)，第 2 round 返 (prompt=50, completion=30)
+    # ChainAgent.run 后 ConversationLog.tokens_used == 100+20+50+30 == 200
+    from hub.models.conversation import ConversationLog
+
+    call_count = 0
+
+    async def chat_side_effect(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return AgentLLMResponse(
+                text=None,
+                tool_calls=[ToolCall(id="call_t1", name="search_products", args={})],
+                usage_prompt_tokens=100,
+                usage_completion_tokens=20,
+                raw_message={"role": "assistant", "content": None, "tool_calls": [{
+                    "id": "call_t1", "type": "function",
+                    "function": {"name": "search_products", "arguments": "{}"},
+                }]},
+            )
+        return AgentLLMResponse(
+            text="找到了商品",
+            tool_calls=[],
+            usage_prompt_tokens=50,
+            usage_completion_tokens=30,
+            raw_message={"role": "assistant", "content": "找到了商品"},
+        )
+
+    registry = _make_mock_registry()
+    registry.call = AsyncMock(return_value={"items": [{"id": 1}]})
+    conv_id = _conv_id(f"tokens-{uuid.uuid4().hex[:6]}")
+    agent = _make_agent(llm_chat_side_effect=chat_side_effect, registry=registry)
+
+    await agent.run("查商品", hub_user_id=1, conversation_id=conv_id, acting_as=101)
+
+    log = await ConversationLog.filter(conversation_id=conv_id).first()
+    assert log is not None
+    assert log.tokens_used == 200, f"expected 200 but got {log.tokens_used}"
+
+
+@pytest.mark.asyncio
+async def test_tool_other_exception_injects_error_to_history_not_raise():
+    """v2 加固（review I-3）：tool 抛非确认类异常（如 ERP 5xx）→ 注入 history.error，不上抛。"""
+    call_count = 0
+
+    async def chat_side_effect(messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _tool_call_response("search_products", {})
+        # 第 2 round：LLM 看到 error 后返文本
+        return _text_response("抱歉，查询失败，请稍后重试")
+
+    registry = _make_mock_registry()
+    registry.call = AsyncMock(side_effect=RuntimeError("ERP 503"))
+
+    agent = _make_agent(llm_chat_side_effect=chat_side_effect, registry=registry)
+    result = await agent.run(
+        "查商品", hub_user_id=1, conversation_id=_conv_id(f"err-inject-{uuid.uuid4().hex[:6]}"),
+        acting_as=101,
+    )
+    # 不应抛 RuntimeError；应返回文本（LLM 决策后的回复）
+    assert result.kind == "text"
+    assert result.text is not None
+
+
+@pytest.mark.asyncio
+async def test_llm_invalid_response_returns_error():
+    """v2 加固（review I-3）：LLM 返非法格式 → AgentLLMClient 抛 LLMParseError → ChainAgent 返 error_result。"""
+    agent = _make_agent(
+        llm_chat_side_effect=LLMParseError("LLM 返回格式异常: choices 缺失")
+    )
+    result = await agent.run(
+        "测试解析错误",
+        hub_user_id=1, conversation_id=_conv_id(f"parse-err-{uuid.uuid4().hex[:6]}"),
+        acting_as=101,
+    )
+    assert result.kind == "error"
+    assert result.error is not None
+
+
+@pytest.mark.asyncio
+async def test_tool_call_bizerror_propagates():
+    """v2 加固（review I-4）：mock registry.call 抛 BizError → ChainAgent.run 应抛 BizError 上层。"""
+    registry = _make_mock_registry()
+    from hub.error_codes import BizErrorCode
+    registry.call = AsyncMock(side_effect=BizError(BizErrorCode.PERM_DOWNSTREAM_DENIED))
+
+    agent = _make_agent(
+        llm_chat_return=_tool_call_response("create_voucher", {"amount": 100}),
+        registry=registry,
+    )
+
+    with pytest.raises(BizError):
+        await agent.run(
+            "开一张单",
+            hub_user_id=1, conversation_id=_conv_id(f"bizerr-{uuid.uuid4().hex[:6]}"),
+            acting_as=101,
+        )

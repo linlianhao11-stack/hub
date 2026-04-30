@@ -17,7 +17,9 @@ from hub.agent.tools.types import (
 from hub.agent.types import (
     AgentResult, AgentMaxRoundsExceeded, PromptTooLargeError,
 )
-from hub.capabilities.deepseek import LLMServiceError
+from hub.capabilities.deepseek import LLMServiceError, LLMParseError
+from hub.error_codes import BizError
+from hub.models.conversation import ConversationLog
 
 logger = logging.getLogger("hub.agent.chain_agent")
 
@@ -58,6 +60,14 @@ class ChainAgent:
                   channel_userid: str = "",
                   user_just_confirmed: bool = False) -> AgentResult:
         """运行一轮对话。
+
+        ⚠️ 已知限制（Task 10/19 的待办）：
+           SessionMemory 当前只持久化 user / tool / assistant text；assistant.tool_calls
+           原始结构（plan §2185 raw_message）未持久化。后果：单次 run() 内多 round 完整
+           OK；但跨进程恢复（kill -9 + 重启）后 session_memory.load() 返回的 history
+           可能含孤儿 tool 消息，**不能直接喂回 LLM**。
+           Task 10 接 inbound 时如需跨 turn 恢复多 round 上下文，需扩展 ConversationMessage
+           或在 load 路径过滤孤儿 tool。本任务只保证单次 run() 内的协议完整。
 
         Args:
             user_message: 用户输入
@@ -138,6 +148,9 @@ class ChainAgent:
                         budget_token=self.MAX_PROMPT_TOKEN,
                     )
                 except PromptTooLargeError as e:
+                    # Plan §1949 提"PromptTooLargeError → ChainAgent fallback rule"。
+                    # 当前简化为返 error_result；fallback 到 RuleParser 的实际逻辑由 Task 10
+                    # inbound handler 接收 error_result 后决定（agent 失败时降级回 rule）。
                     final_status = "failed_system"
                     error_summary = f"prompt 超 budget: {e}"
                     return AgentResult.error_result("对话太复杂，请简化后重发")
@@ -151,7 +164,9 @@ class ChainAgent:
                     final_status = "failed_system"
                     error_summary = "LLM 超时 30s"
                     return AgentResult.error_result("AI 响应超时，请稍后重试")
-                except LLMServiceError as e:
+                except (LLMServiceError, LLMParseError) as e:
+                    # v2 加固（review I-3）：LLMParseError（格式异常）也统一返 error_result
+                    # 符合"LLM 异常都翻译成用户友好错误"原则
                     final_status = "failed_system"
                     error_summary = f"LLM 服务错: {e}"
                     return AgentResult.error_result("AI 服务暂不可用")
@@ -214,8 +229,14 @@ class ChainAgent:
                                 }, ensure_ascii=False),
                                 "round_idx": round_idx,
                             })
+                        except BizError:
+                            # v2 加固（review I-4）：plan §1859 明确"权限不足 BizError 上抛由 handler 翻译"
+                            # 让上层 inbound handler 决定如何向用户展示（避免 LLM 复述 permission code）
+                            final_status = "failed_user"
+                            error_summary = "权限拒绝"
+                            raise
                         except Exception as e:
-                            # tool 内部抛错（ERP 5xx / 权限拒绝等）→ 注入错误让 LLM 决策
+                            # tool 其他内部抛错（ERP 5xx / 网络错等）→ 注入错误让 LLM 决策
                             logger.exception(
                                 "tool %s 调用抛错 conv=%s round=%s", call.name,
                                 conversation_id, round_idx,
@@ -278,8 +299,15 @@ class ChainAgent:
     @staticmethod
     async def _open_conversation_log(*, conversation_id: str, hub_user_id: int,
                                      channel_userid: str, started_at: datetime):
+        """打开/获取 ConversationLog。
+
+        语义（v2 文档化 review M-8）：conversation_id 是 UNIQUE，**一个 conversation 一条 log**。
+        多次调 run() 同一 conv_id 时第二次取已有记录、final_status / tokens_used / rounds_count
+        会被 finally 块覆盖（累计在内存 history 不同步落库）。
+        如果产品需要"每 turn 一条 log"语义（区分多次对话回合），需要扩展 model 加 turn_idx
+        或改 conversation_id 加上 turn 后缀。Plan 6 当前为简化设计，单条聚合表达。
+        """
         try:
-            from hub.models.conversation import ConversationLog
             log = await ConversationLog.create(
                 conversation_id=conversation_id,
                 hub_user_id=hub_user_id,
@@ -291,7 +319,6 @@ class ChainAgent:
             # 已存在或其他写库错误：可观测性不阻塞业务
             logger.exception("ConversationLog.create 失败 conv=%s", conversation_id)
             try:
-                from hub.models.conversation import ConversationLog
                 existing = await ConversationLog.filter(conversation_id=conversation_id).first()
                 return existing  # 可能 None
             except Exception:
