@@ -18,7 +18,20 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 TABLES_TO_TRUNCATE = [
-    # 顺序：FK 依赖逆序
+    # 顺序：FK 依赖逆序（子表先 truncate）
+    # Plan 6 子表（先 truncate）
+    "tool_call_log",
+    "contract_draft",
+    "voucher_draft",
+    "price_adjustment_request",
+    "stock_adjustment_request",
+    # Plan 6 父表 / 独立表
+    "conversation_log",
+    "contract_template",
+    "user_memory",
+    "customer_memory",
+    "product_memory",
+    # Plan 1-5 原有表
     "consumed_binding_token",  # Plan 3 新增
     "meta_audit_log", "audit_log", "task_payload", "task_log",
     "erp_user_state_cache",
