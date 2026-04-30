@@ -87,6 +87,17 @@ async def setup_db():
     except Exception:
         pass  # 已存在则忽略
 
+    # Plan 6 Task 11：contract_template.file_storage_key 在生产迁移中是 TEXT，
+    # 但 generate_schemas(safe=True) 可能根据 ORM 旧模型生成 VARCHAR(500)。
+    # 手工 ALTER 确保测试 DB 与生产 DB 对齐（第一版 base64 存储需要 TEXT 无限制）
+    try:
+        await _conn.execute_query(
+            "ALTER TABLE contract_template "
+            "ALTER COLUMN file_storage_key TYPE TEXT"
+        )
+    except Exception:
+        pass  # 已是 TEXT 或表不存在则忽略
+
     # 三张写草稿表的部分唯一索引
     for _stmt in (
         'CREATE UNIQUE INDEX IF NOT EXISTS idx_voucher_draft_action_id_unique '

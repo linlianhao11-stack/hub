@@ -52,6 +52,7 @@ import {
   LayoutDashboard, Users, Shield, KeyRound, Network,
   MessageSquare, Brain, Settings, Activity, ListChecks,
   History, ClipboardList, HeartPulse, ChevronRight, Sun, Moon,
+  FileText,
 } from 'lucide-vue-next'
 import { useAuthStore } from '../../stores/auth'
 import { useAppStore } from '../../stores/app'
@@ -98,6 +99,12 @@ const groups = [
       { to: '/admin/channels', label: '渠道应用', icon: MessageSquare, perm: 'platform.apikeys.write' },
       { to: '/admin/ai', label: 'AI 提供商', icon: Brain, perm: 'platform.apikeys.write' },
       { to: '/admin/config', label: '系统配置', icon: Settings, perm: 'platform.flags.write' },
+    ],
+  },
+  {
+    title: '业务配置',
+    items: [
+      { to: '/admin/contract-templates', label: '合同模板', icon: FileText, perm: 'usecase.contract_templates.write' },
     ],
   },
   {

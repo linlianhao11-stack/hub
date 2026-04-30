@@ -34,6 +34,8 @@ PERMISSIONS = [
      "允许在钉钉用机器人自动生成销售合同（B 阶段启用）"),
     ("usecase.create_voucher.use", "usecase", "create_voucher", "use", "凭证生成",
      "允许审批通过的报销/付款自动生成会计凭证（D 阶段启用）"),
+    ("usecase.contract_templates.write", "usecase", "contract_templates", "write", "管理合同模板",
+     "可以在后台上传、编辑、启用/禁用合同模板"),
     # channel.*
     ("channel.dingtalk.use", "channel", "dingtalk", "use", "使用钉钉接入",
      "允许通过钉钉机器人交互"),

@@ -17,6 +17,7 @@ from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup, setup_full
 from hub.routers.admin import ai_providers as admin_ai_providers
 from hub.routers.admin import approvals as admin_approvals
+from hub.routers.admin import contract_templates as admin_contract_templates
 from hub.routers.admin import audit as admin_audit
 from hub.routers.admin import channels as admin_channels
 from hub.routers.admin import conversation as admin_conversation
@@ -215,6 +216,7 @@ app.include_router(admin_conversation.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_dashboard.router)
 app.include_router(admin_approvals.router)
+app.include_router(admin_contract_templates.router)
 
 
 # ============================================================

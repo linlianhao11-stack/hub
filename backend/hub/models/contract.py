@@ -19,7 +19,7 @@ class ContractTemplate(Model):
     id = fields.IntField(pk=True)
     name = fields.CharField(max_length=200)  # 模板名称
     template_type = fields.CharField(max_length=50)  # 类型：sales/purchase/framework/etc
-    file_storage_key = fields.CharField(max_length=500)  # 加密存储的 docx 文件 key
+    file_storage_key = fields.TextField()  # 存储 docx 文件（第一版：base64 编码，TEXT 无长度限制）
     placeholders = fields.JSONField()  # 占位符定义 [{name, type, required}, ...]
     description = fields.TextField(null=True)  # 模板说明
     is_active = fields.BooleanField(default=True)  # 是否启用
