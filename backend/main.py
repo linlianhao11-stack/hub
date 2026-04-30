@@ -16,6 +16,7 @@ from hub.config import get_settings
 from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup, setup_full
 from hub.routers.admin import ai_providers as admin_ai_providers
+from hub.routers.admin import approvals as admin_approvals
 from hub.routers.admin import audit as admin_audit
 from hub.routers.admin import channels as admin_channels
 from hub.routers.admin import conversation as admin_conversation
@@ -60,8 +61,11 @@ async def lifespan(app: FastAPI):
         )
         app.state.session_auth = ErpSessionAuth(erp_adapter=erp_for_session)
         app.state._session_erp_adapter = erp_for_session  # 留引用方便 shutdown 关闭
+        # 注入 approvals router 所需的 ERP adapter
+        admin_approvals.set_erp_adapter(erp_for_session)
     else:
         app.state.session_auth = None
+        admin_approvals.set_erp_adapter(None)
 
     # 3. 首启动检测：未初始化（system_initialized=false）且无未使用 token → 生成并打印
     from datetime import datetime
@@ -143,6 +147,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("HUB Gateway 关闭")
     # 关闭顺序：先停 scheduler、再取消连接 task、最后 redis / db
+    admin_approvals.set_erp_adapter(None)
     if hasattr(app.state, "scheduler"):
         try:
             await app.state.scheduler.stop()
@@ -195,6 +200,7 @@ app.include_router(admin_tasks.router)
 app.include_router(admin_conversation.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_dashboard.router)
+app.include_router(admin_approvals.router)
 
 
 # ============================================================

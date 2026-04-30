@@ -239,6 +239,51 @@ class Erp4Adapter:
             params["warehouse_id"] = warehouse_id
         return await self._act_as_get("/api/v1/inventory/aging", acting_as_user_id, params=params)
 
+    async def create_voucher(self, *, voucher_data: dict, client_request_id: str,
+                             acting_as_user_id: int) -> dict:
+        """ERP `POST /api/v1/vouchers` 创建凭证。
+
+        含 client_request_id 实现幂等（Task 18 ERP 加唯一约束 + idempotent_replay 返回）。
+        Task 18 完成前：ERP 会忽略此字段（不会去重；不报错）。
+        """
+        return await self._act_as_post(
+            "/api/v1/vouchers",
+            json={**voucher_data, "client_request_id": client_request_id},
+            acting_as_user_id=acting_as_user_id,
+        )
+
+    async def batch_approve_vouchers(self, *, voucher_ids: list[int],
+                                     acting_as_user_id: int) -> dict:
+        """ERP `POST /api/v1/vouchers/batch-approve`（已存在）。
+
+        返回 {success: list[int], failed: list[{id, reason}]}。
+        """
+        return await self._act_as_post(
+            "/api/v1/vouchers/batch-approve",
+            json={"voucher_ids": voucher_ids},
+            acting_as_user_id=acting_as_user_id,
+        )
+
+    async def upsert_customer_price_rule(self, *, customer_id: int, product_id: int,
+                                          new_price: float, reason: str | None = None,
+                                          client_request_id: str,
+                                          acting_as_user_id: int) -> dict:
+        """ERP `POST /api/v1/customer-price-rules`（Task 18 ERP 完成后才真有 endpoint）。
+
+        第一版仅写 adapter 方法骨架，让 audit_price_request 路由能编译。
+        """
+        return await self._act_as_post(
+            "/api/v1/customer-price-rules",
+            json={
+                "customer_id": customer_id,
+                "product_id": product_id,
+                "price": new_price,
+                "reason": reason,
+                "client_request_id": client_request_id,
+            },
+            acting_as_user_id=acting_as_user_id,
+        )
+
     # ------------- 私有 HTTP 方法 -------------
 
     def _system_headers(self) -> dict:
@@ -261,6 +306,25 @@ class Erp4Adapter:
         async def _do():
             try:
                 r = await self._client.post(path, headers=self._system_headers(), json=json)
+                self._raise_for_status(r)
+                return r.json()
+            except httpx.RequestError as e:
+                raise ErpSystemError(f"网络错误: {e}") from e
+        return await self._breaker.call(_do)
+
+    async def _act_as_post(
+        self, path: str, *, json: dict, acting_as_user_id: int,
+    ) -> dict:
+        if acting_as_user_id is None:
+            raise RuntimeError(
+                "Erp4Adapter 业务调用必须传 acting_as_user_id（spec §11 模型 Y 强制）",
+            )
+
+        async def _do():
+            try:
+                r = await self._client.post(
+                    path, headers=self._act_as_headers(acting_as_user_id), json=json,
+                )
                 self._raise_for_status(r)
                 return r.json()
             except httpx.RequestError as e:
