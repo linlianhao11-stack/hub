@@ -105,7 +105,13 @@ const groups = [
     title: '业务配置',
     items: [
       { to: '/admin/contract-templates', label: '合同模板', icon: FileText, perm: 'usecase.contract_templates.write' },
-      { to: '/admin/approvals', label: '待审批', icon: ClipboardCheck, perm: 'usecase.create_voucher.approve' },
+      {
+        to: '/admin/approvals',
+        label: '待审批',
+        icon: ClipboardCheck,
+        // 凭证审批员 | 调价审批员 | 库存调整审批员，任一角色均可见
+        perm: 'usecase.create_voucher.approve|usecase.adjust_price.approve|usecase.adjust_stock.approve',
+      },
     ],
   },
   {

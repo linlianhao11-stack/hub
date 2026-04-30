@@ -7,9 +7,10 @@ import api from './index'
 
 export const approvalsApi = {
   // ===== 凭证 =====
-  listVoucher({ status = 'pending', limit = 100, offset = 0 } = {}) {
+  listVoucher({ status = 'pending', limit = 20, offset = 0 } = {}, axiosConfig = {}) {
     return api.get('/admin/approvals/voucher', {
       params: { status, limit, offset },
+      ...axiosConfig,
     })
   },
   batchApproveVoucher(draft_ids) {
@@ -20,9 +21,10 @@ export const approvalsApi = {
   },
 
   // ===== 调价 =====
-  listPrice({ status = 'pending', limit = 100, offset = 0 } = {}) {
+  listPrice({ status = 'pending', limit = 20, offset = 0 } = {}, axiosConfig = {}) {
     return api.get('/admin/approvals/price', {
       params: { status, limit, offset },
+      ...axiosConfig,
     })
   },
   batchApprovePrice(request_ids) {
@@ -33,9 +35,10 @@ export const approvalsApi = {
   },
 
   // ===== 库存调整 =====
-  listStock({ status = 'pending', limit = 100, offset = 0 } = {}) {
+  listStock({ status = 'pending', limit = 20, offset = 0 } = {}, axiosConfig = {}) {
     return api.get('/admin/approvals/stock', {
       params: { status, limit, offset },
+      ...axiosConfig,
     })
   },
   batchApproveStock(request_ids) {
