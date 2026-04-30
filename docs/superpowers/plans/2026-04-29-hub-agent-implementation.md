@@ -288,10 +288,19 @@ async def test_call_checks_permission():
 async def test_call_handles_tool_exception():
     """tool 抛错 → tool_call_log 记 error，向上抛。"""
 
-# === 写门禁硬校验（4 case，对应 review P1-#1）===
+# === 写门禁硬校验（v5 round 2 P1：claim_action 原子领取 + token 绑 action_id）===
+# 辅助：模拟 inbound 拦截 → ChainAgent 调 add_pending → 用户回'是' → confirm_all_pending
+async def _confirm_one(reg, conversation_id, hub_user_id, tool_name, args):
+    """模拟 ChainAgent 把单条 pending 标 confirmed；返 (action_id, token)。"""
+    await reg.confirm_gate.add_pending(conversation_id, hub_user_id, tool_name, args)
+    confirmed = await reg.confirm_gate.confirm_all_pending(conversation_id, hub_user_id)
+    a = confirmed[-1]
+    return a["action_id"], a["token"]
+
+
 async def test_write_tool_without_confirmation_token_raises():
-    """无 confirmation_token 调用 WRITE_DRAFT/WRITE_ERP tool → UnconfirmedWriteToolError。"""
-    reg = ToolRegistry()
+    """无 confirmation_action_id / confirmation_token → UnconfirmedWriteToolError。"""
+    reg = ToolRegistry(...)
     reg.register("create_voucher_draft", _fake_voucher_fn,
                  perm="usecase.create_voucher.use",
                  tool_type=ToolType.WRITE_DRAFT,
@@ -302,81 +311,217 @@ async def test_write_tool_without_confirmation_token_raises():
                        conversation_id="c1", round_idx=0)
 
 async def test_write_tool_with_wrong_token_raises():
-    """confirmation_token 不匹配 → 拦截。"""
-    reg = ToolRegistry()
+    """confirmation_token 不匹配 → claim_action restore + 拦截 → 合法调用方 token 不被污染。"""
+    reg = ToolRegistry(...)
     reg.register("create_voucher_draft", _fake_voucher_fn,
                  perm="usecase.create_voucher.use",
-                 tool_type=ToolType.WRITE_DRAFT,
-                 description="...")
-    # 先确认一个不同 args 的动作（mark_confirmed 按 (conv, hub_user_id) 隔离）
-    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft",
-                                          {"amount": 999})
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    action_id, _ = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                       {"amount": 1000})
+    # 用错的 token
     with pytest.raises(UnconfirmedWriteToolError):
-        await reg.call("create_voucher_draft", {"amount": 1000},
-                       hub_user_id=1, acting_as=2,
-                       conversation_id="c1", round_idx=0,
-                       _hidden_token="token-for-amount-999")
+        await reg.call("create_voucher_draft", {
+            "amount": 1000,
+            "confirmation_action_id": action_id,
+            "confirmation_token": "x" * 32,
+        }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+    # 合法 token 还能用（验证 restore 起效）
+    confirmed = await reg.confirm_gate.list_pending("c1", 1)  # pending 还在
+    assert any(p["action_id"] == action_id for p in confirmed)
+
 
 async def test_write_tool_with_args_changed_after_confirm_raises():
-    """用户确认 args A → LLM 偷偷改成 args B 调用 → 拦截（防 args 篡改攻击）。"""
-
-async def test_write_tool_with_correct_token_passes():
-    """正确 token + 一致 args → 通过。"""
-    reg = ToolRegistry()
+    """用户确认 args A → LLM 偷偷改成 args B 调用 → claim 校验 args 不一致 → 拦截 + restore。"""
+    reg = ToolRegistry(...)
     reg.register("create_voucher_draft", _fake_voucher_fn,
                  perm="usecase.create_voucher.use",
                  tool_type=ToolType.WRITE_DRAFT, description="...")
-    args = {"amount": 1000}
-    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft", args)
-    token = reg.confirm_gate.compute_token("c1", 1, "create_voucher_draft", args)
-    result = await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
-                            hub_user_id=1, acting_as=2,
-                            conversation_id="c1", round_idx=0)
+    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                           {"amount": 1000})
+    # LLM 偷偷把 amount 改成 9999，token 仍然用合法的
+    with pytest.raises(UnconfirmedWriteToolError):
+        await reg.call("create_voucher_draft", {
+            "amount": 9999,  # 篡改
+            "confirmation_action_id": action_id,
+            "confirmation_token": token,
+        }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+    # 用回正确 args 仍能成功（说明 token 被 restore 了）
+    result = await reg.call("create_voucher_draft", {
+        "amount": 1000,
+        "confirmation_action_id": action_id,
+        "confirmation_token": token,
+    }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=1)
     assert result is not None
 
-# === token 一次性消费（2 case，对应 review v4 第三轮 P1）===
-async def test_write_tool_token_is_one_time_use():
-    """同 token 第二次调用被拒（防 LLM 重试 / 同对话回合内复用）。"""
-    reg = ToolRegistry()
+
+async def test_write_tool_with_correct_token_passes():
+    """正确 (action_id, token) + 一致 args → 通过。"""
+    reg = ToolRegistry(...)
     reg.register("create_voucher_draft", _fake_voucher_fn,
                  perm="usecase.create_voucher.use",
                  tool_type=ToolType.WRITE_DRAFT, description="...")
-    args = {"amount": 1000}
-    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft", args)
-    token = reg.confirm_gate.compute_token("c1", 1, "create_voucher_draft", args)
+    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                           {"amount": 1000})
+    result = await reg.call("create_voucher_draft", {
+        "amount": 1000,
+        "confirmation_action_id": action_id,
+        "confirmation_token": token,
+    }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+    assert result is not None
 
-    # 第一次：成功执行 + 消费 token
-    result1 = await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
+
+# === token 一次性消费（v4 第三轮 + v5 第二轮 P1：原子 claim 防并发）===
+async def test_write_tool_token_is_one_time_use():
+    """同 (action_id, token) 第二次调用被拒（claim 已删 confirmed[action_id]）。"""
+    reg = ToolRegistry(...)
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                           {"amount": 1000})
+    payload = {
+        "amount": 1000,
+        "confirmation_action_id": action_id,
+        "confirmation_token": token,
+    }
+
+    # 第一次：成功 → claim 已 HDEL；remove_pending 已清 pending
+    result1 = await reg.call("create_voucher_draft", payload,
                               hub_user_id=1, acting_as=2,
                               conversation_id="c1", round_idx=0)
     assert result1 is not None
 
-    # 第二次（同 token 同 args）：is_confirmed → False（已 SREM）→ 拦截
+    # 第二次（同 action_id+token）：claim_action 返 None → 拦截
     with pytest.raises(UnconfirmedWriteToolError):
-        await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
+        await reg.call("create_voucher_draft", payload,
                        hub_user_id=1, acting_as=2,
                        conversation_id="c1", round_idx=1)
 
 
 async def test_write_tool_token_preserved_when_tool_fails():
-    """tool fn 抛异常时 token 不消费，下次重试可继续用（提升用户体验）。"""
-    reg = ToolRegistry()
-    async def flaky(amount, **_): raise RuntimeError("ERP 5xx")
-    reg.register("create_voucher_draft", flaky,
+    """tool fn 抛异常时 restore_action 还原 confirmed → 用户重试用同 token 还能成功。"""
+    counter = {"n": 0}
+    async def sometimes_flaky(amount, **_):
+        counter["n"] += 1
+        if counter["n"] == 1:
+            raise RuntimeError("ERP 5xx")
+        return {"draft_id": 99}
+
+    reg = ToolRegistry(...)
+    reg.register("create_voucher_draft", sometimes_flaky,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                           {"amount": 1000})
+    payload = {
+        "amount": 1000,
+        "confirmation_action_id": action_id,
+        "confirmation_token": token,
+    }
+
+    # 第一次：tool 失败 → restore_action 把 data 还回 confirmed
+    with pytest.raises(RuntimeError):
+        await reg.call("create_voucher_draft", payload,
+                       hub_user_id=1, acting_as=2,
+                       conversation_id="c1", round_idx=0)
+
+    # 第二次：tool 成功（counter=2）→ 通过，证明 token 被 restore 了
+    result = await reg.call("create_voucher_draft", payload,
+                             hub_user_id=1, acting_as=2,
+                             conversation_id="c1", round_idx=1)
+    assert result == {"draft_id": 99}
+
+
+async def test_write_tool_concurrent_claim_executes_only_once():
+    """v5 round 2 P1：asyncio.gather 同 (action_id, token) N 个并发，只有 1 个 tool.fn 跑。"""
+    import asyncio
+    counter = {"n": 0}
+    async def slow_fn(amount, **_):
+        counter["n"] += 1
+        await asyncio.sleep(0.05)  # 给并发窗口
+        return {"draft_id": counter["n"]}
+
+    reg = ToolRegistry(...)
+    reg.register("create_voucher_draft", slow_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                           {"amount": 1000})
+    payload = {
+        "amount": 1000,
+        "confirmation_action_id": action_id,
+        "confirmation_token": token,
+    }
+
+    # 5 个并发同时拿同 (action_id, token) 调
+    results = await asyncio.gather(*[
+        reg.call("create_voucher_draft", payload,
+                 hub_user_id=1, acting_as=2,
+                 conversation_id="c1", round_idx=i)
+        for i in range(5)
+    ], return_exceptions=True)
+
+    # 1 个成功，4 个 UnconfirmedWriteToolError
+    successes = [r for r in results if not isinstance(r, BaseException)]
+    blocked = [r for r in results if isinstance(r, UnconfirmedWriteToolError)]
+    assert len(successes) == 1
+    assert len(blocked) == 4
+    assert counter["n"] == 1  # tool.fn 只跑了 1 次（写副作用没重复）
+
+
+async def test_action_id_uniqueness_for_duplicate_args():
+    """v5 round 2 P1：单 round 同 tool + 同 args 两个 pending → 两个独立 token，互不影响。"""
+    reg = ToolRegistry(...)
+    counter = {"n": 0}
+    async def fn(amount, **_):
+        counter["n"] += 1
+        return {"draft_id": counter["n"]}
+
+    reg.register("create_voucher_draft", fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+
+    # 模拟 LLM 同 round 调两次 create_voucher_draft({amount:1000}) → 都拦截
+    args = {"amount": 1000}
+    await reg.confirm_gate.add_pending("c1", 1, "create_voucher_draft", args)
+    await reg.confirm_gate.add_pending("c1", 1, "create_voucher_draft", args)
+
+    # 用户回'是' → 两个 action_id 各自 token
+    confirmed = await reg.confirm_gate.confirm_all_pending("c1", 1)
+    assert len(confirmed) == 2
+    assert confirmed[0]["action_id"] != confirmed[1]["action_id"]
+    assert confirmed[0]["token"] != confirmed[1]["token"]  # token 含 action_id 所以不同
+
+    # 调用第一个：成功，第二个仍可用
+    r1 = await reg.call("create_voucher_draft", {
+        **args, "confirmation_action_id": confirmed[0]["action_id"],
+        "confirmation_token": confirmed[0]["token"],
+    }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+    r2 = await reg.call("create_voucher_draft", {
+        **args, "confirmation_action_id": confirmed[1]["action_id"],
+        "confirmation_token": confirmed[1]["token"],
+    }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+    assert counter["n"] == 2  # 真的跑了 2 次，无相互干扰
+
+
+async def test_token_cross_action_replay_blocked():
+    """v5 round 2 P1：把 action_A 的 token 用在 action_B 上 → 拦截（防跨 action 复用）。"""
+    reg = ToolRegistry(...)
+    reg.register("create_voucher_draft", _fake_voucher_fn,
                  perm="usecase.create_voucher.use",
                  tool_type=ToolType.WRITE_DRAFT, description="...")
     args = {"amount": 1000}
-    await reg.confirm_gate.mark_confirmed("c1", 1, "create_voucher_draft", args)
-    token = reg.confirm_gate.compute_token("c1", 1, "create_voucher_draft", args)
+    await reg.confirm_gate.add_pending("c1", 1, "create_voucher_draft", args)
+    await reg.confirm_gate.add_pending("c1", 1, "create_voucher_draft", args)
+    confirmed = await reg.confirm_gate.confirm_all_pending("c1", 1)
+    a, b = confirmed[0], confirmed[1]
 
-    # 第一次：tool 失败 → token 保留
-    with pytest.raises(RuntimeError):
-        await reg.call("create_voucher_draft", {**args, "confirmation_token": token},
-                       hub_user_id=1, acting_as=2,
-                       conversation_id="c1", round_idx=0)
-    assert await reg.confirm_gate.is_confirmed(
-        "c1", 1, "create_voucher_draft", args, token,
-    ) is True  # token 仍在 confirmed set 内
+    # 拿 a.token 配 b.action_id → 校验失败 → restore + 拦截
+    with pytest.raises(UnconfirmedWriteToolError):
+        await reg.call("create_voucher_draft", {
+            **args, "confirmation_action_id": b["action_id"],
+            "confirmation_token": a["token"],
+        }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
 
 # === 实体写入路径（2 case，对应 review P2-#8）===
 async def test_call_extracts_customer_id_from_result():
@@ -399,7 +544,7 @@ async def test_call_validates_args_against_schema():
 async def test_schema_for_user_caches_per_user():
 ```
 
-合计 **15 case**（含 v4 第三轮 P1 加的 token 一次性消费 2 case）。
+合计 **17 case**（含 v5 第二轮 P1 加的并发 claim + 跨 action 复用拦截 + action_id 唯一性 3 case；删除旧的 SREM-based 一次性消费 case 1 个 → 净 +2）。
 
 - [ ] **Step 2: 实现 ToolRegistry**
 
@@ -460,7 +605,8 @@ class ToolRegistry:
         required = []
         for pname, param in sig.parameters.items():
             if pname in ("self", "ctx", "acting_as_user_id", "hub_user_id",
-                        "conversation_id", "confirmation_token"):
+                        "conversation_id",
+                        "confirmation_token", "confirmation_action_id"):
                 continue  # 这些是 ToolRegistry 注入的内部 context，不暴露给 LLM
             ptype = hints.get(pname, str)
             properties[pname] = {"type": self._py_to_json_type(ptype)}
@@ -503,34 +649,45 @@ class ToolRegistry:
 
     async def call(self, name: str, args: dict, *, hub_user_id: int,
                    acting_as: int, conversation_id: str, round_idx: int) -> Any:
-        """统一入口：写门禁 → 权限 → schema 校验 → 调 fn → 消费 token → 提取实体 → 记 log。"""
+        """统一入口：写门禁 → 权限 → schema 校验 → claim → 调 fn → remove_pending/restore → 提取实体。
+
+        v5 round 2 P1：写类 tool 改为"原子 claim + 失败 restore"模式，真正挡得住并发：
+          claim_action 用 Redis Lua HGET+HDEL 原子取走 confirmed[action_id]；
+          并发 N 个同 token 调用，只有 1 个拿到 data 进 tool.fn，其余直接拒。
+          tool.fn 抛错时调 restore_action 把 data 还回去，便于用户/重试逻辑用同 token 再来。
+        """
         tool = self._tools.get(name)
         if not tool:
             raise ToolNotFoundError(name)
 
-        # ❶ 写类 tool 硬门禁（review v3 第二轮 P1：按 hub_user_id 隔离）
-        token: str | None = None
-        if tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP):
+        # ❶ 写类 tool 硬门禁（review v5 第二轮 P1：tool.fn 前原子 claim）
+        is_write = tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP)
+        claimed_data: dict | None = None
+        action_id: str | None = None
+        if is_write:
+            action_id = args.pop("confirmation_action_id", None)
             token = args.pop("confirmation_token", None)
-            if not await self.confirm_gate.is_confirmed(
-                conversation_id, hub_user_id, name, args, token,
-            ):
-                # 记一条"未确认拦截"日志方便溯源
+            claimed_data = await self.confirm_gate.claim_action(
+                conversation_id, hub_user_id, action_id, token, name, args,
+            )
+            if claimed_data is None:
+                # 全部失败场景（无 action_id / 无 token / token 错 / args 错 / 已被并发领取）
+                # 都走这里，统一报错；ChainAgent 上层把 raise 翻成对 LLM 的 system hint
                 await self._log_blocked_call(conversation_id, round_idx, name, args,
-                                              reason="unconfirmed_write")
+                                              reason="unconfirmed_write_or_claim_failed")
                 raise UnconfirmedWriteToolError(
-                    f"写类 tool '{name}' 必须先经用户确认（或 token 已被消费过）。"
-                    "请用 text 把操作预览发给用户，"
-                    "用户回'是'后由 ChainAgent 自动注入新 confirmation_token 重试。"
+                    f"写类 tool '{name}' 未确认，或 confirmation_token/action_id 无效，"
+                    "或已被另一并发调用领取。请用 text 把操作预览发给用户，"
+                    "用户回'是'后由 ChainAgent 自动注入新 (action_id, token) 重试。"
                 )
 
-        # ❷ 权限校验
+        # ❷ 权限校验（claim 成功后才走，避免无效 claim 被 401 中断）
         await require_permissions(hub_user_id, [tool.perm])
 
         # ❸ args schema 校验（用 jsonschema）
         self._validate_args(args, tool.schema)
 
-        # ❹ 调 tool（注入内部 context）+ 记 log + 异常包装
+        # ❹ 调 tool（注入内部 context）+ 记 log + 失败 restore_action
         async with log_tool_call(
             conversation_id=conversation_id, round_idx=round_idx,
             tool_name=name, args=args,
@@ -546,23 +703,35 @@ class ToolRegistry:
             for k, v in inject_ctx.items():
                 if k in sig.parameters:
                     kwargs[k] = v
-            result = await tool.fn(**kwargs)
+
+            try:
+                result = await tool.fn(**kwargs)
+            except Exception:
+                # ❺a 写类 tool 执行失败 → restore_action（让用户/重试用同 token 再来）
+                if is_write and claimed_data is not None and action_id is not None:
+                    try:
+                        await self.confirm_gate.restore_action(
+                            conversation_id, hub_user_id, action_id, claimed_data,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "restore_action failed (conv=%s user=%s action=%s)",
+                            conversation_id, hub_user_id, action_id,
+                        )
+                raise
+
             ctx.set_result(result)
 
-            # ❺ 写类 tool 成功执行后：原子消费 token（review v4 第三轮 P1：一次性使用）
-            #    - 失败时不消费：tool fn 抛异常会跳过这里，token 保留可重试，免去用户二次确认
-            #    - 成功时立刻消费：LLM 在 30 min TTL 内拿同 token 重复调被 is_confirmed 拦截
-            #    - SREM 原子：并发场景下只有第一个真正消费成功（次要兜底；主要 LLM flow 是单线程）
-            if token is not None:
-                consumed = await self.confirm_gate.consume_token(
-                    conversation_id, hub_user_id, token,
-                )
-                if not consumed:
-                    # 罕见：tool 执行期间另一并发调用消费了；执行已发生，写一条 warning
-                    logger.warning(
-                        "confirmation_token already consumed by concurrent path "
-                        "(conv=%s user=%s tool=%s)",
-                        conversation_id, hub_user_id, name,
+            # ❺b 写类 tool 执行成功 → 清对应 pending（confirmed 已被 claim 时取走，无需再清）
+            if is_write and action_id is not None:
+                try:
+                    await self.confirm_gate.remove_pending(
+                        conversation_id, hub_user_id, action_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "remove_pending failed (conv=%s user=%s action=%s)",
+                        conversation_id, hub_user_id, action_id,
                     )
 
             # ❻ 提取实体引用写回 session memory（review P2-#8）
@@ -631,17 +800,34 @@ from redis.asyncio import Redis
 class ConfirmGate:
     """写门禁 + pending_write 状态管理（按 conversation_id × hub_user_id 严格隔离）。
 
-    review v3 第二轮 P1：
+    review v3 第二轮 P1（已应用）：
     - key/token 加 hub_user_id：群聊里 B 不能确认 A 的写
-    - pending 改 hash（action_id → pending data）：支持单 round 多个写 tool 一起 pending，
-      用户一次"是"全部确认；不会被后一次写覆盖
+    - pending 改 hash（action_id → pending data）：支持单 round 多个写 tool 一起 pending
+
+    review v5 第二轮 P1（本轮新加，关键改动）：
+    - confirmed 从 set 改成 hash {action_id → confirmed_data}：消费按 action_id 原子做
+    - compute_token 加 action_id 入 payload：单 round 同 tool+同 args 多 pending 也有不同 token
+    - 新 claim_action：tool.fn 前用 Redis Lua HGET+HDEL 原子领取 → 真正 one-time，挡得住并发
+    - 新 restore_action：tool.fn 抛错时还原 confirmed 状态以便重试（不强制用户重新确认）
     """
     PENDING_KEY = "hub:agent:pending:"      # hash: {action_id: pending_json}
-    CONFIRMED_KEY = "hub:agent:confirmed:"  # set: {token, ...}
+    CONFIRMED_KEY = "hub:agent:confirmed:"  # hash: {action_id: confirmed_json}（v5 round 2 改）
     TTL = 1800  # 30 min（与会话 memory 同 TTL）
+
+    # Lua 脚本：原子 HGET+HDEL（"GETDEL" pattern for hash field）
+    # 并发场景下保证两个调用只有一个能取到 raw 字符串；另一个返回 nil
+    _CLAIM_LUA = """
+    local raw = redis.call('HGET', KEYS[1], ARGV[1])
+    if raw then
+        redis.call('HDEL', KEYS[1], ARGV[1])
+        return raw
+    end
+    return nil
+    """
 
     def __init__(self, redis: Redis):
         self.redis = redis
+        self._claim_script = redis.register_script(self._CLAIM_LUA)
 
     def _pending_key(self, conversation_id: str, hub_user_id: int) -> str:
         return f"{self.PENDING_KEY}{conversation_id}:{hub_user_id}"
@@ -661,11 +847,15 @@ class ConfirmGate:
         return _norm(args)
 
     @staticmethod
-    def compute_token(conversation_id: str, hub_user_id: int,
+    def compute_token(conversation_id: str, hub_user_id: int, action_id: str,
                       tool_name: str, normalized_args: dict) -> str:
-        """token = sha256(conversation_id:hub_user_id:tool_name:canonical_json(args))[:32]。"""
+        """token = sha256(conv:user:action_id:tool:canonical(args))[:32]（v5 round 2：含 action_id）。
+
+        加 action_id 后，单 round 同 tool + 同 args 的多个 pending 也有不同 token，
+        消费一个不影响另一个；防 LLM 用同 token 触发不同 action 的副作用。
+        """
         payload = (
-            f"{conversation_id}:{hub_user_id}:{tool_name}:"
+            f"{conversation_id}:{hub_user_id}:{action_id}:{tool_name}:"
             f"{json.dumps(normalized_args, sort_keys=True, ensure_ascii=False)}"
         )
         return hashlib.sha256(payload.encode()).hexdigest()[:32]
@@ -702,65 +892,109 @@ class ConfirmGate:
     async def clear_pending(self, conversation_id: str, hub_user_id: int) -> None:
         await self.redis.delete(self._pending_key(conversation_id, hub_user_id))
 
-    # ====== confirmed（用户已确认的 token）======
+    async def remove_pending(self, conversation_id: str, hub_user_id: int,
+                             action_id: str) -> None:
+        """v5 round 2：tool.fn 成功后清单条 pending（不影响其他 pending）。"""
+        await self.redis.hdel(
+            self._pending_key(conversation_id, hub_user_id), action_id,
+        )
+
+    # ====== confirmed（用户已确认的待执行 action）======
     async def mark_confirmed(self, conversation_id: str, hub_user_id: int,
-                             tool_name: str, args: dict) -> str:
-        """把单个动作的 token 写 confirmed set。"""
+                             action_id: str, tool_name: str, args: dict) -> str:
+        """v5 round 2：confirmed 改成 hash {action_id: data}。token 含 action_id，唯一。"""
         normalized = self.canonicalize(args)
-        token = self.compute_token(conversation_id, hub_user_id, tool_name, normalized)
-        await self.redis.sadd(self._confirmed_key(conversation_id, hub_user_id), token)
-        await self.redis.expire(self._confirmed_key(conversation_id, hub_user_id), self.TTL)
+        token = self.compute_token(
+            conversation_id, hub_user_id, action_id, tool_name, normalized,
+        )
+        confirmed_data = {
+            "tool_name": tool_name,
+            "args": args,
+            "normalized_args": normalized,
+            "token": token,
+        }
+        confirmed_key = self._confirmed_key(conversation_id, hub_user_id)
+        await self.redis.hset(
+            confirmed_key, action_id,
+            json.dumps(confirmed_data, ensure_ascii=False),
+        )
+        await self.redis.expire(confirmed_key, self.TTL)
         return token
 
     async def confirm_all_pending(self, conversation_id: str,
                                    hub_user_id: int) -> list[dict]:
         """用户回'是' → 把所有 pending action 标 confirmed → 返 [{action_id, tool_name, args, token}, ...]。
 
-        ChainAgent 用这个返回值组装 system hint 让 LLM 重新调 tool 时填对 token。
-        pending 不主动清；ToolRegistry.call 在 tool 调用成功后由 ChainAgent 清掉对应 action_id。
+        ChainAgent 用这个返回值组装 system hint 让 LLM 重新调 tool 时填对 (action_id, token)。
+        pending 不主动清；ToolRegistry.call 成功执行后由 remove_pending 清掉对应 action_id。
         """
         pending = await self.list_pending(conversation_id, hub_user_id)
         out = []
         for p in pending:
             token = await self.mark_confirmed(
-                conversation_id, hub_user_id, p["tool_name"], p["args"],
+                conversation_id, hub_user_id, p["action_id"],
+                p["tool_name"], p["args"],
             )
             out.append({**p, "token": token})
         return out
 
-    async def is_confirmed(self, conversation_id: str, hub_user_id: int,
-                           tool_name: str, args: dict, token: str | None) -> bool:
-        """ToolRegistry.call 入口检查（按 conversation_id × hub_user_id 隔离）。
+    async def claim_action(self, conversation_id: str, hub_user_id: int,
+                           action_id: str | None, token: str | None,
+                           tool_name: str, args: dict) -> dict | None:
+        """v5 round 2 P1：原子领取 confirmed action（tool.fn 前调，真正 one-time）。
 
-        只读：检查 token 形式正确 + 在 confirmed set 中。
-        不消费 token —— 消费由 consume_token 在 tool 成功执行后做。
+        流程：
+        1. Lua 脚本原子 HGET+HDEL confirmed[action_id]：并发 N 个调用只有 1 个拿到 raw
+        2. 校验返回 data 中的 token 与传入 token 一致 + tool_name + args 一致
+        3. 校验失败：把 data restore 回 confirmed（不消耗别人的合法 action）+ 返 None
+        4. 全部通过：返 data；调用方拿到 data 后可执行 tool.fn
+
+        失败语义（返 None 的全部场景）：
+        - confirmed_hash 中无该 action_id（从未确认 / 已被并发领取 / 已超 TTL）
+        - token 不匹配（LLM 篡改 / 跨 action 复用）
+        - tool_name 或 args 与 confirmed 时不一致（LLM 偷偷改参数）
+
+        成功后调用方应：tool.fn 成功 → 调 remove_pending；tool.fn 失败 → 调 restore_action。
         """
-        if not token:
-            return False
+        if not (token and action_id):
+            return None
+        confirmed_key = self._confirmed_key(conversation_id, hub_user_id)
+        raw = await self._claim_script(keys=[confirmed_key], args=[action_id])
+        if not raw:
+            return None
+        raw_str = raw if isinstance(raw, str) else raw.decode()
+        data = json.loads(raw_str)
+
+        # 校验 token / tool_name / args 一致性；任何不一致都 restore + 返 None
         normalized = self.canonicalize(args)
-        expected = self.compute_token(conversation_id, hub_user_id, tool_name, normalized)
-        if token != expected:
-            return False
-        return bool(await self.redis.sismember(
-            self._confirmed_key(conversation_id, hub_user_id), token,
-        ))
-
-    async def consume_token(self, conversation_id: str, hub_user_id: int,
-                            token: str) -> bool:
-        """原子消费 token（review v4 第三轮 P1：一次性使用，防 LLM 重试/记忆复用）。
-
-        Redis SREM 是原子操作 —— 同一 token 并发 N 次调用，只有 1 次返 1（成功消费）。
-        ToolRegistry.call 在 tool 成功执行后调；调用方应在确认成功后立即消费，
-        避免 30 min TTL 内被 LLM 在下一 round / 下一对话回合用同 token 重复触发同写操作。
-
-        返：True = 我们刚消费的（合法一次性使用）；False = 已被消费或不存在（重试/篡改）。
-        """
-        if not token:
-            return False
-        removed = await self.redis.srem(
-            self._confirmed_key(conversation_id, hub_user_id), token,
+        expected_token = self.compute_token(
+            conversation_id, hub_user_id, action_id, tool_name, normalized,
         )
-        return bool(removed)
+        consistent = (
+            data.get("token") == token == expected_token
+            and data.get("tool_name") == tool_name
+            and data.get("normalized_args") == normalized
+        )
+        if not consistent:
+            # restore：原 data 还回 confirmed，让合法调用方还能用（不污染合法 action 状态）
+            await self.redis.hset(confirmed_key, action_id, raw_str)
+            await self.redis.expire(confirmed_key, self.TTL)
+            return None
+        return data
+
+    async def restore_action(self, conversation_id: str, hub_user_id: int,
+                             action_id: str, data: dict) -> None:
+        """v5 round 2 P1：tool.fn 抛错时把 confirmed 状态还原，让用户/重试逻辑能用同 token 再来。
+
+        语义：claim_action 成功后才会调（说明这个 action_id+token 之前是合法的）。
+        TTL 重置；用户在 30 min 窗口内还能重试。超过 TTL 才需要重新发起确认。
+        """
+        confirmed_key = self._confirmed_key(conversation_id, hub_user_id)
+        await self.redis.hset(
+            confirmed_key, action_id,
+            json.dumps(data, ensure_ascii=False),
+        )
+        await self.redis.expire(confirmed_key, self.TTL)
 ```
 
 **`hub/agent/tools/entity_extractor.py`**：
@@ -1506,17 +1740,26 @@ class ChainAgent:
                 conversation_id, hub_user_id,
             )
             if confirmed_actions:
-                # 把所有 pending 拼成结构化 hint（每条带 action_id + tool_name + args 摘要 + token）
-                lines = [f"用户已确认 {len(confirmed_actions)} 个写操作。请按下表重新调用对应 tool 并附 confirmation_token："]
+                # 把所有 pending 拼成结构化 hint。v5 round 2 P1：必须同时传 (action_id, token) 两个字段，
+                # ToolRegistry.call 用 action_id 做原子 claim，token 做一致性校验
+                lines = [
+                    f"用户已确认 {len(confirmed_actions)} 个写操作。请按下表重新调用对应 tool，"
+                    "**每次调用必须同时传 confirmation_action_id 和 confirmation_token 两个字段**："
+                ]
                 for a in confirmed_actions:
                     args_summary = json.dumps(a["args"], ensure_ascii=False)[:200]
                     lines.append(
-                        f"  • action_id={a['action_id']}: {a['tool_name']} "
-                        f"args={args_summary} → token=\"{a['token']}\""
+                        f"  • {a['tool_name']}: args={args_summary} "
+                        f"→ confirmation_action_id=\"{a['action_id']}\" "
+                        f"confirmation_token=\"{a['token']}\""
                     )
+                lines.append(
+                    "注意：每对 (action_id, token) 只能用 1 次。失败时（tool 抛错）token 会被 HUB 还原，可重试同对；"
+                    "成功后 HUB 会原子消费，不可再用。"
+                )
                 confirm_hint = "\n".join(lines)
-                # 不在这里 clear_pending；让 ToolRegistry.call 调用成功后
-                # ChainAgent 在 tool result 接收时按 action_id 删对应 pending
+                # 不在这里 clear_pending；ToolRegistry.call 在 tool 成功后调
+                # ConfirmGate.remove_pending 按 action_id 单条清；其他 pending 不受影响。
             # 没 pending：用户随口"是"，confirm_hint 留 None，正常进 LLM
 
         # ❷ 主循环
@@ -1542,12 +1785,10 @@ class ChainAgent:
                             conversation_id=conversation_id, round_idx=round_idx,
                         )
                         self.history.append(ToolResult(call.id, result))
-                        # 写 tool 成功后，找到对应 pending action_id 删除（防 LLM 重复 confirm）
-                        await self._cleanup_consumed_pending(
-                            conversation_id, hub_user_id, call.name, call.args,
-                        )
+                        # v5 round 2：pending 清理由 ToolRegistry.call 内部按 confirmation_action_id
+                        # 调 ConfirmGate.remove_pending 完成；ChainAgent 这里不再做按 args 匹配的兜底。
                     except UnconfirmedWriteToolError as e:
-                        # 写门禁拦截 → 加入 pending list（不覆盖之前的）
+                        # 写门禁拦截 → 加入 pending list（不覆盖之前的；按 action_id 单条存）
                         await self.confirm_gate.add_pending(
                             conversation_id, hub_user_id, call.name, call.args,
                         )
@@ -1560,19 +1801,6 @@ class ChainAgent:
             return AgentResult.text(llm_resp.text)
 
         raise AgentMaxRoundsExceeded()
-
-    async def _cleanup_consumed_pending(self, conversation_id, hub_user_id,
-                                          tool_name, args):
-        """tool 调用成功后：从 pending hash 删除匹配的 action（按 args 内容比对）。"""
-        normalized = self.confirm_gate.canonicalize(args)
-        pending_list = await self.confirm_gate.list_pending(conversation_id, hub_user_id)
-        for p in pending_list:
-            if p["tool_name"] == tool_name and p["normalized_args"] == normalized:
-                await self.confirm_gate.redis.hdel(
-                    self.confirm_gate._pending_key(conversation_id, hub_user_id),
-                    p["action_id"],
-                )
-                return
 ```
 
 **单聊 vs 群聊 conversation_id 设计**：
@@ -1920,6 +2148,22 @@ async def batch_approve_vouchers(req: BatchApproveRequest, request: Request):
     ).all()
 
     if not created_drafts:
+        # review v5 第二轮 P2-#3：早返回前也写一条 audit log，避免 in_progress-only 批量审批
+        # 不留任何痕迹（管理层无法看到"会计 A 在 X 时点尝试批了 N 张但全在处理中"）
+        await AuditLog.create(
+            who_hub_user_id=actor.id, action="batch_approve_vouchers",
+            target_type="voucher_draft",
+            target_id=str(req.draft_ids),
+            detail={
+                "approved": [],
+                "creation_failed": creation_failures,
+                "approve_failed": [],
+                "in_progress": [p["draft_id"] for p in in_progress],
+                "early_return_reason": (
+                    "no_actionable_drafts"  # 全部 in_progress 或 phase1 全失败
+                ),
+            },
+        )
         return {
             "approved_count": 0, "approved_draft_ids": [],
             "failed": creation_failures,
@@ -1995,7 +2239,7 @@ async def batch_reject_vouchers(req, request):
 - `Voucher` 表加 `client_request_id` 字段（VARCHAR 64，NULL OK）+ partial unique index（仅当 client_request_id NOT NULL 时唯一）
 - `POST /api/v1/vouchers` body 接受 `client_request_id` 字段；冲突时返已存在的 voucher（HTTP 200 + 标记 idempotent_replay=True）
 
-- [ ] **Step 3: 测试 17 case（含 creating 租约恢复 + in_progress 暴露）**
+- [ ] **Step 3: 测试 18 case（含 creating 租约恢复 + in_progress 暴露 + 早返回 audit log）**
 
 | # | 场景 | 期望 |
 |---|---|---|
@@ -2016,6 +2260,7 @@ async def batch_reject_vouchers(req, request):
 | 15 | **崩溃恢复（租约过期）**：人为造一条 status=creating + creating_started_at=10 分钟前 → 再次 batch-approve 同 draft_id | 视为崩溃残留，重新进 phase1 + 同 client_request_id 调 ERP；ERP 返 idempotent_replay → 标 created → 进 phase2 |
 | 16 | **租约未过期跳过**：status=creating + creating_started_at=2 分钟前 → 再次 batch-approve | 当作"另一个进程在处理"，**该条不进 phase1，但出现在 response.in_progress 中**（含 since / lease_expires_at / 中文 reason），UI 可显示"处理中"区别于"全部失败" |
 | 17 | **混合 in_progress + 正常**：3 张 draft 中 1 张 creating(2min 前 lease 未过)，2 张 pending → batch-approve 全部 | 2 张正常进 phase1+phase2 → approved_count=2；in_progress 数组含那 1 条；失败列表为空 |
+| 18 | **全 in_progress 早返回**（review v5 第二轮 P2-#3）：3 张 draft 都 creating + lease 未过 → batch-approve 全部 | approved_count=0 + failed=[]；**audit log 仍写入一条**，detail 含 in_progress draft_id + early_return_reason="no_actionable_drafts" + actor，UI/管理层可看到"会计 X 在 T 时点尝试批 3 张但全部在处理中" |
 
 - [ ] **Step 4: 提交**
 
@@ -2796,7 +3041,7 @@ git commit -m "docs(hub): Plan 6 端到端验证记录"
 - ✓ ConfirmGate (conversation_id, hub_user_id) 二元组隔离 + action_id 多 pending 支持 — 跨 Task 2 / Task 6 / Task 10 一致
 - ✓ voucher_draft 状态机 5 值（pending / creating / created / approved / rejected）跨 spec §5.4 / Task 1 / Task 8 / Task 18 一致
 - ✓ client_request_id 命名：HUB 端 `f"hub-draft-{draft.id}"` 与 ERP schema VARCHAR(64) NULL 一致
-- ✓ confirmation_token 一次性消费语义跨 ConfirmGate.consume_token / ToolRegistry.call 一致（v5 加），含失败不消费的细则
+- ✓ confirmation 链路一次性 + 真正抗并发（v6）：ConfirmGate.claim_action（Lua HGET+HDEL 原子）+ restore_action / remove_pending；ToolRegistry.call 用 (confirmation_action_id, confirmation_token) 双字段；token 含 action_id（同 args 多 pending 不撞 token）
 - ✓ ERP idempotent_replay 字段语义跨 Task 8（HUB phase1 调用方）/ Task 18（ERP router 返回方）/ ChainAgent confirm hint 一致
 
 ### 范围检查
@@ -2848,6 +3093,13 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
 - P1 #2：ERP 幂等回放**真正处理并发唯一冲突** —— Task 18 router 实现块改为实际 `try/except IntegrityError + requery + idempotent_replay=True`（含分支：非 client_request_id 唯一冲突照常 reraise / IntegrityError 后回查不到也 reraise），测试 case 5 → 9（含 asyncio.gather 并发测）
 - P2 #3：creating 租约未过期的草稿不再静默吞掉 —— batch-approve 返回新增 `in_progress` 数组（含 draft_id / since / lease_expires_at / 中文 reason），UI 可显示"处理中"区别于"全部失败"，audit log 同步含 in_progress draft_id；Task 8 测试 16 → 17 case
 - P2 #4：ToolRegistry imports 完整列表搬进实现块顶部（含 `import time` / `Any` / `ToolArgsValidationError` / `logging.getLogger`），删掉块外的"必要 import"footnote
+
+**Plan 6 v6 结束（应用第五轮 review 3 条反馈，写操作 confirmation 链路真正抗并发）**：
+- P1 #1：v5 的"成功后 SREM"挡不住并发 → 改为 **tool.fn 前原子 claim_action**（Redis Lua HGET+HDEL）。ConfirmGate 全面重构：confirmed 从 set 改成 hash {action_id: data}；新 `claim_action` Lua 原子领取 + 一致性校验 + 失败 restore；新 `restore_action` 让 tool.fn 抛错时还原 confirmed；新 `remove_pending` 按 action_id 单条清。ToolRegistry.call 改用 claim+restore pattern。
+- P1 #2：**token 绑定 action_id** —— compute_token payload 加 action_id；LLM 调写 tool 时必须**同时传 confirmation_action_id + confirmation_token** 两字段；ChainAgent confirm hint 改为按"action_id+token"对要求；schema 同时排除两个字段不暴露给 LLM。
+- P2 #3：**in_progress-only 早返回写 audit log** —— 全部 draft 都 creating + 租约未过期时不再无声返回 0/0，audit log 加 `early_return_reason="no_actionable_drafts"` + in_progress draft_id；Task 8 加 case 18 验证。
+- 测试新增：`test_write_tool_concurrent_claim_executes_only_once`（asyncio.gather 5 个并发只跑 1 次 tool.fn）+ `test_action_id_uniqueness_for_duplicate_args`（同 args 多 pending 各自独立）+ `test_token_cross_action_replay_blocked`（跨 action 复用 token 拦截）；Task 2 测试 15 → 17 case；Task 8 测试 17 → 18 case。
+- 旧 `_cleanup_consumed_pending` ChainAgent 兜底删除（pending 清理责任已移到 ToolRegistry.call → ConfirmGate.remove_pending 按 action_id 单条做，更精确）
 
 总计：
 - 19 个 Task
