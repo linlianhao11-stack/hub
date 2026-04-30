@@ -610,6 +610,72 @@ async def test_claim_atomically_removes_pending_so_reconfirm_safe():
         }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=1)
     assert counter["n"] == 1  # 真的没有重复执行
 
+
+# === v7 round 2 P1：args 不污染 + 错误类型分流（2 case）===
+async def test_call_does_not_mutate_caller_args():
+    """v7 round 2 P1-#1：reg.call 不能把 confirmation 字段从调用方原 dict 里 pop 掉。"""
+    reg = ToolRegistry(...)
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
+                                           {"amount": 1000})
+    payload = {
+        "amount": 1000,
+        "confirmation_action_id": action_id,
+        "confirmation_token": token,
+    }
+    payload_snapshot = dict(payload)  # 记一份调用前内容
+
+    await reg.call("create_voucher_draft", payload,
+                    hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+
+    # 调用后原 dict 应保持不变（关键：confirmation 字段仍在）
+    assert payload == payload_snapshot
+    assert payload["confirmation_action_id"] == action_id
+    assert payload["confirmation_token"] == token
+
+
+async def test_claim_failed_does_not_add_pending():
+    """v7 round 2 P1-#2：claim 失败（带过 confirmation 但失败）→ ChainAgent 不应 add_pending。
+
+    场景：用户已确认 action_A，LLM 拿 a.token 配 b.action_id 调用 → ClaimFailedError。
+    ChainAgent 收到 ClaimFailedError 后**不能**调 add_pending，否则会出现"幽灵 pending"
+    污染下一轮 confirm_all_pending（用户回'是'又会 mark 一次同写操作）。
+    """
+    # 先模拟 ChainAgent 接到 ClaimFailedError 时的处理：
+    #   ChainAgent.run 主循环里区分 except MissingConfirmationError vs except ClaimFailedError
+    #   后者不调 add_pending；前者才调。
+    # 这个测试覆盖 ChainAgent 那条分支（不是 ToolRegistry 本身），但放这里是为了和
+    # error subclass 一起测；ChainAgent 集成测在 Task 6/10。
+
+    # 直接验证 ToolRegistry 抛对 subclass：
+    reg = ToolRegistry(...)
+    reg.register("create_voucher_draft", _fake_voucher_fn,
+                 perm="usecase.create_voucher.use",
+                 tool_type=ToolType.WRITE_DRAFT, description="...")
+    args = {"amount": 1000}
+    await reg.confirm_gate.add_pending("c1", 1, "create_voucher_draft", args)
+    confirmed = await reg.confirm_gate.confirm_all_pending("c1", 1)
+    a = confirmed[0]
+
+    # 完全不传 confirmation 字段 → MissingConfirmationError（is-a UnconfirmedWriteToolError）
+    with pytest.raises(MissingConfirmationError):
+        await reg.call("create_voucher_draft", {**args},
+                       hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+
+    # 传了 confirmation_token 但 token 错（带 action_id）→ ClaimFailedError
+    with pytest.raises(ClaimFailedError):
+        await reg.call("create_voucher_draft", {
+            **args,
+            "confirmation_action_id": a["action_id"],
+            "confirmation_token": "x" * 32,  # 错 token
+        }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=1)
+
+    # 两个都是 UnconfirmedWriteToolError 子类（向后兼容 except 兜底语义）
+    assert issubclass(MissingConfirmationError, UnconfirmedWriteToolError)
+    assert issubclass(ClaimFailedError, UnconfirmedWriteToolError)
+
 # === 实体写入路径（2 case，对应 review P2-#8）===
 async def test_call_extracts_customer_id_from_result():
     """tool 返回含 customer_id → 写回 session.referenced_entities。"""
@@ -631,7 +697,7 @@ async def test_call_validates_args_against_schema():
 async def test_schema_for_user_caches_per_user():
 ```
 
-合计 **20 case**（v5 加 3 case + v6 round 2 加 3 case：权限失败不消费 token / schema 失败不消费 token / claim 原子删 pending 防重复 confirm）。
+合计 **22 case**（v5 加 3 + v6 round 2 加 3 + v7 round 2 加 2：args 不污染 + 错误类型分流）。
 
 - [ ] **Step 2: 实现 ToolRegistry**
 
@@ -738,55 +804,71 @@ class ToolRegistry:
                    acting_as: int, conversation_id: str, round_idx: int) -> Any:
         """统一入口：权限 → schema 校验 → claim（写类）→ 调 fn → 失败 restore / 成功直接走 → 提取实体。
 
-        v6 round 2 P1 加固（关键改动）：
+        v6 round 2 P1 加固：
         1. require_permissions / _validate_args 移到 claim **之前**（review v6 P1-#1）
-           原因：v6 写法把这两步放在 claim 后；权限被撤销 / args schema 不合法时 confirmed
-           token 已被 HDEL 但 tool 没真跑，用户进入难解释的"已确认但失败"循环。
-           修复：把 stateless 的权限+schema 校验提前；失败时不消费 confirmed token。
         2. claim_action 现在原子同时 HDEL confirmed + pending（持久终态，review v6 P1-#2）
-           原因：v6 写法 tool 成功后再 remove_pending；Redis 短暂故障导致 pending 残留时
-           用户回'是'重新 mark_confirmed → 同写操作再次执行（重复副作用）。
-           修复：claim 时一次性删两个；成功路径无需任何后续 cleanup（持久终态）。
-        3. 失败 restore 也用 Lua 原子还回 confirmed + pending；不会出现"confirmed 还了
-           但 pending 没还"的中间态导致用户回'是'时多 mark 一份。
+        3. 失败 restore 也用 Lua 原子还回 confirmed + pending
+
+        v7 round 2 P1 加固：
+        4. **入口处复制 args**（review v7 P1-#1）—— 不污染 ChainAgent 持有的原 args dict；
+           tests/concurrent path 复用 payload 不会因为第一次 pop 把 token 删掉而第二次失败
+        5. **MissingConfirmationError vs ClaimFailedError 两个 subclass**（review v7 P1-#2）：
+           - 两者都是 UnconfirmedWriteToolError（向后兼容）
+           - 但语义不同：missing → ChainAgent 应 add_pending；claim_failed → 不 add（避免重复 pending）
         """
         tool = self._tools.get(name)
         if not tool:
             raise ToolNotFoundError(name)
 
-        # ❶ 写类 tool：先 pop confirmation 字段（schema 校验不含它们）
+        # ❶ v7 round 2 P1-#1：入口复制 args，所有 pop/inject/log/fn 都用副本，原 args 不被污染
+        tool_args = dict(args)
+
+        # ❷ 写类 tool：从副本 pop confirmation 字段（schema 校验不含它们）
         is_write = tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP)
         action_id: str | None = None
         token: str | None = None
+        had_confirmation_fields = False
         if is_write:
-            action_id = args.pop("confirmation_action_id", None)
-            token = args.pop("confirmation_token", None)
+            action_id = tool_args.pop("confirmation_action_id", None)
+            token = tool_args.pop("confirmation_token", None)
+            had_confirmation_fields = bool(action_id) or bool(token)
 
-        # ❷ 权限 + args schema 校验（v6 round 2 P1：移到 claim 前；失败不消费 confirmed token）
+        # ❸ 权限 + args schema 校验（v6 round 2 P1-#1：移到 claim 前；失败不消费 confirmed token）
         await require_permissions(hub_user_id, [tool.perm])
-        self._validate_args(args, tool.schema)
+        self._validate_args(tool_args, tool.schema)
 
-        # ❸ 写类 tool 硬门禁：原子 claim（claim 内已含 token / tool_name / args 一致性校验）
+        # ❹ 写类 tool 硬门禁：原子 claim（claim 内已含 token / tool_name / args 一致性校验）
         bundle: dict | None = None
         if is_write:
             bundle = await self.confirm_gate.claim_action(
-                conversation_id, hub_user_id, action_id, token, name, args,
+                conversation_id, hub_user_id, action_id, token, name, tool_args,
             )
             if bundle is None:
-                # 全部失败场景（无 action_id / 无 token / token 错 / args 错 / 已被并发领取）
-                # 都走这里，统一报错；ChainAgent 上层把 raise 翻成对 LLM 的 system hint
-                await self._log_blocked_call(conversation_id, round_idx, name, args,
-                                              reason="unconfirmed_write_or_claim_failed")
-                raise UnconfirmedWriteToolError(
-                    f"写类 tool '{name}' 未确认，或 confirmation_token/action_id 无效，"
-                    "或已被另一并发调用领取。请用 text 把操作预览发给用户，"
-                    "用户回'是'后由 ChainAgent 自动注入新 (action_id, token) 重试。"
-                )
+                # v7 round 2 P1-#2：分两类失败 → ChainAgent 据此决定是否 add_pending
+                if not had_confirmation_fields:
+                    # 第一次调写 tool，没传 confirmation 字段 → ChainAgent 应 add_pending + 让 LLM 出预览
+                    await self._log_blocked_call(conversation_id, round_idx, name, tool_args,
+                                                  reason="missing_confirmation")
+                    raise MissingConfirmationError(
+                        f"写类 tool '{name}' 还未经用户确认。请用 text 把操作预览发给用户，"
+                        "用户回'是'后由 ChainAgent 自动注入 (action_id, token) 重试。"
+                    )
+                else:
+                    # 传了 confirmation 字段但 claim 失败（错 token / 跨 action 复用 / 并发输家 / stale）
+                    # → ChainAgent **不应**再 add_pending（避免重复 pending）；
+                    #   只让 LLM 重新出预览让用户重新确认（claim 内部已对篡改场景做 restore）
+                    await self._log_blocked_call(conversation_id, round_idx, name, tool_args,
+                                                  reason="claim_failed")
+                    raise ClaimFailedError(
+                        f"写类 tool '{name}' 的 confirmation_token/action_id 无效"
+                        "（已被消费 / token 不匹配 / args 被改 / 跨 action 复用）。"
+                        "请用 text 重新发预览给用户并请用户重新确认；不要复用旧 token。"
+                    )
 
-        # ❹ 调 tool（注入内部 context）+ 记 log + 失败 restore_action（confirmed + pending 一起还）
+        # ❺ 调 tool（注入内部 context）+ 记 log + 失败 restore_action（confirmed + pending 一起还）
         async with log_tool_call(
             conversation_id=conversation_id, round_idx=round_idx,
-            tool_name=name, args=args,
+            tool_name=name, args=tool_args,
         ) as ctx:
             inject_ctx = {
                 "acting_as_user_id": acting_as,
@@ -795,7 +877,7 @@ class ToolRegistry:
             }
             # 只注入 fn 实际接受的参数（避免 TypeError unexpected keyword）
             sig = inspect.signature(tool.fn)
-            kwargs = {**args}
+            kwargs = {**tool_args}
             for k, v in inject_ctx.items():
                 if k in sig.parameters:
                     kwargs[k] = v
@@ -803,7 +885,7 @@ class ToolRegistry:
             try:
                 result = await tool.fn(**kwargs)
             except Exception:
-                # ❺ 写类 tool 执行失败 → restore_action（让用户/重试用同 token 再来）
+                # ❻ 写类 tool 执行失败 → restore_action（让用户/重试用同 token 再来）
                 if is_write and bundle is not None and action_id is not None:
                     try:
                         await self.confirm_gate.restore_action(
@@ -823,7 +905,7 @@ class ToolRegistry:
 
             # 写类 tool 成功路径：claim 时已原子删除 confirmed + pending，无需任何 cleanup（持久终态）
 
-            # ❻ 提取实体引用写回 session memory（review P2-#8）
+            # ❼ 提取实体引用写回 session memory（review P2-#8）
             refs = self.entity_extractor.extract(result)
             if refs.has_any():
                 await self.session_memory.add_entity_refs(
@@ -873,7 +955,22 @@ class ToolDef:
     tool_type: ToolType
     schema: dict
 
-class UnconfirmedWriteToolError(Exception): ...
+class UnconfirmedWriteToolError(Exception):
+    """写类 tool 未确认或确认链路失败的基类（v7 round 2 P1：拆两个 subclass）。"""
+
+class MissingConfirmationError(UnconfirmedWriteToolError):
+    """LLM 第一次调写 tool 完全没传 confirmation_action_id / confirmation_token。
+
+    ChainAgent 处理：调 add_pending（用户尚未见过预览，应该走"先生成 text 预览"路径）。
+    """
+
+class ClaimFailedError(UnconfirmedWriteToolError):
+    """LLM 传了 confirmation 字段但 claim 失败（token 错 / args 篡改 / 已被并发领取 / stale）。
+
+    ChainAgent 处理：**不调 add_pending**（v7 round 2 P1-#2：避免重复 pending）；
+    只输出"重新预览并请用户重新确认"提示给 LLM。
+    """
+
 class ToolNotFoundError(Exception): ...
 class ToolArgsValidationError(Exception): ...
 ```
@@ -1919,15 +2016,27 @@ class ChainAgent:
                             conversation_id=conversation_id, round_idx=round_idx,
                         )
                         self.history.append(ToolResult(call.id, result))
-                        # v5 round 2：pending 清理由 ToolRegistry.call 内部按 confirmation_action_id
-                        # 调 ConfirmGate.remove_pending 完成；ChainAgent 这里不再做按 args 匹配的兜底。
-                    except UnconfirmedWriteToolError as e:
-                        # 写门禁拦截 → 加入 pending list（不覆盖之前的；按 action_id 单条存）
+                        # v6 round 2：pending 清理由 claim_action Lua 原子完成；ChainAgent 这里不再做兜底
+                    except MissingConfirmationError as e:
+                        # v7 round 2 P1-#2：第一次调写 tool 没传 confirmation 字段
+                        # → 加入 pending（用户尚未见过预览）+ 让 LLM 改用 text 预览
                         await self.confirm_gate.add_pending(
                             conversation_id, hub_user_id, call.name, call.args,
                         )
-                        # 注入错误让 LLM 改用 text 预览给用户
-                        self.history.append(ToolResult(call.id, {"error": str(e)}))
+                        self.history.append(ToolResult(call.id, {
+                            "error": str(e),
+                            "next_action": "preview_and_wait_for_user_confirm",
+                        }))
+                    except ClaimFailedError as e:
+                        # v7 round 2 P1-#2：传了 confirmation 但 claim 失败（错 token/篡改/并发输家/stale）
+                        # → **不再 add_pending**（claim 内部已 restore 合法 pending；
+                        #    再加会制造重复 pending → 用户回'是'重 mark → 重复执行）
+                        # 只让 LLM 重新出预览让用户重新确认
+                        self.history.append(ToolResult(call.id, {
+                            "error": str(e),
+                            "next_action": "re_preview_and_request_user_reconfirm",
+                            "hint": "不要复用旧 token；旧 token 已失效或被篡改。",
+                        }))
                 continue
 
             if llm_resp.is_clarification:
@@ -1967,25 +2076,34 @@ agent_result = await chain_agent.run(
 )
 ```
 
-**完整对话样例**（端到端验证）：
+**完整对话样例**（端到端验证，v7 round 2 协议：双字段 + claim_action 原子领取）：
 
 | Round | 钉钉消息 | ChainAgent 行为 | Redis 状态 |
 |---|---|---|---|
-| 1 | 用户: "把上周差旅做凭证" | LLM 调 search_orders / create_voucher_draft（无 token）→ 写门禁拦截 → save_pending_write → LLM 改输出 text 预览 → ChainAgent 返回 text | `pending_write:{tool: create_voucher_draft, args: {...}}` |
-| 1 端 | bot: "我准备创建凭证：差旅费 ¥3,200，借管理费用-差旅 / 贷库存现金。回复'是'确认提交。" | — | 同上 |
-| 2 | 用户: "是" | inbound 识别 RE_CONFIRM → user_just_confirmed=True → ChainAgent mark_confirmed + clear_pending_write + 注入 confirm_hint → LLM 看到 hint 重新调 create_voucher_draft 带 token → ToolRegistry is_confirmed=True → 真执行 | 清空 pending_write，confirmed set 加 token |
-| 2 端 | bot: "凭证草稿已生成（draft_id=42），等会计审批。" | — | — |
+| 1 | 用户: "把上周差旅做凭证" | LLM 调 search_orders → 12 条；LLM 调 create_voucher_draft × 12（无 confirmation_action_id/token）→ ToolRegistry.claim_action 返 None → `MissingConfirmationError` → ChainAgent **add_pending × 12**（每条独立 action_id）→ LLM 改输出 text 预览 | `pending_hash[a1..a12] = {tool, args}`；`confirmed_hash` 空 |
+| 1 端 | bot: "我准备创建 12 张凭证：差旅 ¥3,200 等。回复'是'确认全部提交。" | — | 同上 |
+| 2 | 用户: "是" | inbound 识别 RE_CONFIRM → `user_just_confirmed=True` → ChainAgent.confirm_all_pending → 12 个 (action_id, token) 写 confirmed_hash + 拼 confirm_hint（每行一个 action_id+token 对）→ LLM 看到 hint 重新调 create_voucher_draft × 12（每次同传 confirmation_action_id+confirmation_token）→ ToolRegistry.claim_action **Lua 原子 HGET+HDEL** confirmed+pending → tool 真执行 | claim 后两 hash 都清空（持久终态）|
+| 2 端 | bot: "12 张凭证草稿已生成，等会计审批。" | — | 两 hash 都空；用户再回'是'也不会重复执行 |
+
+**关键不变量** （review v7 round 2 P1）：
+- ChainAgent **仅在 MissingConfirmationError 时 add_pending**；ClaimFailedError（错 token / 篡改 / 并发输家 / stale）时 LLM 收到 `next_action="re_preview_and_request_user_reconfirm"` 提示，重新预览让用户重新确认（不会制造重复 pending）
+- ToolRegistry.call 入口 `tool_args = dict(args)` 复制；并发调用复用 payload 不会因为第一次 pop 把 token 删掉而第二次失败
 
 测试覆盖（review P1-#2）：
 ```python
 async def test_first_call_blocked_then_user_confirms_then_retry():
-    """端到端：第一次 LLM 调 create_voucher_draft → 拦截 → 用户回'是' → 第二轮 LLM 自动带 token 调用 → 通过。"""
+    """端到端：第一次 LLM 调 create_voucher_draft（无 confirmation 字段）→ MissingConfirmationError
+    → add_pending → 用户回'是' → confirm_all_pending → 第二轮 LLM 用 (action_id, token) 调用 → 通过。"""
 
 async def test_user_confirms_but_no_pending_write():
-    """用户回'是'但没 pending_write（直接说'是'）→ 不报错，正常进 LLM 处理。"""
+    """用户回'是'但没 pending（直接说'是'）→ confirm_all_pending 返 [] → 不报错，正常进 LLM 处理。"""
 
-async def test_pending_write_expires_after_30min():
-    """30min 后 pending_write Redis 过期 → 用户再回'是'无效，需重新发起请求。"""
+async def test_claim_failed_does_not_create_duplicate_pending():
+    """v7 round 2 P1-#2：LLM 拿错 token 调 → ClaimFailedError → ChainAgent 不调 add_pending；
+    pending_hash 中条数与之前一致（无重复）。"""
+
+async def test_pending_expires_after_30min():
+    """30min 后 pending_hash Redis TTL 过期 → 用户再回'是' confirm_all_pending 返 [] → 需重发请求。"""
 ```
 
 - [ ] **Step 3: 测试合计**
@@ -3175,7 +3293,11 @@ git commit -m "docs(hub): Plan 6 端到端验证记录"
 - ✓ ConfirmGate (conversation_id, hub_user_id) 二元组隔离 + action_id 多 pending 支持 — 跨 Task 2 / Task 6 / Task 10 一致
 - ✓ voucher_draft 状态机 5 值（pending / creating / created / approved / rejected）跨 spec §5.4 / Task 1 / Task 8 / Task 18 一致
 - ✓ client_request_id 命名：HUB 端 `f"hub-draft-{draft.id}"` 与 ERP schema VARCHAR(64) NULL 一致
-- ✓ confirmation 链路一次性 + 真正抗并发（v6）：ConfirmGate.claim_action（Lua HGET+HDEL 原子）+ restore_action / remove_pending；ToolRegistry.call 用 (confirmation_action_id, confirmation_token) 双字段；token 含 action_id（同 args 多 pending 不撞 token）
+- ✓ confirmation 链路一次性 + 真正抗并发 + 持久终态 + 错误类型分流（v6/v7/v8）：
+  - ConfirmGate.claim_action（Lua HGET+HDEL 跨 confirmed_hash + pending_hash 原子）+ restore_action（Lua 原子还回两 hash）
+  - ToolRegistry.call 入口 `tool_args = dict(args)` 不污染调用方；权限+schema 前置；写类失败 restore；写类成功无 cleanup
+  - 用 (confirmation_action_id, confirmation_token) 双字段；token 含 action_id
+  - 错误分流：MissingConfirmationError（add_pending）vs ClaimFailedError（不 add_pending）；都是 UnconfirmedWriteToolError 子类
 - ✓ ERP idempotent_replay 字段语义跨 Task 8（HUB phase1 调用方）/ Task 18（ERP router 返回方）/ ChainAgent confirm hint 一致
 
 ### 范围检查
@@ -3243,6 +3365,14 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
   - `test_permission_denied_does_not_consume_token`
   - `test_schema_validation_failure_does_not_consume_token`
   - `test_claim_atomically_removes_pending_so_reconfirm_safe`
+
+**Plan 6 v8 结束（应用第七轮 review 3 条反馈，args 不污染 + 错误类型分流 + 端到端样例同步）**：
+- P1 #1：**ToolRegistry.call 入口复制 args**（review v7 P1-#1）—— v7 写法 `args.pop(...)` 直接污染调用方持有的 dict，导致 `test_write_tool_token_preserved_when_tool_fails` 和并发测试复用 payload 时第二次调用 token 已被 pop 掉而失败；运行时也可能污染 ChainAgent 保存的 tool_call args。修复：入口 `tool_args = dict(args)`，所有 pop / validate / claim / log / fn 注入都用副本，原 args 不动。
+- P1 #2：**MissingConfirmationError vs ClaimFailedError 错误类型分流**（review v7 P1-#2）—— v7 写法所有 UnconfirmedWriteToolError 都触发 ChainAgent.add_pending；但 claim 失败可能是错 token / 跨 action / 并发输家 / stale 等"已确认重试失败"场景，再 add_pending 制造重复 pending → 用户下次回'是'又会 mark 一次同写操作 → 重复执行。修复：拆两个 subclass（都继承 UnconfirmedWriteToolError 向后兼容），ChainAgent 只在 MissingConfirmationError 时 add_pending；ClaimFailedError 时 LLM 收到 `next_action="re_preview_and_request_user_reconfirm"` 提示重新预览。
+- P3 #3：**Plan 端到端样例同步新协议**（review v7 P3-#3）—— Task 6 完整对话样例改为双字段 + claim_action + pending_hash + confirmed_hash 描述；删除 `clear_pending_write` / `is_confirmed=True` / `confirmed set 加 token` 等旧协议词；测试覆盖加 `test_claim_failed_does_not_create_duplicate_pending`。
+- 测试新增（Task 2: 20 → 22 case）：
+  - `test_call_does_not_mutate_caller_args`（reg.call 后调用方原 dict 不变）
+  - `test_claim_failed_does_not_add_pending`（ClaimFailedError + MissingConfirmationError 区分；都是 UnconfirmedWriteToolError 子类）
 
 总计：
 - 19 个 Task
