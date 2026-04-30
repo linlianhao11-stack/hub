@@ -13,6 +13,8 @@ docs/integration/2026-04-27-fuzzy-search-audit.md（ERP 仓库）。
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 
 from hub.circuit_breaker import CircuitBreaker
@@ -182,6 +184,54 @@ class Erp4Adapter:
                 raise ErpSystemError(f"网络错误: {e}") from e
 
         return await self._breaker.call(_do)
+
+    async def search_orders(
+        self, *,
+        customer_id: int | None = None,
+        since: datetime | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 200,
+        acting_as_user_id: int,
+    ) -> dict:
+        """ERP `/api/v1/orders`：按客户/时间/状态分页搜单。"""
+        params: dict = {"page": page, "page_size": page_size}
+        if customer_id is not None:
+            params["customer_id"] = customer_id
+        if since is not None:
+            params["since"] = since.isoformat()
+        if status:
+            params["status"] = status
+        return await self._act_as_get("/api/v1/orders", acting_as_user_id, params=params)
+
+    async def get_order_detail(self, order_id: int, *, acting_as_user_id: int) -> dict:
+        """ERP `/api/v1/orders/{order_id}`：订单详情。"""
+        return await self._act_as_get(f"/api/v1/orders/{order_id}", acting_as_user_id)
+
+    async def get_customer_balance(self, customer_id: int, *, acting_as_user_id: int) -> dict:
+        """ERP `/api/v1/finance/customer-statement/{customer_id}`：客户余额（应收/已付/未付）。"""
+        return await self._act_as_get(
+            f"/api/v1/finance/customer-statement/{customer_id}", acting_as_user_id,
+        )
+
+    async def get_inventory_aging(
+        self, *,
+        threshold_days: int = 90,
+        product_id: int | None = None,
+        warehouse_id: int | None = None,
+        acting_as_user_id: int,
+    ) -> dict:
+        """ERP `/api/v1/inventory/aging`：按库龄聚合滞销商品。
+
+        ⏳ 依赖 Task 18 ERP 新增 endpoint；Adapter 方法先写好，
+        测试仅验证 URL/params/headers 而不真打 ERP。
+        """
+        params: dict = {"threshold_days": threshold_days}
+        if product_id is not None:
+            params["product_id"] = product_id
+        if warehouse_id is not None:
+            params["warehouse_id"] = warehouse_id
+        return await self._act_as_get("/api/v1/inventory/aging", acting_as_user_id, params=params)
 
     # ------------- 私有 HTTP 方法 -------------
 
