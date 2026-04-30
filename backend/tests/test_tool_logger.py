@@ -4,7 +4,7 @@
   1. 成功调用 → 写一行 tool_call_log（断言 args_json/result_json/duration_ms）
   2. tool 抛异常 → tool_call_log.error 有值且异常上抛
   3. 大 result（> 10KB）→ result_json 被截断（保留 keys + _truncated: true）
-  4. 先建 conversation_log，再写 tool_call_log → FK 逻辑关联不报错
+  4. conversation_id 不存在于 conversation_log 表 → tool_call_log 写入仍成功（无 FK 约束）
   5. 并发同 conversation 多 tool → 各自独立行
 """
 from __future__ import annotations
@@ -103,24 +103,31 @@ async def test_large_result_is_truncated():
     assert len(result.get("items", [])) < 200
 
 
-# ─── Case 4: conversation_id 存在，FK 逻辑关联 ───────────────────────────────
+# ─── Case 4: conversation_id 不存在，无 FK 约束，写入仍成功 ─────────────────
 @pytest.mark.asyncio
-async def test_tool_call_log_with_existing_conversation():
-    """先建 conversation_log，再写 tool_call_log → 逻辑关联正常，无 FK 约束报错。"""
-    # 1. 先建父记录
-    conv = await _make_conversation("conv-case4")
-    assert conv.conversation_id == "conv-case4"
+async def test_tool_call_log_without_parent_conversation():
+    """conversation_id 不存在于 conversation_log 表 → tool_call_log 写入仍成功。
 
-    # 2. 再写 tool_call_log
+    验证 ToolCallLog.conversation_id 是普通字符串字段，不存在数据库层 FK 约束。
+    无需先建 ConversationLog 父记录即可写入。
+    """
+    orphan_id = "never-existed-conversation-id-xyz"
+
+    # 确认父记录确实不存在
+    assert not await ConversationLog.filter(conversation_id=orphan_id).exists()
+
+    # 直接写 tool_call_log，不建父记录 —— 不应抛任何异常
     async with log_tool_call(
-        conversation_id="conv-case4",
+        conversation_id=orphan_id,
         round_idx=2,
         tool_name="get_customer_info",
         args={"customer_id": 42},
     ) as ctx:
         ctx.set_result({"customer_name": "测试客户", "credit_limit": 10000})
 
-    row = await ToolCallLog.get(conversation_id="conv-case4", tool_name="get_customer_info")
+    # 写入成功
+    assert await ToolCallLog.filter(conversation_id=orphan_id).exists()
+    row = await ToolCallLog.get(conversation_id=orphan_id, tool_name="get_customer_info")
     assert row.round_idx == 2
     assert row.result_json is not None
     assert row.result_json.get("customer_name") == "测试客户"
