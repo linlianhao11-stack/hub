@@ -20,12 +20,22 @@ async def main():
 
     from hub.adapters.channel.dingtalk_sender import DingTalkSender
     from hub.adapters.downstream.erp4 import Erp4Adapter
+    from hub.agent.chain_agent import ChainAgent
+    from hub.agent.context_builder import ContextBuilder
+    from hub.agent.llm_client import AgentLLMClient
+    from hub.agent.memory.loader import MemoryLoader
+    from hub.agent.memory.persistent import (
+        CustomerMemoryService, ProductMemoryService, UserMemoryService,
+    )
+    from hub.agent.memory.session import SessionMemory
+    from hub.agent.prompt.builder import PromptBuilder
+    from hub.agent.tools import analyze_tools, draft_tools, erp_tools, generate_tools
+    from hub.agent.tools.confirm_gate import ConfirmGate
+    from hub.agent.tools.registry import ToolRegistry
     from hub.capabilities.factory import load_active_ai_provider
     from hub.crypto import decrypt_secret
     from hub.handlers.dingtalk_inbound import handle_inbound
     from hub.handlers.dingtalk_outbound import handle_outbound
-    from hub.intent.chain_parser import ChainParser
-    from hub.intent.llm_parser import LLMParser
     from hub.intent.rule_parser import RuleParser
     from hub.match.conversation_state import ConversationStateRepository
     from hub.models import ChannelApp, DownstreamSystem
@@ -79,14 +89,10 @@ async def main():
     identity_service = IdentityService(erp_active_cache=erp_active_cache)
     binding_service = BindingService(erp_adapter=erp_adapter)
 
-    # 业务依赖（Plan 4）：意图解析链 + 多轮上下文 + 价格策略 + 业务用例
+    # 业务依赖（Plan 4）：多轮上下文 + 价格策略 + 业务用例（pending_choice/confirm 路径保留）
     ai_provider = await load_active_ai_provider()
-    chain_parser = ChainParser(
-        rule=RuleParser(), llm=LLMParser(ai=ai_provider),
-        low_confidence_threshold=0.7,
-    )
     if ai_provider is None:
-        logger.warning("ai_provider 表为空，LLMParser 将一律返回 unknown（仅 RuleParser 有效）")
+        logger.warning("ai_provider 表为空，ChainAgent 将无法调用 LLM（仅 RuleParser fallback 有效）")
     conversation_state = ConversationStateRepository(redis=redis_client, ttl_seconds=300)
     pricing = DefaultPricingStrategy(erp_adapter=erp_adapter)
     query_product = QueryProductUseCase(
@@ -96,6 +102,60 @@ async def main():
         erp=erp_adapter, pricing=pricing, sender=sender, state=conversation_state,
     )
 
+    # Plan 6：构造 ChainAgent（替代 chain_parser）
+    # 1. ConfirmGate（写门禁 pending/confirmed 状态）
+    confirm_gate = ConfirmGate(redis_client)
+
+    # 2. SessionMemory（对话历史 + entity refs）
+    session_memory = SessionMemory(redis_client)
+
+    # 3. ToolRegistry + 注册所有 tool（read / generate / write_draft / analyze）
+    tool_registry = ToolRegistry(
+        confirm_gate=confirm_gate,
+        session_memory=session_memory,
+    )
+    erp_tools.set_erp_adapter(erp_adapter)
+    erp_tools.register_all(tool_registry)
+    analyze_tools.register_all(tool_registry)
+    generate_tools.set_dependencies(sender=sender, erp=erp_adapter)
+    generate_tools.register_all(tool_registry)
+    draft_tools.set_erp_adapter(erp_adapter)
+    draft_tools.register_all(tool_registry)
+
+    # 4. MemoryLoader
+    memory_loader = MemoryLoader(
+        session=session_memory,
+        user=UserMemoryService(),
+        customer=CustomerMemoryService(),
+        product=ProductMemoryService(),
+    )
+
+    # 5. PromptBuilder（默认词典 / 同义词 / few-shots）
+    prompt_builder = PromptBuilder()
+
+    # 6. ContextBuilder
+    context_builder = ContextBuilder(prompt_builder=prompt_builder)
+
+    # 7. AgentLLMClient（从 ai_provider 取 api_key / base_url / model）
+    agent_llm = AgentLLMClient(
+        api_key=ai_provider.api_key if ai_provider else "",
+        base_url=ai_provider.base_url if ai_provider else "",
+        model=ai_provider.model if ai_provider else "",
+    )
+
+    # 8. ChainAgent
+    chain_agent = ChainAgent(
+        llm=agent_llm,
+        registry=tool_registry,
+        confirm_gate=confirm_gate,
+        session_memory=session_memory,
+        memory_loader=memory_loader,
+        context_builder=context_builder,
+    )
+
+    # RuleParser：保留作 ChainAgent 未预期异常时的降级兜底
+    rule_parser = RuleParser()
+
     runtime = WorkerRuntime(redis_client=redis_client)
 
     async def dingtalk_inbound_handler(task_data):
@@ -104,7 +164,8 @@ async def main():
             binding_service=binding_service,
             identity_service=identity_service,
             sender=sender,
-            chain_parser=chain_parser,
+            chain_agent=chain_agent,
+            rule_parser=rule_parser,
             conversation_state=conversation_state,
             query_product_usecase=query_product,
             query_customer_history_usecase=query_customer,

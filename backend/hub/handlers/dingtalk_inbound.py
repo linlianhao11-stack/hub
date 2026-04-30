@@ -2,14 +2,18 @@
 
 职责：
 - 解析命令：/绑定 X / /解绑 / 帮助 → 直走 BindingService
-- 已绑定 + ERP 启用：调 ChainParser → 路由到对应 UseCase
-- 多轮编号选择：从 ConversationState 取候选项 → 调 execute_selected_*
-- 低置信度：保 state，让用户回"是"确认
+- 已绑定 + ERP 启用：调 ChainAgent → 自然语言多轮对话
+- 多轮编号选择（Plan 4 遗产）：从 ConversationState 取候选项 → 调 execute_selected_*
+- 低置信度（Plan 4 遗产）：保 state，让用户回"是"确认
+- RE_CONFIRM 识别：用户回"是/确认/yes"→ user_just_confirmed=True 传给 ChainAgent
+- 降级兜底：ChainAgent 未预期异常 → 降级 RuleParser；无 RuleParser → 友好错误文案
 
 依赖外部注入（避免直连）：
 - binding_service / identity_service / sender（Plan 3）
-- chain_parser / conversation_state / query_product_usecase /
-  query_customer_history_usecase / require_permissions（Plan 4）
+- chain_agent（Plan 6 新）/ rule_parser（fallback，可选）
+- chain_parser（Plan 4，过渡期保留，可选；新代码不用）
+- conversation_state / query_product_usecase / query_customer_history_usecase /
+  require_permissions（Plan 4，保留供 pending_choice / pending_confirm 路径）
 - live_publisher（Plan 5 task 6）：注入 LiveStreamPublisher 后，
   task_logger 退出时把脱敏事件 publish 到 Redis pubsub 让前端 SSE 收到
 
@@ -31,17 +35,27 @@ RE_BIND = re.compile(r"^/?绑定\s+(\S+)\s*$")
 RE_UNBIND = re.compile(r"^/?解绑\s*$")
 RE_HELP = re.compile(r"^/?(help|帮助|\?|菜单)\s*$", re.IGNORECASE)
 
+# RE_CONFIRM：识别用户确认写操作的语义词（Plan 6 §2161-2174）
+# 仅匹配整条消息是确认词的情况（防"是的""确认一下" 等误判）
+RE_CONFIRM = re.compile(r"^\s*(是|确认|yes|y|ok|确定)\s*$", re.IGNORECASE)
+
 
 async def handle_inbound(
     task_data: dict, *,
     binding_service,
     identity_service,
     sender,
-    chain_parser=None,
+    # Plan 6 新依赖
+    chain_agent=None,          # ChainAgent（主路径）
+    rule_parser=None,          # RuleParser（ChainAgent 未预期异常时降级 fallback）
+    # Plan 4 遗产——保留供 pending_choice / pending_confirm 路径使用
     conversation_state=None,
     query_product_usecase=None,
     query_customer_history_usecase=None,
     require_permissions=None,
+    # 过渡期保留；新代码不调用
+    chain_parser=None,
+    # 可观测性
     live_publisher=None,
 ) -> None:
     payload = task_data.get("payload", {})
@@ -69,8 +83,7 @@ async def handle_inbound(
 
         sender.send_text = _wrapped_send_text
         try:
-            # ====== 以下 Plan 4 原 handle_inbound 函数体（除新增 record["final_status"]）======
-            # 1. 绑定/解绑/帮助命令（不需要 IdentityService）
+            # ====== 第一层：Rule 命令路由（不需要 IdentityService）======
             m_bind = RE_BIND.match(content)
             if m_bind:
                 result = await binding_service.initiate_binding(
@@ -97,7 +110,7 @@ async def handle_inbound(
                 record["final_status"] = "success"
                 return
 
-            # 2. 解析身份 + 检查 ERP 启用
+            # ====== 第二层：身份解析 + ERP 状态检查 ======
             resolution = await identity_service.resolve(dingtalk_userid=channel_userid)
             if not resolution.found:
                 await _send_text(sender, channel_userid,
@@ -110,14 +123,8 @@ async def handle_inbound(
                 record["final_status"] = "failed_user"
                 return
 
-            # 3. 进入业务用例（Plan 3 注入 None 时降级为占位提示）
-            if chain_parser is None:
-                await _send_text(sender, channel_userid,
-                                 "我没听懂，请发送「帮助」查看可用功能。")
-                record["final_status"] = "failed_user"
-                return
-
-            # 取多轮上下文
+            # ====== 第三层：Plan 4 pending_choice / pending_confirm 多轮回路（保留不动）======
+            # 取多轮上下文（仅在 conversation_state 注入时有效）
             state = await conversation_state.load(channel_userid) if conversation_state else None
             parser_context: dict = {}
             if state:
@@ -126,70 +133,134 @@ async def handle_inbound(
                 if state.get("pending_confirm"):
                     parser_context["pending_confirm"] = "yes"
 
-            intent = await chain_parser.parse(content, context=parser_context)
-            # 把意图解析结果写入 record（live stream + task_log 两边都用）
-            record["intent_parser"] = intent.parser
-            record["intent_confidence"] = intent.confidence
-
-            # 4. 路由 + 权限校验
-            try:
-                if intent.intent_type == "select_choice":
+            # 优先处理 pending_choice（数字编号回路）
+            if state and state.get("pending_choice") and content.isdigit():
+                try:
+                    # 构造一个 select_choice intent 交给既有 _handle_select_choice
+                    from hub.ports import ParsedIntent
+                    choice_intent = ParsedIntent(
+                        intent_type="select_choice",
+                        fields={"choice": int(content)},
+                        confidence=1.0, parser="pending_choice",
+                    )
                     await _handle_select_choice(
-                        intent, state, channel_userid, sender,
+                        choice_intent, state, channel_userid, sender,
                         conversation_state, resolution,
                         query_product_usecase, query_customer_history_usecase,
                         require_permissions,
                     )
                     record["final_status"] = "success"
-                    return
-
-                if intent.intent_type == "confirm_yes":
-                    if state and state.get("pending_confirm"):
-                        await _execute_confirmed(
-                            state, channel_userid, sender, conversation_state, resolution,
-                            query_product_usecase, query_customer_history_usecase,
-                            require_permissions,
-                        )
-                    else:
-                        await _send_text(sender, channel_userid,
-                                         "没有需要确认的待办；请重新描述你的需求。")
-                    record["final_status"] = "success"
-                    return
-
-                if intent.intent_type == "unknown":
-                    await _send_text(sender, channel_userid,
-                                     build_user_message(BizErrorCode.INTENT_LOW_CONFIDENCE))
+                except BizError as e:
+                    await _send_text(sender, channel_userid, str(e))
                     record["final_status"] = "failed_user"
-                    return
+                return
 
-                if intent.notes == "low_confidence":
-                    await conversation_state.save(channel_userid, {
-                        "intent_type": intent.intent_type,
-                        "fields": intent.fields,
-                        "pending_confirm": "yes",
-                    })
-                    summary = _summarize_intent(intent)
-                    await _send_text(
-                        sender, channel_userid,
-                        f"我大概理解为：{summary}\n\n如果是这个意思请回复「是」继续，"
-                        f"否则请用更明确的方式重新描述。",
+            # pending_confirm 路由：仅在有 state.pending_confirm 且内容匹配确认词时触发
+            # 注意：这个路径是绑定二次确认（Plan 3/4），与 RE_CONFIRM（Plan 6 写门禁确认）独立
+            if state and state.get("pending_confirm") and RE_CONFIRM.match(content):
+                try:
+                    await _execute_confirmed(
+                        state, channel_userid, sender, conversation_state, resolution,
+                        query_product_usecase, query_customer_history_usecase,
+                        require_permissions,
                     )
                     record["final_status"] = "success"
-                    return
+                except BizError as e:
+                    await _send_text(sender, channel_userid, str(e))
+                    record["final_status"] = "failed_user"
+                return
 
-                # 高置信度直接执行
-                await _execute_intent(
-                    intent, channel_userid, sender, resolution,
-                    query_product_usecase, query_customer_history_usecase,
-                    require_permissions,
+            # ====== 第四层：ChainAgent 业务主路径（Plan 6 新）======
+            if chain_agent is None:
+                # 没有 ChainAgent 时降级为友好提示（兼容测试 / 未配置场景）
+                await _send_text(sender, channel_userid,
+                                 "我没听懂，请发送「帮助」查看可用功能。")
+                record["final_status"] = "failed_user"
+                return
+
+            # RE_CONFIRM 识别（Plan 6 §2161）：用户整条消息是确认词
+            # → user_just_confirmed=True 让 ChainAgent 调 confirm_gate.confirm_all_pending
+            user_just_confirmed = bool(RE_CONFIRM.match(content))
+
+            try:
+                agent_result = await chain_agent.run(
+                    user_message=content,
+                    hub_user_id=resolution.hub_user_id,
+                    conversation_id=conversation_id,
+                    acting_as=resolution.erp_user_id,
+                    channel_userid=channel_userid,
+                    user_just_confirmed=user_just_confirmed,
                 )
-                record["final_status"] = "success"
             except BizError as e:
+                # BizError（权限拒绝等）：翻译成中文给用户
                 await _send_text(sender, channel_userid, str(e))
                 record["final_status"] = "failed_user"
+                return
+            except Exception:
+                # ChainAgent 未预期异常（Redis 死 / 网络超时未被 agent 内部 catch 等）
+                # → 降级 RuleParser
+                logger.exception(
+                    "ChainAgent 抛出未预期异常，降级 RuleParser conv=%s", conversation_id,
+                )
+                await _fallback_to_rule_parser(
+                    content=content, rule_parser=rule_parser,
+                    sender=sender, channel_userid=channel_userid,
+                    record=record, parser_context=parser_context,
+                )
+                return
+
+            # agent 返回 AgentResult（kind=text/clarification/error）
+            if agent_result.kind == "error":
+                # ChainAgent 已翻译过的友好错误（"AI 响应超时" 之类）→ 直接发给用户
+                await _send_text(
+                    sender, channel_userid,
+                    agent_result.error or "AI 处理出了点问题",
+                )
+                record["final_status"] = "failed_system_final"
+                return
+
+            # success 路径：text 或 clarification 都直接发文本
+            final_text = agent_result.text or "（无回复）"
+            await _send_text(sender, channel_userid, final_text)
+            record["final_status"] = "success"
+            record["agent_kind"] = agent_result.kind
+
         finally:
             # 还原 sender.send_text，避免共享实例上累积包装
             sender.send_text = original_send_text
+
+
+async def _fallback_to_rule_parser(
+    *, content: str, rule_parser,
+    sender, channel_userid: str,
+    record: dict, parser_context: dict,
+) -> None:
+    """ChainAgent 未预期异常时降级走 RuleParser。"""
+    if rule_parser is None:
+        await _send_text(sender, channel_userid, "AI 处理出了点问题，请稍后重试")
+        record["final_status"] = "failed_system_final"
+        return
+    try:
+        intent = await rule_parser.parse(content, context=parser_context)
+    except Exception:
+        logger.exception("RuleParser fallback 也失败")
+        await _send_text(sender, channel_userid, "AI 处理出了点问题，请稍后重试")
+        record["final_status"] = "failed_system_final"
+        return
+    if intent.intent_type == "unknown":
+        await _send_text(
+            sender, channel_userid,
+            "AI 处理出了点问题，请用更明确的方式描述（例：查 SKU50139）",
+        )
+        record["final_status"] = "failed_system_final"
+        return
+    # rule 命中：简化降级提示（完整实现见 Task 19 端到端验证）
+    await _send_text(
+        sender, channel_userid,
+        "AI 暂时不可用，已降级到规则匹配。请用「查 商品名」格式重发。",
+    )
+    record["fallback"] = "rule"
+    record["final_status"] = "fallback_to_rule"
 
 
 async def _execute_intent(
