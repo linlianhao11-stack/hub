@@ -110,7 +110,7 @@
 | `tests/test_prompt_builder.py` | 6 | schema 注入 / 词典 / few-shots / 历史限制 |
 | `tests/test_erp_tools.py` | 11 × 4 = 44 | 每个 tool：成功 / 权限拒 / ERP 错 / 输出 schema |
 | `tests/test_generate_tools.py` | 12 | 合同模板渲染 / Excel / 占位符校验 / 文件发送 |
-| `tests/test_draft_tools.py` | 9 | 三个草稿创建 / 金额上限 / 必填字段 |
+| `tests/test_draft_tools.py` | 21 | 三个草稿创建（voucher/price/stock）/ 金额上限 / 必填字段 / 幂等重试 / 并发幂等 / commit 后抛错重试 |
 | `tests/test_analyze_tools.py` | 6 | 聚合 tool 内部组合 |
 | `tests/test_admin_approvals.py` | 12 | 三个 inbox 子路由：列表 / 批量通过 / 批量拒绝 / 写 ERP 错 |
 | `tests/test_admin_contract_templates.py` | 8 | 上传 / 占位符校验 / 启用禁用 |
@@ -682,24 +682,32 @@ async def test_claim_failed_does_not_add_pending():
     assert issubclass(ClaimFailedError, UnconfirmedWriteToolError)
 
 
-# === v8 round 2 P1：confirmation_action_id 注入 + tool fn 幂等保护（2 case）===
-async def test_write_tool_must_declare_action_id_param():
-    """v8 round 2 P1：写类 tool 函数签名必须声明 confirmation_action_id；否则 call 时 raise。"""
+# === v8 round 2 P1 / v9 round 2 P1：confirmation_action_id 注入 + 幂等保护（3 case）===
+async def test_write_tool_must_declare_action_id_param_at_register_time():
+    """v9 round 2 P1：写类 tool 函数签名必须声明 confirmation_action_id；
+    register() 阶段 fail fast，**不能**让错误延迟到 call 后（call 后 claim 已消费确认态）。"""
     reg = ToolRegistry(...)
     # 写 tool fn 故意不声明 confirmation_action_id
     async def bad_write_fn(amount: int, *, hub_user_id, conversation_id):
         return {"id": 1}
-    reg.register("create_voucher_draft", bad_write_fn,
-                 perm="usecase.create_voucher.use",
-                 tool_type=ToolType.WRITE_DRAFT, description="...")
-    action_id, token = await _confirm_one(reg, "c1", 1, "create_voucher_draft",
-                                           {"amount": 1000})
+    # 关键：注册时就 raise，不等到 call
     with pytest.raises(RuntimeError, match="confirmation_action_id"):
-        await reg.call("create_voucher_draft", {
-            "amount": 1000,
-            "confirmation_action_id": action_id,
-            "confirmation_token": token,
-        }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
+        reg.register("create_voucher_draft", bad_write_fn,
+                     perm="usecase.create_voucher.use",
+                     tool_type=ToolType.WRITE_DRAFT, description="...")
+    # 注册失败的 tool 不在 _tools 字典中
+    assert "create_voucher_draft" not in reg._tools
+
+
+async def test_read_tool_does_not_need_action_id_param():
+    """READ / GENERATE 类 tool 不需要声明 confirmation_action_id（仅写类要）。"""
+    reg = ToolRegistry(...)
+    async def search_fn(query: str): return []
+    # 不抛 → 注册成功
+    reg.register("search_products", search_fn,
+                 perm="usecase.query_product.use",
+                 tool_type=ToolType.READ, description="...")
+    assert "search_products" in reg._tools
 
 
 async def test_action_id_injected_to_write_tool_fn():
@@ -748,7 +756,7 @@ async def test_call_validates_args_against_schema():
 async def test_schema_for_user_caches_per_user():
 ```
 
-合计 **24 case**（v5 加 3 + v6 round 2 加 3 + v7 round 2 加 2 + v8 round 2 加 2：写 tool 必须声明 confirmation_action_id / action_id 被注入 fn）。
+合计 **25 case**（v5 加 3 + v6 round 2 加 3 + v7 round 2 加 2 + v8 round 2 加 2 + v9 round 2 加 1：register-time fail-fast 校验 + 读类 tool 不需声明）。
 
 - [ ] **Step 2: 实现 ToolRegistry**
 
@@ -785,9 +793,26 @@ class ToolRegistry:
 
     def register(self, name: str, fn: Callable, *, perm: str, description: str,
                  tool_type: ToolType):
-        """注册 tool；tool_type 必填。"""
+        """注册 tool；tool_type 必填。
+
+        v9 round 2 P1：写类 tool fn 必须在签名声明 confirmation_action_id 参数（fail fast）。
+        理由：ToolRegistry.call 在 claim_action 之后才注入这个参数；如果 fn 没声明，
+        调用时会 RuntimeError，但此时 claim 已原子删除 confirmed+pending，
+        且错误发生在 restore try/except 之前 → 用户的确认态被消费且无法 restore。
+        把检查放到 register() 时做，启动期就能发现，绝不进入运行期消费确认态的窗口。
+        """
         sig = inspect.signature(fn)
         hints = get_type_hints(fn)
+
+        # ✱ register-time 硬校验：写类 tool 必须声明 confirmation_action_id（v9 round 2 P1-#1）
+        if tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP):
+            if "confirmation_action_id" not in sig.parameters:
+                raise RuntimeError(
+                    f"写类 tool '{name}' 必须在函数签名声明 confirmation_action_id: str 参数，"
+                    "且实现内部用它做幂等查询/唯一约束。"
+                    "ToolRegistry.restore_action 依赖这一点保证失败重试不重复副作用。"
+                )
+
         params = self._build_json_schema(sig, hints)
 
         self._tools[name] = ToolDef(
@@ -938,6 +963,8 @@ class ToolRegistry:
             # v8 round 2 P1：写类 tool 把 action_id 作为内部 idempotency key 注入；
             # tool fn 用它查 / 写 DB 唯一索引保证 restore 后重试是真幂等的（DB 副作用也能去重）。
             # 重要：claim 已校验 LLM 传入 confirmation_action_id 的一致性；这里注入的就是同一个值。
+            # 写类 tool 的签名校验在 register() 时已 fail-fast（v9 round 2 P1-#1），
+            # 这里不再二次校验 —— 任何 register 通过的写 tool 一定声明了 confirmation_action_id 参数。
             if is_write and action_id is not None:
                 inject_ctx["confirmation_action_id"] = action_id
 
@@ -947,14 +974,6 @@ class ToolRegistry:
             for k, v in inject_ctx.items():
                 if k in sig.parameters:
                     kwargs[k] = v
-
-            # v8 round 2 P1：写类 tool 必须声明 confirmation_action_id 参数做幂等键（约束在 register 时校验）
-            if is_write and "confirmation_action_id" not in sig.parameters:
-                raise RuntimeError(
-                    f"写类 tool '{name}' 必须在签名声明 confirmation_action_id: str 参数，"
-                    "且实现内部用它做幂等查询/唯一约束。"
-                    "ToolRegistry.restore_action 依赖这一点保证失败重试不重复副作用。"
-                )
 
             try:
                 result = await tool.fn(**kwargs)
@@ -2342,7 +2361,7 @@ git commit -m "feat(hub): Plan 6 Task 7（生成型 tool：合同 docx / 报价 
 **Files:**
 - Create: `backend/hub/agent/tools/draft_tools.py`
 - Create: `backend/hub/routers/admin/approvals.py`
-- Test: `tests/test_draft_tools.py`（**12**）+ `test_admin_approvals.py`（12）
+- Test: `tests/test_draft_tools.py`（**21**）+ `test_admin_approvals.py`（12）
 
 - [ ] **Step 1: draft_tools.py 三个写草稿 tool（v8 round 2 P1：必须用 confirmation_action_id 做幂等键）**
 
@@ -2421,41 +2440,179 @@ async def create_voucher_draft(
 
 
 async def create_price_adjustment_request(
-    customer_id: int, product_id: int,
-    new_price: float, discount_pct: float | None = None,
+    customer_id: int,
+    product_id: int,
+    new_price: float,
+    discount_pct: float | None = None,
     reason: str | None = None,
-    *, hub_user_id, conversation_id,
+    *,
+    hub_user_id: int,
+    conversation_id: str,
     confirmation_action_id: str,  # v8 round 2 P1：必须
 ) -> dict:
-    """同上模式：先按 (user, action_id) 查 → 命中返 idempotent_replay → 否则 INSERT
-       → IntegrityError catch 回查 → 否则 reraise。"""
-    ...
+    """生成调价请求草稿，挂销售主管审批 inbox。
+
+    幂等性：同 voucher 写法 —— (requester_hub_user_id, confirmation_action_id) 部分唯一索引。
+    """
+    # 1. 校验入参
+    if new_price <= 0:
+        raise ToolArgsValidationError("new_price 必须大于 0")
+    if discount_pct is not None and not (0 < discount_pct < 1):
+        raise ToolArgsValidationError("discount_pct 必须在 (0, 1) 区间")
+
+    # 2. 校验客户 / 产品（这层 ERP 端已会 404，HUB 不预检）
+
+    # 3. 取当前价（参考字段，便于审批人对比；调失败不阻塞草稿生成）
+    try:
+        current_price = await _fetch_current_price(customer_id, product_id)
+    except Exception:
+        current_price = None  # 草稿仍可建，审批时手工对比
+
+    # 4. v8 round 2 P1：幂等查询 —— 命中直接返
+    existing = await PriceAdjustmentRequest.filter(
+        requester_hub_user_id=hub_user_id,
+        confirmation_action_id=confirmation_action_id,
+    ).first()
+    if existing:
+        return {
+            "request_id": existing.id,
+            "approval_url": _approval_url_price(existing.id),
+            "message_for_user": "调价请求已提交销售主管审批。",
+            "idempotent_replay": True,
+        }
+
+    # 5. INSERT；并发同 (user, action_id) 时唯一索引会抛 IntegrityError
+    try:
+        req = await PriceAdjustmentRequest.create(
+            requester_hub_user_id=hub_user_id,
+            customer_id=customer_id,
+            product_id=product_id,
+            current_price=current_price,
+            new_price=new_price,
+            discount_pct=discount_pct,
+            reason=reason,
+            conversation_id=conversation_id,
+            confirmation_action_id=confirmation_action_id,
+        )
+    except IntegrityError as exc:
+        if "confirmation_action_id" not in str(exc).lower():
+            raise  # 其他唯一约束冲突照常 reraise
+        existing = await PriceAdjustmentRequest.filter(
+            requester_hub_user_id=hub_user_id,
+            confirmation_action_id=confirmation_action_id,
+        ).first()
+        if not existing:
+            raise  # 极罕见：抛 IntegrityError 但回查不到 → 不假装成功
+        return {
+            "request_id": existing.id,
+            "approval_url": _approval_url_price(existing.id),
+            "message_for_user": "调价请求已提交销售主管审批。",
+            "idempotent_replay": True,
+        }
+
+    return {
+        "request_id": req.id,
+        "approval_url": _approval_url_price(req.id),
+        "message_for_user": "调价请求已提交销售主管审批。",
+        "idempotent_replay": False,
+    }
+
 
 async def create_stock_adjustment_request(
-    ..., *,
-    hub_user_id, conversation_id,
-    confirmation_action_id: str,
+    product_id: int,
+    warehouse_id: int,
+    delta_quantity: int,  # 可正可负（盘盈/盘亏）
+    reason: str,
+    *,
+    hub_user_id: int,
+    conversation_id: str,
+    confirmation_action_id: str,  # v8 round 2 P1：必须
 ) -> dict:
-    """同上。"""
-    ...
+    """生成库存调整请求草稿，挂库管/财务审批 inbox。
+
+    幂等性：同上 —— (requester_hub_user_id, confirmation_action_id) 部分唯一索引。
+    """
+    # 1. 校验入参
+    if delta_quantity == 0:
+        raise ToolArgsValidationError("delta_quantity 不能为 0")
+    if not reason or not reason.strip():
+        raise ToolArgsValidationError("reason 必填（盘盈/盘亏说明）")
+
+    # 2. v8 round 2 P1：幂等查询
+    existing = await StockAdjustmentRequest.filter(
+        requester_hub_user_id=hub_user_id,
+        confirmation_action_id=confirmation_action_id,
+    ).first()
+    if existing:
+        return {
+            "request_id": existing.id,
+            "approval_url": _approval_url_stock(existing.id),
+            "message_for_user": "库存调整请求已提交审批。",
+            "idempotent_replay": True,
+        }
+
+    # 3. INSERT + IntegrityError 兜底
+    try:
+        req = await StockAdjustmentRequest.create(
+            requester_hub_user_id=hub_user_id,
+            product_id=product_id,
+            warehouse_id=warehouse_id,
+            delta_quantity=delta_quantity,
+            reason=reason,
+            conversation_id=conversation_id,
+            confirmation_action_id=confirmation_action_id,
+        )
+    except IntegrityError as exc:
+        if "confirmation_action_id" not in str(exc).lower():
+            raise
+        existing = await StockAdjustmentRequest.filter(
+            requester_hub_user_id=hub_user_id,
+            confirmation_action_id=confirmation_action_id,
+        ).first()
+        if not existing:
+            raise
+        return {
+            "request_id": existing.id,
+            "approval_url": _approval_url_stock(existing.id),
+            "message_for_user": "库存调整请求已提交审批。",
+            "idempotent_replay": True,
+        }
+
+    return {
+        "request_id": req.id,
+        "approval_url": _approval_url_stock(req.id),
+        "message_for_user": "库存调整请求已提交审批。",
+        "idempotent_replay": False,
+    }
 ```
 
-**写 tool 测试 case（test_draft_tools.py，v8 round 2 P1 加 3 case 幂等重试）**：
+**写 tool 测试 case（test_draft_tools.py，v9/v10 三个 tool 都覆盖幂等重试）**：
 
-| # | 场景 | 期望 |
-|---|---|---|
-| 1 | 创建凭证草稿成功 | voucher_draft 写入；返 idempotent_replay=False |
-| 2 | 创建超金额上限 | 拦截 + ¥1M 错误信息 |
-| 3 | 必填字段校验 | 拒绝 + schema error |
-| 4 | 创建调价请求成功 | price_adjustment_request 写入 |
-| 5 | 创建库存调整请求成功 | stock_adjustment_request 写入 |
-| 6 | 调用方未声明 confirmation_action_id 参数 → ToolRegistry register 时拒绝 | RuntimeError "写类 tool 必须声明 confirmation_action_id" |
-| 7 | **同 (user, action_id) 第二次调用** | 返已存在 draft + idempotent_replay=True；DB 中只有 1 条 |
-| 8 | **不同 user 同 action_id**（极罕见因 action_id 全局 hex 唯一）| 各自独立创建（部分唯一索引按 user+action_id 判）|
-| 9 | 单 conversation_id 多 action_id 创建 12 条 voucher_draft | DB 中 12 条独立 draft |
-| 10 | **并发同 (user, action_id) 两个 INSERT**（asyncio.gather）| 一个赢，一个 IntegrityError 被 catch + 回查 → 都返 200，DB 中只有 1 条；其中一个 idempotent_replay=False，另一个 True |
-| 11 | **IntegrityError 但回查不到（DB 异常状态）** | reraise，不假装成功 |
-| 12 | **fn 已 commit DB 但抛错后 ToolRegistry restore + 用户重试** | 第二次走幂等查询返已存在；DB 不重复创建；最终结果与第一次"假成功"一致 |
+| # | 场景 | tool | 期望 |
+|---|---|---|---|
+| 1 | 创建凭证草稿成功 | voucher | voucher_draft 写入；idempotent_replay=False |
+| 2 | 创建超金额上限 | voucher | 拦截 + ¥1M 错误信息 |
+| 3 | 必填字段校验 | voucher | 拒绝 + schema error |
+| 4 | 创建调价请求成功 | price | price_adjustment_request 写入；idempotent_replay=False |
+| 5 | 创建库存调整请求成功 | stock | stock_adjustment_request 写入；idempotent_replay=False |
+| 6 | new_price ≤ 0 拦截 | price | ToolArgsValidationError |
+| 7 | discount_pct 越界（≤0 / ≥1） | price | ToolArgsValidationError |
+| 8 | delta_quantity == 0 拦截 | stock | ToolArgsValidationError |
+| 9 | reason 空字符串 | stock | ToolArgsValidationError |
+| 10 | 单 conversation_id 多 action_id 创建 12 条 voucher_draft | voucher | DB 中 12 条独立 draft |
+| 11 | **同 (user, action_id) 第二次调用** | voucher | 返已存在 draft + idempotent_replay=True；DB 中只有 1 条 |
+| 12 | **同 (user, action_id) 第二次调用** | price | 同上模式 |
+| 13 | **同 (user, action_id) 第二次调用** | stock | 同上模式 |
+| 14 | **并发同 (user, action_id) 两个 INSERT**（asyncio.gather） | voucher | 一个赢一个 IntegrityError 被 catch + 回查 → 都返 200，DB 中只有 1 条 |
+| 15 | **并发同 (user, action_id) 两个 INSERT** | price | 同上模式 |
+| 16 | **并发同 (user, action_id) 两个 INSERT** | stock | 同上模式 |
+| 17 | **IntegrityError 但回查不到（DB 异常状态）** | voucher | reraise，不假装成功 |
+| 18 | **fn 已 commit DB 但 commit 后副作用抛错（如发钉钉超时）→ ToolRegistry restore + 用户重试** | voucher | 第二次走幂等查询返已存在；DB 不重复创建；最终结果与第一次"假成功"一致 |
+| 19 | 同上模式（commit 后抛错 + 重试）| price | 同上 |
+| 20 | 同上模式 | stock | 同上 |
+| 21 | 不同 user 同 action_id（极罕见因 action_id 全局 hex 但理论可重）| voucher | 各自独立创建（部分唯一索引按 user+action_id 判）|
+
+合计 **21 case**（v9 round 2 P1 把 9 → 21：调价/库存幂等覆盖均匀）。
 
 - [ ] **Step 2: admin/approvals.py 三个 inbox 子路由（review P1-#4 改进版：草稿状态机 + 幂等 + creating 崩溃恢复）**
 
@@ -3563,6 +3720,20 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
   - Task 8 case 7：同 (user, action_id) 第二次调用返 idempotent_replay
   - Task 8 case 10：asyncio.gather 并发同 (user, action_id) DB 只 1 条
   - Task 8 case 12：fn 已 commit DB 但抛错后 restore + 重试，DB 不重复创建
+
+**Plan 6 v10 结束（应用第九轮 review 2 条反馈，签名校验前置 + 调价/库存 tool 完整展开）**：
+- P1 #1：**签名校验从 call 时移到 register 时**（review v9 P1-#1）—— v9 的 RuntimeError 检查在 ToolRegistry.call 中、且发生在 claim_action 已原子删除 confirmed+pending 之后；如果某个写 tool 漏声明 `confirmation_action_id` 参数，第一次调用会 RuntimeError，但确认态已被消费且不会 restore（错误不在 try/except 内）。修复：
+  1. 把检查移到 `ToolRegistry.register()`：`if tool_type in (WRITE_DRAFT, WRITE_ERP) and "confirmation_action_id" not in sig.parameters: raise RuntimeError`
+  2. 删除 ToolRegistry.call 内的二次校验（注释提示 register-time 已 fail-fast）
+  3. 加测试 `test_write_tool_must_declare_action_id_param_at_register_time`（注册时就 raise，不进入 _tools 字典）
+  4. 加测试 `test_read_tool_does_not_need_action_id_param`（READ/GENERATE 类不需要声明）
+- P1 #2：**create_price_adjustment_request 和 create_stock_adjustment_request 完整展开**（review v9 P1-#2）—— v9 总结说三个写 tool 都完整改成幂等保护，但正文只展开了 voucher，剩两个仍是 `...`。完整修复：按 voucher 同模式展开两个 tool fn，每个含：
+  1. 入参校验（new_price>0 / discount_pct∈(0,1) / delta_quantity≠0 / reason 非空 等）
+  2. 先按 (user, action_id) 查 → 命中返 idempotent_replay
+  3. INSERT
+  4. IntegrityError catch（仅 confirmation_action_id 唯一冲突）+ 回查
+  5. 极端情况 reraise
+- 测试覆盖扩展（Task 8: 9 → 21 case）：调价/库存的 idempotent_replay / asyncio.gather 并发幂等 / commit 后抛错重试 各自一套，与 voucher 对称覆盖
 
 总计：
 - 19 个 Task
