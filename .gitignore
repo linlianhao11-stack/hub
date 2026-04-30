@@ -26,3 +26,6 @@ htmlcov/
 .DS_Store
 *.log
 tmp/
+
+# Git worktrees (Plan 6 implementation isolation)
+.worktrees/
