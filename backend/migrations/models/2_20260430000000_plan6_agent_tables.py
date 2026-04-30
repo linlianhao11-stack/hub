@@ -187,6 +187,19 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
 
 
 async def downgrade(db: BaseDBAsyncClient) -> str:
+    """回滚 Plan 6 迁移，删除全部 9 张表。
+
+    警告：不可恢复操作，仅供开发期向下回滚使用。执行后将永久丢失以下所有数据：
+      - conversation_log：所有 Agent 对话元数据
+      - tool_call_log：所有 tool 调用明细（含 args/result/耗时）
+      - user_memory / customer_memory / product_memory：三层 Agent 记忆
+      - contract_template：所有合同模板
+      - contract_draft：所有合同草稿
+      - voucher_draft：所有凭证草稿（含五状态机数据）
+      - price_adjustment_request / stock_adjustment_request：所有调价/库存调整申请
+
+    生产环境禁止执行。
+    """
     return """
         DROP TABLE IF EXISTS "stock_adjustment_request";
         DROP TABLE IF EXISTS "price_adjustment_request";

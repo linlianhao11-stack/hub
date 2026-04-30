@@ -49,7 +49,7 @@ class ToolCallLog(Model):
     result_json = fields.JSONField(null=True)  # 调用结果（超 10KB 自动截断）
     duration_ms = fields.IntField(null=True)  # 耗时（毫秒）
     error = fields.CharField(max_length=500, null=True)  # 异常信息（截断到 500 字符）
-    called_at = fields.DatetimeField()  # 调用时间
+    called_at = fields.DatetimeField(auto_now_add=True)  # 调用时间（写入时自动填充，无需显式传入）
 
     class Meta:
         table = "tool_call_log"

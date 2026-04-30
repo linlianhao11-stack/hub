@@ -6,7 +6,7 @@ Plan 5 task_logger 的姊妹模块：
 
 设计原则：
   - 业务永远不被可观察性阻塞——写入失败仅打 exception log
-  - 超过 10KB 的 result_json 自动截断（保留 keys + 前 N 个 items + _truncated: true 标记）
+  - 超过 10KB 的 args_json / result_json 自动截断（保留 keys + 前 N 个 items + _truncated: true 标记）
   - 异常照常向上抛，确保 tool 层错误不被吞
 """
 from __future__ import annotations
@@ -15,7 +15,6 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 
 from hub.models.conversation import ToolCallLog
 
@@ -53,11 +52,11 @@ async def log_tool_call(
                 conversation_id=conversation_id,
                 round_idx=round_idx,
                 tool_name=tool_name,
-                args_json=args,
+                args_json=_truncate_for_log(args, max_size_kb=10),  # M1: args 同样截断，防止超大 JSONB
                 result_json=ctx._result,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 error=ctx._error,
-                called_at=datetime.now(UTC),
+                # called_at 由 ToolCallLog.called_at(auto_now_add=True) 自动填充，无需显式传入
             )
         except Exception:
             logger.exception("tool_call_log 写入失败（不阻塞业务）")
@@ -89,6 +88,12 @@ def _truncate_for_log(value: object, max_size_kb: int = 10) -> object:
        - 其他：转 str 并截断。
 
     返回值始终是 JSON 可序列化的 Python 对象（dict/list/str/None 等）。
+
+    边界：单 key value 太大时（>max_size_kb），返回值仅含 schema 提示，实际数据不保留。
+    例如当字典中某个 value 本身就超限时：
+        >>> _truncate_for_log({"data": "x" * 20000})
+        {"_truncated": True, "_original_keys": ["data"]}
+    调用方须注意：此时只能知道原来有哪些 key，具体内容不在日志中。
     """
     max_bytes = max_size_kb * 1024
 
