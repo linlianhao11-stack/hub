@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, UTC
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -35,7 +35,6 @@ from hub.agent.tools.erp_tools import (
 )
 from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.confirm_gate import ConfirmGate
-from hub.agent.tools.types import ToolType
 from hub.error_codes import BizError
 
 
@@ -104,7 +103,7 @@ async def test_adapter_search_orders_url_and_params(erp_url):
         return Response(200, json={"items": [], "total": 0})
 
     adapter = _make_real_adapter(erp_url, handler)
-    since = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 3, 1, tzinfo=UTC)
     await adapter.search_orders(
         customer_id=42, since=since, status="confirmed",
         page=2, page_size=50, acting_as_user_id=99,
@@ -426,7 +425,9 @@ async def test_search_orders_success(mock_adapter):
     call_kwargs = mock_adapter.search_orders.call_args.kwargs
     assert call_kwargs["customer_id"] == 3
     assert call_kwargs["acting_as_user_id"] == 99
-    assert "since" in call_kwargs
+    since_actual = call_kwargs["since"]
+    expected_delta = (datetime.now(UTC) - since_actual).total_seconds()
+    assert expected_delta == pytest.approx(7 * 86400, abs=10)  # 7 天 ± 10 秒
 
 
 @pytest.mark.asyncio
@@ -599,3 +600,45 @@ def test_current_erp_adapter_raises_when_unset():
     set_erp_adapter(None)  # 确保 None
     with pytest.raises(RuntimeError, match="ERP adapter 未初始化"):
         current_erp_adapter()
+
+
+# ============================================================
+# Part 4: Erp4Adapter 4 个新方法 — 4xx / 5xx 错误透传（I-2）
+# 使用真实 Erp4Adapter + MockTransport 拦 HTTP，确认错误类正确映射
+# ============================================================
+
+@pytest.fixture
+def erp_adapter_with_mock(erp_url):
+    """返回 (adapter, set_handler) 二元组：set_handler 动态替换 MockTransport 响应。"""
+    handler_ref: list = [lambda req: Response(200, json={})]
+
+    def dispatch(req: httpx.Request) -> Response:
+        return handler_ref[0](req)
+
+    adapter = _make_real_adapter(erp_url, dispatch)
+
+    def set_handler(fn):
+        handler_ref[0] = fn
+
+    return adapter, set_handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,expected_exc", [
+    (404, ErpNotFoundError),
+    (503, ErpSystemError),
+])
+@pytest.mark.parametrize("method,kwargs", [
+    ("search_orders", {"acting_as_user_id": 99}),
+    ("get_order_detail", {"order_id": 1, "acting_as_user_id": 99}),
+    ("get_customer_balance", {"customer_id": 1, "acting_as_user_id": 99}),
+    ("get_inventory_aging", {"acting_as_user_id": 99}),
+])
+async def test_adapter_new_methods_propagate_http_errors(
+    method, kwargs, status, expected_exc, erp_adapter_with_mock,
+):
+    """4 个 adapter 新方法 × (404, 503) = 8 case；验证 _act_as_get 错误 chain 不被新方法短路。"""
+    adapter, set_handler = erp_adapter_with_mock
+    set_handler(lambda req: Response(status, json={"detail": "mock error"}))
+    with pytest.raises(expected_exc):
+        await getattr(adapter, method)(**kwargs)

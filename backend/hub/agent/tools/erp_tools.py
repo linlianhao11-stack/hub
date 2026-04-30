@@ -18,7 +18,16 @@ _erp_adapter: Erp4Adapter | None = None
 
 
 def set_erp_adapter(adapter: Erp4Adapter | None) -> None:
-    """app startup 时挂 adapter；传 None 仅用于测试 cleanup。"""
+    """app startup 时挂 adapter；shutdown 时建议传 None 防 stale 引用。
+
+    用法（Task 6 集成时在 main.py lifespan 实施）：
+        # startup
+        adapter = Erp4Adapter(...)
+        set_erp_adapter(adapter)
+        ...
+        # shutdown
+        set_erp_adapter(None)
+    """
     global _erp_adapter
     _erp_adapter = adapter
 
@@ -164,6 +173,11 @@ def register_all(registry: ToolRegistry) -> None:
 
     perm 命名约定：`usecase.<verb>.<resource>`；READ 类不需声明 confirmation_action_id。
     聚合 tool（analyze_top_customers / analyze_slow_moving_products）在 Task 9 注册。
+
+    ⚠️ Cross-task 依赖：本函数引用的 9 个 perm 码（usecase.query_orders.use 等）
+       由 Task 17 (`backend/hub/seed.py`) 写入 seed 数据。Task 17 完成前生产环境
+       has_permission 会全返 False 导致 LLM 看不到这些 tool。集成顺序：
+       Task 17 (seed) → Task 6 (ChainAgent 调 register_all) → 跑通。
     """
     registry.register(
         "search_products", search_products,
