@@ -45,6 +45,7 @@ const routes = [
       { path: 'audit', name: 'audit', component: () => import('../views/admin/AuditView.vue') },
       { path: 'health', name: 'health', component: () => import('../views/admin/HealthView.vue') },
       { path: 'contract-templates', name: 'contract-templates', component: () => import('../views/admin/ContractTemplatesView.vue') },
+      { path: 'approvals', name: 'admin-approvals', component: () => import('../views/admin/ApprovalsView.vue') },
     ],
   },
   {

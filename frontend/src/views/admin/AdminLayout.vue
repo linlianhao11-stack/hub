@@ -52,7 +52,7 @@ import {
   LayoutDashboard, Users, Shield, KeyRound, Network,
   MessageSquare, Brain, Settings, Activity, ListChecks,
   History, ClipboardList, HeartPulse, ChevronRight, Sun, Moon,
-  FileText,
+  FileText, ClipboardCheck,
 } from 'lucide-vue-next'
 import { useAuthStore } from '../../stores/auth'
 import { useAppStore } from '../../stores/app'
@@ -105,6 +105,7 @@ const groups = [
     title: '业务配置',
     items: [
       { to: '/admin/contract-templates', label: '合同模板', icon: FileText, perm: 'usecase.contract_templates.write' },
+      { to: '/admin/approvals', label: '待审批', icon: ClipboardCheck, perm: 'usecase.create_voucher.approve' },
     ],
   },
   {
