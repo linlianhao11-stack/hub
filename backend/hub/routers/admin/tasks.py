@@ -4,6 +4,10 @@
 - 列表：platform.tasks.read（看元数据）
 - 详情（带 payload）：platform.conversation.monitor（更敏感，需要单独权限）
 - 详情触发 MetaAuditLog（"谁看了谁的 task"）
+
+Plan 6 Task 13 升级：task 详情末尾附加 conversation_log + tool_calls（agent 决策链）。
+关联策略：channel_userid + task.created_at ±30s 时间窗口模糊匹配 ConversationLog；
+命中 0 / >1 时返 null（避免错配），不影响既有字段。
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from hub.auth.admin_perms import require_hub_perm
 from hub.crypto import decrypt_secret
 from hub.models import MetaAuditLog, TaskLog, TaskPayload
+from hub.models.conversation import ConversationLog, ToolCallLog
 
 logger = logging.getLogger("hub.admin.tasks")
 
@@ -113,6 +118,52 @@ async def get_task_detail(request: Request, task_id: str):
             ip=request.client.host if request.client else None,
         )
 
+    # === Plan 6 Task 13：关联 agent 决策链（conversation_log + tool_calls）===
+    # 策略：用 channel_userid + task.created_at ±30s 时间窗口模糊匹配 ConversationLog。
+    # 命中 0 / >1 时均返 null，避免错配（task 不一定走 agent 路径）。
+    conversation_log_dict = None
+    tool_calls_list: list[dict] = []
+
+    if task.channel_userid and task.created_at:
+        time_window_start = task.created_at - timedelta(seconds=30)
+        time_window_end = task.created_at + timedelta(seconds=30)
+        candidates = await ConversationLog.filter(
+            channel_userid=task.channel_userid,
+            started_at__gte=time_window_start,
+            started_at__lte=time_window_end,
+        ).all()
+
+        if len(candidates) == 1:
+            conv = candidates[0]
+            tokens_cost_yuan = (
+                float(conv.tokens_cost_yuan) if conv.tokens_cost_yuan is not None else None
+            )
+            conversation_log_dict = {
+                "conversation_id": conv.conversation_id,
+                "rounds_count": conv.rounds_count,
+                "tokens_used": conv.tokens_used,
+                "tokens_cost_yuan": tokens_cost_yuan,
+                "final_status": conv.final_status,
+                "error_summary": conv.error_summary,
+                "started_at": conv.started_at.isoformat() if conv.started_at else None,
+                "ended_at": conv.ended_at.isoformat() if conv.ended_at else None,
+            }
+            # 拉对应 tool_calls，按 round_idx + called_at 升序
+            tool_logs = await ToolCallLog.filter(
+                conversation_id=conv.conversation_id,
+            ).order_by("round_idx", "called_at").all()
+            for log in tool_logs:
+                tool_calls_list.append({
+                    "id": log.id,
+                    "round_idx": log.round_idx,
+                    "tool_name": log.tool_name,
+                    "args_json": log.args_json,
+                    "result_json": log.result_json,
+                    "duration_ms": log.duration_ms,
+                    "error": log.error,
+                    "called_at": log.called_at.isoformat() if log.called_at else None,
+                })
+
     return {
         "task_log": {
             "task_id": task.task_id,
@@ -128,4 +179,6 @@ async def get_task_detail(request: Request, task_id: str):
             "retry_count": task.retry_count,
         },
         "payload": payload_data,
+        "conversation_log": conversation_log_dict,
+        "tool_calls": tool_calls_list,
     }
