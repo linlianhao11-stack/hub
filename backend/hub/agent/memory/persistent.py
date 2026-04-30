@@ -7,6 +7,8 @@ from __future__ import annotations
 from datetime import datetime, UTC
 from typing import Iterable
 
+from tortoise.transactions import in_transaction
+
 from hub.models.memory import (
     UserMemory as UserMemoryModel,
     CustomerMemory as CustomerMemoryModel,
@@ -27,22 +29,40 @@ class UserMemoryService:
     async def upsert_facts(self, hub_user_id: int, *,
                            new_facts: list[dict],
                            preferences: dict | None = None) -> None:
-        """追加 facts（去重）+ 可选 merge preferences。"""
-        rec, _ = await UserMemoryModel.get_or_create(hub_user_id=hub_user_id)
-        existing = rec.facts or []
-        # 简单去重：fact 文本相同视为重复
-        seen = {f.get("fact") for f in existing if isinstance(f, dict)}
-        for f in new_facts:
-            if isinstance(f, dict) and f.get("fact") not in seen:
-                existing.append({**f, "created_at": datetime.now(UTC).isoformat()})
-                seen.add(f.get("fact"))
-        rec.facts = existing
-        if preferences is not None:
-            merged = (rec.preferences or {}).copy()
-            merged.update(preferences)
-            rec.preferences = merged
-        rec.updated_at = datetime.now(UTC)
-        await rec.save()
+        """追加 facts（去重）+ 可选 merge preferences。
+
+        M5: 行为：append-unique-by-fact-text；遇到重复 fact 文本静默跳过
+        （不更新 created_at/confidence）。
+
+        C3: 用 in_transaction + select_for_update 防止两个并发 extract_and_write
+        同时读到同样的 existing list、各自 append 后 save 导致最后写者覆盖前一个。
+        """
+        async with in_transaction("default") as conn:
+            # 行锁防并发覆盖
+            recs = (
+                await UserMemoryModel
+                .filter(hub_user_id=hub_user_id)
+                .select_for_update()
+                .using_db(conn)
+                .all()
+            )
+            if not recs:
+                rec = await UserMemoryModel.create(hub_user_id=hub_user_id, using_db=conn)
+            else:
+                rec = recs[0]
+            existing = rec.facts or []
+            seen = {f.get("fact") for f in existing if isinstance(f, dict)}
+            for f in new_facts:
+                if isinstance(f, dict) and f.get("fact") not in seen:
+                    existing.append({**f, "created_at": datetime.now(UTC).isoformat()})
+                    seen.add(f.get("fact"))
+            rec.facts = existing
+            if preferences is not None:
+                merged = (rec.preferences or {}).copy()
+                merged.update(preferences)
+                rec.preferences = merged
+            rec.updated_at = datetime.now(UTC)
+            await rec.save(using_db=conn)
 
 
 class CustomerMemoryService:
@@ -62,17 +82,34 @@ class CustomerMemoryService:
 
     async def upsert_facts(self, customer_id: int, *,
                            new_facts: list[dict]) -> None:
-        rec, _ = await CustomerMemoryModel.get_or_create(erp_customer_id=customer_id)
-        existing = rec.facts or []
-        seen = {f.get("fact") for f in existing if isinstance(f, dict)}
-        for f in new_facts:
-            if isinstance(f, dict) and f.get("fact") not in seen:
-                existing.append({**f, "created_at": datetime.now(UTC).isoformat()})
-                seen.add(f.get("fact"))
-        rec.facts = existing
-        rec.last_referenced_at = datetime.now(UTC)
-        rec.updated_at = datetime.now(UTC)
-        await rec.save()
+        """追加 customer facts（去重）。
+
+        M5: 行为：append-unique-by-fact-text；遇到重复 fact 文本静默跳过。
+
+        C3: in_transaction + select_for_update 防并发覆盖。
+        """
+        async with in_transaction("default") as conn:
+            recs = (
+                await CustomerMemoryModel
+                .filter(erp_customer_id=customer_id)
+                .select_for_update()
+                .using_db(conn)
+                .all()
+            )
+            if not recs:
+                rec = await CustomerMemoryModel.create(erp_customer_id=customer_id, using_db=conn)
+            else:
+                rec = recs[0]
+            existing = rec.facts or []
+            seen = {f.get("fact") for f in existing if isinstance(f, dict)}
+            for f in new_facts:
+                if isinstance(f, dict) and f.get("fact") not in seen:
+                    existing.append({**f, "created_at": datetime.now(UTC).isoformat()})
+                    seen.add(f.get("fact"))
+            rec.facts = existing
+            rec.last_referenced_at = datetime.now(UTC)
+            rec.updated_at = datetime.now(UTC)
+            await rec.save(using_db=conn)
 
 
 class ProductMemoryService:
@@ -87,13 +124,30 @@ class ProductMemoryService:
 
     async def upsert_facts(self, product_id: int, *,
                            new_facts: list[dict]) -> None:
-        rec, _ = await ProductMemoryModel.get_or_create(erp_product_id=product_id)
-        existing = rec.facts or []
-        seen = {f.get("fact") for f in existing if isinstance(f, dict)}
-        for f in new_facts:
-            if isinstance(f, dict) and f.get("fact") not in seen:
-                existing.append({**f, "created_at": datetime.now(UTC).isoformat()})
-                seen.add(f.get("fact"))
-        rec.facts = existing
-        rec.updated_at = datetime.now(UTC)
-        await rec.save()
+        """追加 product facts（去重）。
+
+        M5: 行为：append-unique-by-fact-text；遇到重复 fact 文本静默跳过。
+
+        C3: in_transaction + select_for_update 防并发覆盖。
+        """
+        async with in_transaction("default") as conn:
+            recs = (
+                await ProductMemoryModel
+                .filter(erp_product_id=product_id)
+                .select_for_update()
+                .using_db(conn)
+                .all()
+            )
+            if not recs:
+                rec = await ProductMemoryModel.create(erp_product_id=product_id, using_db=conn)
+            else:
+                rec = recs[0]
+            existing = rec.facts or []
+            seen = {f.get("fact") for f in existing if isinstance(f, dict)}
+            for f in new_facts:
+                if isinstance(f, dict) and f.get("fact") not in seen:
+                    existing.append({**f, "created_at": datetime.now(UTC).isoformat()})
+                    seen.add(f.get("fact"))
+            rec.facts = existing
+            rec.updated_at = datetime.now(UTC)
+            await rec.save(using_db=conn)

@@ -12,6 +12,7 @@ from hub.models.conversation import ToolCallLog
 logger = logging.getLogger("hub.agent.memory.writer")
 
 
+# I3: customer/product facts 也加 confidence 字段 + filter（与 user_facts 对齐）
 _EXTRACTION_PROMPT = """从下面的对话历史 + tool 调用日志中抽取事实，写入三层 memory：
 
 1. user_facts: 当前用户偏好 / 工作习惯（如"喜欢付款条款 30 天"）
@@ -21,12 +22,23 @@ _EXTRACTION_PROMPT = """从下面的对话历史 + tool 调用日志中抽取事
 格式 JSON：
 {
   "user_facts": [{"fact": "string", "confidence": 0.0-1.0}],
-  "customer_facts": [{"customer_id": int, "fact": "string"}],
-  "product_facts": [{"product_id": int, "fact": "string"}]
+  "customer_facts": [{"customer_id": int, "fact": "string", "confidence": 0.0-1.0}],
+  "product_facts": [{"product_id": int, "fact": "string", "confidence": 0.0-1.0}]
 }
 
 只抽**有商业价值**的事实；闲聊 / 重复 / 无意义内容跳过。confidence < 0.6 不写。
 """
+
+
+def _safe_list(value: Any) -> list:
+    """C2: 防御非 list 输入（LLM 可能返回 null / string 等）。"""
+    return value if isinstance(value, list) else []
+
+
+# I2: 模块级 EntityExtractor 实例，用于 should_extract 的结构化检查
+from hub.agent.tools.entity_extractor import EntityExtractor  # noqa: E402
+
+_EXTRACTOR = EntityExtractor()
 
 
 class MemoryWriter:
@@ -42,14 +54,17 @@ class MemoryWriter:
     @staticmethod
     def should_extract(*, tool_call_logs: list[ToolCallLog],
                        rounds_count: int) -> bool:
-        """重要性 gate（spec §3.3）。任一满足即抽。"""
+        """重要性 gate（spec §3.3）。任一满足即抽。
+
+        I2: 复用 EntityExtractor.extract().has_any() 替代字面 substring match，
+        避免 "customer_identifier_v2" 等假阳性。
+        """
         if rounds_count >= 4:
             return True
         for log in tool_call_logs:
             if log.tool_name.startswith(("create_", "generate_")):
                 return True
-            result = log.result_json or {}
-            if "customer_id" in str(result) or "product_id" in str(result):
+            if log.result_json and _EXTRACTOR.extract(log.result_json).has_any():
                 return True
         return False
 
@@ -70,8 +85,8 @@ class MemoryWriter:
                 text=_EXTRACTION_PROMPT + "\n\n" + summary,
                 schema={
                     "user_facts": [{"fact": "string", "confidence": "float"}],
-                    "customer_facts": [{"customer_id": "int", "fact": "string"}],
-                    "product_facts": [{"product_id": "int", "fact": "string"}],
+                    "customer_facts": [{"customer_id": "int", "fact": "string", "confidence": "float"}],
+                    "product_facts": [{"product_id": "int", "fact": "string", "confidence": "float"}],
                 },
             )
         except Exception:
@@ -81,7 +96,14 @@ class MemoryWriter:
             )
             return
 
-        await self._upsert_all(hub_user_id, conversation_id, result or {})
+        # C2: _upsert_all DB 异常不阻塞业务（asyncio.create_task 中 unhandled 会变 warning）
+        try:
+            await self._upsert_all(hub_user_id, conversation_id, result or {})
+        except Exception:
+            logger.exception(
+                "MemoryWriter._upsert_all 写库失败 conv=%s（不阻塞业务，待下次抽取兜底）",
+                conversation_id,
+            )
 
     @staticmethod
     def _build_extraction_input(tool_call_logs: list[ToolCallLog]) -> str:
@@ -96,29 +118,42 @@ class MemoryWriter:
 
     async def _upsert_all(self, hub_user_id: int, conversation_id: str,
                           extraction: dict) -> None:
-        """三层分别 upsert。"""
+        """三层分别 upsert。
+
+        C2: 调用方已用 try/except 包裹，此处异常会向上抛被 caller 捕获 log。
+        C2: _safe_list 防御 LLM 返回非 list 入参。
+        I3: customer/product 同样按 confidence >= 0.6 过滤。
+        """
         # user_facts
         u_facts = [
-            f for f in (extraction.get("user_facts") or [])
-            if f.get("confidence", 0) >= 0.6
+            f for f in _safe_list(extraction.get("user_facts"))
+            if isinstance(f, dict) and f.get("confidence", 0) >= 0.6
         ]
         for f in u_facts:
             f["source_conversation"] = conversation_id
         if u_facts:
             await self.user.upsert_facts(hub_user_id, new_facts=u_facts)
 
-        # customer_facts
-        for f in extraction.get("customer_facts") or []:
+        # customer_facts — I3: 加 confidence 过滤
+        for f in _safe_list(extraction.get("customer_facts")):
             cid = f.get("customer_id")
-            if isinstance(cid, int):
+            if isinstance(cid, int) and isinstance(f, dict) and f.get("confidence", 0) >= 0.6:
                 await self.customer.upsert_facts(cid, new_facts=[
-                    {"fact": f.get("fact"), "source_conversation": conversation_id},
+                    {
+                        "fact": f.get("fact"),
+                        "confidence": f.get("confidence"),
+                        "source_conversation": conversation_id,
+                    },
                 ])
 
-        # product_facts
-        for f in extraction.get("product_facts") or []:
+        # product_facts — I3: 加 confidence 过滤
+        for f in _safe_list(extraction.get("product_facts")):
             pid = f.get("product_id")
-            if isinstance(pid, int):
+            if isinstance(pid, int) and isinstance(f, dict) and f.get("confidence", 0) >= 0.6:
                 await self.product.upsert_facts(pid, new_facts=[
-                    {"fact": f.get("fact"), "source_conversation": conversation_id},
+                    {
+                        "fact": f.get("fact"),
+                        "confidence": f.get("confidence"),
+                        "source_conversation": conversation_id,
+                    },
                 ])

@@ -1,14 +1,6 @@
 # hub/agent/tools/entity_extractor.py
-from dataclasses import dataclass, field
-
-
-@dataclass
-class EntityRefs:
-    customer_ids: set[int] = field(default_factory=set)
-    product_ids: set[int] = field(default_factory=set)
-
-    def has_any(self) -> bool:
-        return bool(self.customer_ids or self.product_ids)
+# I1: EntityRefs 已移到 hub.agent.memory.types，这里重新导出保持兼容。
+from hub.agent.memory.types import EntityRefs  # noqa: F401 — 重新导出
 
 
 class EntityExtractor:

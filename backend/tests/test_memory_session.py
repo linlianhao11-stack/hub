@@ -98,6 +98,16 @@ async def test_load_returns_full_history_with_refs(session, redis_client):
 
 
 @pytest.mark.asyncio
+async def test_append_handles_special_chars(session, redis_client):
+    """M7: 中文 / emoji / 转义引号 / 控制字符都能正确 roundtrip。"""
+    cid = _conv_id("special-chars")
+    weird = '中文 + emoji 🎉 + 换行\\n + "引号" + \\u0001 控制字符'
+    await session.append(cid, role="user", content=weird)
+    history = await session.load(cid)
+    assert history.messages[0].content == weird
+
+
+@pytest.mark.asyncio
 async def test_clear_removes_all_keys(session, redis_client):
     """clear 后 load 返空历史和空引用。"""
     cid = _conv_id("clear")

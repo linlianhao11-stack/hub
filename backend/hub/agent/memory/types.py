@@ -5,6 +5,18 @@ from typing import Any
 
 
 @dataclass
+class EntityRefs:
+    """从 tool result 提取的实体 ID 引用集合。
+    I1: 从 tools/entity_extractor.py 移到此处，消除 memory → tools 的向上依赖。
+    """
+    customer_ids: set[int] = field(default_factory=set)
+    product_ids: set[int] = field(default_factory=set)
+
+    def has_any(self) -> bool:
+        return bool(self.customer_ids or self.product_ids)
+
+
+@dataclass
 class ConversationMessage:
     """单条对话消息。"""
     role: str  # "user" / "assistant" / "tool"

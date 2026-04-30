@@ -18,18 +18,38 @@ USER_TOKEN_BUDGET = 1000
 CUSTOMER_TOKEN_BUDGET = 500   # 单个客户
 PRODUCT_TOKEN_BUDGET = 200    # 单个商品
 
+# M1: 模块级 encoder 缓存，避免每次 import + get_encoding 开销
+_ENCODER = None
+_ENCODER_FAILED = False
+
+
+def _get_encoder():
+    """懒加载 + 缓存 tiktoken encoder；ImportError 后标记失败不重试。"""
+    global _ENCODER, _ENCODER_FAILED
+    if _ENCODER is not None or _ENCODER_FAILED:
+        return _ENCODER
+    try:
+        import tiktoken  # noqa: PLC0415
+        _ENCODER = tiktoken.get_encoding("cl100k_base")
+    except ImportError:
+        _ENCODER_FAILED = True
+        logger.warning("tiktoken 未安装，token 估算 fallback（中文偏低 3x）。建议 pip install tiktoken>=0.5")
+    return _ENCODER
+
 
 def _estimate_tokens(text: str) -> int:
-    """粗略估算 token 数（中文 ~1.5 char/token，英文 ~4 char/token）。
+    """估算 token 数。
 
-    Plan 6 简化：用 tiktoken 的 cl100k_base 估算；fallback 到 len(text)//3。
+    首选 tiktoken cl100k_base；fallback：CJK 按 1.5 char/token，ASCII 按 4 char/token
+    （比原来的 len//3 更贴近中文实际）。
     """
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
+    enc = _get_encoder()
+    if enc is not None:
         return len(enc.encode(text))
-    except Exception:
-        return len(text) // 3
+    # M1 优化 fallback：区分中文字符与 ASCII
+    cjk_count = sum(1 for c in text if ord(c) >= 0x3000)
+    ascii_count = len(text) - cjk_count
+    return int(cjk_count / 1.5 + ascii_count / 4)
 
 
 def _truncate_facts(facts: list[dict], budget: int) -> list[dict]:
@@ -69,7 +89,11 @@ class MemoryLoader:
 
         # 按 token budget 截断
         return Memory(
-            session=session,  # session 暂不截断（消息层在 ContextBuilder Task 6 二次处理）
+            # I5: Plan 6 Task 4 决策：session 全量传递；token 4K 上限的截断由 Task 6 ContextBuilder
+            # 处理（按 round/messages 边界裁），这里只截 user/customer/product facts 列表。
+            # spec §3.3 总预算 10K = 4K (session) + 1K (user) + 5×500 (customers) + 5×200 (products)
+            # 仍然有效，session 那 4K 不在本层 enforce。
+            session=session,
             user={
                 "facts": _truncate_facts(user["facts"], USER_TOKEN_BUDGET),
                 "preferences": user["preferences"],

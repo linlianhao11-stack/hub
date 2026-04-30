@@ -11,8 +11,7 @@ from typing import Iterable
 
 from redis.asyncio import Redis
 
-from hub.agent.memory.types import ConversationHistory, ConversationMessage
-from hub.agent.tools.entity_extractor import EntityRefs
+from hub.agent.memory.types import ConversationHistory, ConversationMessage, EntityRefs
 
 
 class SessionMemory:
@@ -56,11 +55,11 @@ class SessionMemory:
             await pipe.execute()
 
     async def add_entity_refs(self, conversation_id: str, *,
-                              customer_ids: Iterable[int] | set[int] | None = None,
-                              product_ids: Iterable[int] | set[int] | None = None) -> None:
+                              customer_ids: Iterable[int] | None = None,
+                              product_ids: Iterable[int] | None = None) -> None:
         """ToolRegistry 提取后调用。"""
-        cids = list(customer_ids) if customer_ids else []
-        pids = list(product_ids) if product_ids else []
+        cids = list(customer_ids or ())
+        pids = list(product_ids or ())
         if not cids and not pids:
             return
         async with self.redis.pipeline(transaction=False) as pipe:
@@ -102,7 +101,10 @@ class SessionMemory:
         )
 
     async def clear(self, conversation_id: str) -> None:
-        """显式清理（场景：管理员手动重置 / 测试）。"""
+        """显式清理（场景：管理员手动重置 / 测试）。
+
+        Plan 6 Task 4 加：管理员重置 / 测试清理；不在 plan 文字 spec 范围但是合理实用方法。
+        """
         await self.redis.delete(
             self._msgs_key(conversation_id),
             self._refs_customers_key(conversation_id),

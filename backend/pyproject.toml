@@ -23,6 +23,7 @@ dependencies = [
     "python-dateutil>=2.8",
     "structlog>=24.1",
     "dingtalk-stream>=0.18",
+    "tiktoken>=0.5",
 ]
 
 [project.optional-dependencies]

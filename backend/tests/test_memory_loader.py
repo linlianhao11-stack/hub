@@ -165,11 +165,27 @@ async def test_load_multiple_users_isolated(loader):
 
 @pytest.mark.asyncio
 async def test_estimate_tokens_fallback():
-    """tiktoken 不可用时用 len//3 回退（mock import）。"""
-    import sys
-    # 通过 mock 让 tiktoken 导入失败
-    with patch.dict(sys.modules, {"tiktoken": None}):
-        result = _estimate_tokens("hello world test string")
-    # fallback: len("hello world test string") // 3 = 7
-    text = "hello world test string"
-    assert result == len(text) // 3
+    """M1: tiktoken 不可用时用 CJK-aware fallback 回退（强制 _ENCODER_FAILED）。"""
+    import hub.agent.memory.loader as loader_mod
+
+    # 强制 fallback 分支（保留原 _ENCODER / _ENCODER_FAILED 值用于还原）
+    orig_encoder = loader_mod._ENCODER
+    orig_failed = loader_mod._ENCODER_FAILED
+    try:
+        loader_mod._ENCODER = None
+        loader_mod._ENCODER_FAILED = True  # 模拟 tiktoken 不可用
+
+        text_ascii = "hello world test"
+        result = _estimate_tokens(text_ascii)
+        # 纯 ASCII：cjk_count=0，ascii_count=16 → int(0/1.5 + 16/4) = 4
+        expected = int(0 / 1.5 + len(text_ascii) / 4)
+        assert result == expected, f"expected {expected}, got {result}"
+
+        # 中文字符（CJK >= 0x3000）走 CJK 分支
+        text_cjk = "你好世界"
+        result_cjk = _estimate_tokens(text_cjk)
+        # 4 个 CJK → int(4/1.5) = 2
+        assert result_cjk == int(len(text_cjk) / 1.5)
+    finally:
+        loader_mod._ENCODER = orig_encoder
+        loader_mod._ENCODER_FAILED = orig_failed
