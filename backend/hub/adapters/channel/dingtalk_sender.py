@@ -101,3 +101,93 @@ class DingTalkSender:
         )
         if r.status_code >= 400:
             raise DingTalkSendError(f"send oto 失败 {r.status_code}: {r.text[:200]}")
+        # 检查钉钉业务错误码
+        resp_body = r.json() if r.content else {}
+        if resp_body.get("errcode", 0) not in (0, None):
+            raise DingTalkSendError(f"send oto 业务失败: {resp_body}")
+
+    async def send_file(
+        self,
+        *,
+        dingtalk_userid: str,
+        file_bytes: bytes,
+        file_name: str,
+        file_type: str = "docx",
+    ) -> None:
+        """发文件给单个用户（合同 docx / Excel / PDF 等）。
+
+        两步：
+        1. _upload_media 上传拿 media_id
+        2. _send_oto 用 sampleFile msg_key 发给用户
+
+        Args:
+            dingtalk_userid: 钉钉用户 ID
+            file_bytes: 文件字节（< 20MB）
+            file_name: 文件名（含扩展名，如 "合同.docx"）
+            file_type: 文件类型标识（"docx" / "xlsx" / "pdf" 等）
+
+        Raises:
+            DingTalkSendError: 文件超 20MB / 上传失败 / 发送失败
+        """
+        media_id = await self._upload_media(file_bytes, file_name, file_type)
+        await self._send_oto(
+            user_ids=[dingtalk_userid],
+            msg_key="sampleFile",
+            msg_param={"mediaId": media_id, "fileName": file_name, "fileType": file_type},
+        )
+
+    async def _upload_media(
+        self,
+        file_bytes: bytes,
+        file_name: str,
+        file_type: str,
+        *,
+        max_retry: int = 1,
+    ) -> str:
+        """调钉钉 media/upload 接口拿 media_id。
+
+        - 文件 > 20MB 立即抛 DingTalkSendError（不上传）
+        - 5xx 重试最多 max_retry 次
+        - 4xx 立即抛（不重试）
+
+        Returns:
+            media_id 字符串
+        """
+        if len(file_bytes) > 20 * 1024 * 1024:
+            raise DingTalkSendError("文件超过钉钉 20MB 上限")
+
+        token = await self._get_access_token()
+        url = "https://oapi.dingtalk.com/media/upload"
+
+        last_err: Exception | None = None
+        for attempt in range(max_retry + 1):
+            try:
+                files = {
+                    "media": (file_name, file_bytes, f"application/{file_type}"),
+                }
+                r = await self._client.post(
+                    url,
+                    params={"access_token": token, "type": "file"},
+                    files=files,
+                )
+                if r.status_code == 200:
+                    body = r.json()
+                    if body.get("errcode") == 0:
+                        return body["media_id"]
+                    raise DingTalkSendError(f"上传失败: {body}")
+                if r.status_code >= 500 and attempt < max_retry:
+                    # 5xx：记录错误，继续重试
+                    last_err = DingTalkSendError(f"upload {r.status_code}")
+                    continue
+                # 4xx 或超出重试次数的 5xx：立即抛
+                raise DingTalkSendError(f"上传 {r.status_code}: {r.text[:200]}")
+            except DingTalkSendError:
+                raise
+            except httpx.RequestError as e:
+                last_err = DingTalkSendError(f"网络错误: {e}")
+                if attempt < max_retry:
+                    continue
+                raise last_err from e
+
+        # 兜底（实际不应到达）
+        raise last_err or DingTalkSendError("upload exhausted")
