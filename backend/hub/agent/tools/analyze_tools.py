@@ -12,16 +12,12 @@
 长期改进：ERP 加 analytics endpoint 直接 GROUP BY 出聚合结果（spec §14 备注，不在 Plan 6 范围）。
 """
 from __future__ import annotations
-import logging
 import re
 from datetime import datetime, timedelta, UTC
-from typing import Any
 
 from hub.agent.tools.erp_tools import current_erp_adapter
 from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import ToolType
-
-logger = logging.getLogger("hub.agent.tools.analyze_tools")
 
 MAX_ORDERS = 1000
 MAX_PERIOD_DAYS = 90
@@ -39,6 +35,11 @@ def _parse_period_days(period: str | None) -> int:
     - "last_year" / "近一年" / "今年" → 365（会被 caller 截断到 MAX_PERIOD_DAYS）
     - "近 N 天" / "last N days" / "Nd" → N
     - 默认（None / 未识别）→ 30 天
+
+    注意：时间词被粗略映射为 7/30/90/365；
+    "去年"和"今年"都返 365（用 MAX_PERIOD_DAYS 截断兜底）。
+    最终调用方都受 MAX_PERIOD_DAYS=90 截断；超 90 天的 period 触发
+    partial_result=True + notes 提示。
 
     返回原始天数（不在这里截断；caller 决定）。
     """
@@ -109,10 +110,12 @@ async def analyze_top_customers(
         if page > (MAX_ORDERS // PER_PAGE) + 2:
             break
 
-    if len(orders) >= MAX_ORDERS:
-        # 还可能有更多 → 标记 truncated（用 ERP 返的 total 校准）
-        last_total = resp.get("total") or len(orders)
-        truncated = last_total > MAX_ORDERS
+    hit_cap = len(orders) >= MAX_ORDERS
+    if hit_cap:
+        # 还可能有更多 → 标记 truncated
+        # ERP 缺 total 字段时保守标 truncated（防漏报）
+        last_total = resp.get("total") if isinstance(resp, dict) else None
+        truncated = last_total is None or last_total > MAX_ORDERS
         orders = orders[:MAX_ORDERS]
 
     # 聚合 group by customer
@@ -146,11 +149,16 @@ async def analyze_top_customers(
         else:
             item["avg_order"] = 0.0
 
-    notes = None
+    notes_parts: list[str] = []
     if truncated:
-        notes = f"结果不完整：实际订单超 {MAX_ORDERS} 单，仅基于最近 {MAX_ORDERS} 单聚合"
-    elif partial_period:
-        notes = f"请求 period 超 {MAX_PERIOD_DAYS} 天，已截断到最近 {MAX_PERIOD_DAYS} 天"
+        notes_parts.append(
+            f"实际订单超 {MAX_ORDERS} 单，仅基于最近 {MAX_ORDERS} 单聚合"
+        )
+    if partial_period:
+        notes_parts.append(
+            f"请求 period 超 {MAX_PERIOD_DAYS} 天，已截断到最近 {MAX_PERIOD_DAYS} 天"
+        )
+    notes = "；".join(notes_parts) if notes_parts else None
 
     return {
         "items": aggregated,
