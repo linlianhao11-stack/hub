@@ -182,6 +182,8 @@ async def main():
     try:
         await runtime.run()
     finally:
+        # close 顺序：先关 agent_llm（Plan 6 Task 6 自建 httpx client），再关其他
+        await agent_llm.aclose()
         if ai_provider is not None:
             await ai_provider.aclose()
         await erp_adapter.aclose()

@@ -6,12 +6,16 @@
 - 多轮编号选择（Plan 4 遗产）：从 ConversationState 取候选项 → 调 execute_selected_*
 - 低置信度（Plan 4 遗产）：保 state，让用户回"是"确认
 - RE_CONFIRM 识别：用户回"是/确认/yes"→ user_just_confirmed=True 传给 ChainAgent
-- 降级兜底：ChainAgent 未预期异常 → 降级 RuleParser；无 RuleParser → 友好错误文案
+- 降级兜底：
+  - ChainAgent.run 抛出**未被内部捕获**的异常（如 Redis 死了 / 配置错）
+    → 降级 RuleParser → rule 命中执行 use case，否则发友好文案
+  - LLMServiceError / asyncio.TimeoutError / PromptTooLargeError 等已被 ChainAgent
+    内部转为 AgentResult.error_result，**不触发降级**；用户直接收到 ChainAgent 翻译的
+    友好错误文案（"AI 响应超时"等）
 
 依赖外部注入（避免直连）：
 - binding_service / identity_service / sender（Plan 3）
 - chain_agent（Plan 6 新）/ rule_parser（fallback，可选）
-- chain_parser（Plan 4，过渡期保留，可选；新代码不用）
 - conversation_state / query_product_usecase / query_customer_history_usecase /
   require_permissions（Plan 4，保留供 pending_choice / pending_confirm 路径）
 - live_publisher（Plan 5 task 6）：注入 LiveStreamPublisher 后，
@@ -27,6 +31,7 @@ import re
 from hub import messages
 from hub.error_codes import BizError, BizErrorCode, build_user_message
 from hub.observability.task_logger import log_inbound_task
+from hub.ports import ParsedIntent
 
 logger = logging.getLogger("hub.handler.dingtalk_inbound")
 
@@ -37,6 +42,9 @@ RE_HELP = re.compile(r"^/?(help|帮助|\?|菜单)\s*$", re.IGNORECASE)
 
 # RE_CONFIRM：识别用户确认写操作的语义词（Plan 6 §2161-2174）
 # 仅匹配整条消息是确认词的情况（防"是的""确认一下" 等误判）
+# Plan 6 Task 10 加：RE_CONFIRM 比 rule_parser 既有 RE_CONFIRM 多了 "ok" / "确定"，
+# 让 pending_confirm（绑定二次确认）和 RE_CONFIRM（写门禁确认）都用更宽的识别。
+# 用户在两类确认场景下回 "ok" 也能识别。
 RE_CONFIRM = re.compile(r"^\s*(是|确认|yes|y|ok|确定)\s*$", re.IGNORECASE)
 
 
@@ -53,8 +61,6 @@ async def handle_inbound(
     query_product_usecase=None,
     query_customer_history_usecase=None,
     require_permissions=None,
-    # 过渡期保留；新代码不调用
-    chain_parser=None,
     # 可观测性
     live_publisher=None,
 ) -> None:
@@ -134,10 +140,11 @@ async def handle_inbound(
                     parser_context["pending_confirm"] = "yes"
 
             # 优先处理 pending_choice（数字编号回路）
-            if state and state.get("pending_choice") and content.isdigit():
+            # M4：复用 rule_parser.RE_NUMBER（r"^\s*(\d{1,3})\s*$"）保证一致性
+            from hub.intent.rule_parser import RE_NUMBER
+            if state and state.get("pending_choice") and RE_NUMBER.match(content):
                 try:
                     # 构造一个 select_choice intent 交给既有 _handle_select_choice
-                    from hub.ports import ParsedIntent
                     choice_intent = ParsedIntent(
                         intent_type="select_choice",
                         fields={"choice": int(content)},
@@ -206,6 +213,10 @@ async def handle_inbound(
                     content=content, rule_parser=rule_parser,
                     sender=sender, channel_userid=channel_userid,
                     record=record, parser_context=parser_context,
+                    resolution=resolution,
+                    query_product=query_product_usecase,
+                    query_customer=query_customer_history_usecase,
+                    require_permissions=require_permissions,
                 )
                 return
 
@@ -234,8 +245,21 @@ async def _fallback_to_rule_parser(
     *, content: str, rule_parser,
     sender, channel_userid: str,
     record: dict, parser_context: dict,
+    resolution=None, query_product=None, query_customer=None, require_permissions=None,
 ) -> None:
-    """ChainAgent 未预期异常时降级走 RuleParser。"""
+    """ChainAgent 未预期异常时降级走 RuleParser。
+
+    I1 修复（plan §2982）：rule 命中后直接调 _execute_intent 执行 use case，
+    不再让用户'重发同格式'陷入循环。
+    仅 unknown / low_confidence 时才发"AI 服务暂不可用"友好文案。
+
+    parser_context 在当前 fallback 路径下通常为空（pending 状态都已在 handler 主路径
+    early return 了）；保留参数为未来可能的 RuleParser context-aware 解析预留（M8）。
+
+    注：record["agent_kind"] / record["fallback"] 仅落 SSE live publisher，
+    不写 TaskLog（model 没字段）。Task 13 admin 决策链页面如需展示，
+    应在 Task 13 加 model 字段 + migration（M3）。
+    """
     if rule_parser is None:
         await _send_text(sender, channel_userid, "AI 处理出了点问题，请稍后重试")
         record["final_status"] = "failed_system_final"
@@ -247,20 +271,31 @@ async def _fallback_to_rule_parser(
         await _send_text(sender, channel_userid, "AI 处理出了点问题，请稍后重试")
         record["final_status"] = "failed_system_final"
         return
-    if intent.intent_type == "unknown":
+
+    # unknown / low_confidence → 友好兜底文案
+    if intent.intent_type == "unknown" or getattr(intent, "confidence", 1.0) < 0.5:
         await _send_text(
             sender, channel_userid,
-            "AI 处理出了点问题，请用更明确的方式描述（例：查 SKU50139）",
+            "AI 服务暂不可用，请用更明确的方式描述（例：查 SKU50139）",
         )
         record["final_status"] = "failed_system_final"
         return
-    # rule 命中：简化降级提示（完整实现见 Task 19 端到端验证）
-    await _send_text(
-        sender, channel_userid,
-        "AI 暂时不可用，已降级到规则匹配。请用「查 商品名」格式重发。",
-    )
+
+    # rule 命中 → 直接执行 use case（不再让用户重发）
     record["fallback"] = "rule"
     record["final_status"] = "fallback_to_rule"
+    try:
+        await _execute_intent(
+            intent, channel_userid, sender, resolution,
+            query_product, query_customer, require_permissions,
+        )
+    except BizError as e:
+        await _send_text(sender, channel_userid, str(e))
+        record["final_status"] = "failed_user"
+    except Exception:
+        logger.exception("RuleParser fallback 执行 use case 失败")
+        await _send_text(sender, channel_userid, "AI 服务暂不可用，请稍后重试")
+        record["final_status"] = "failed_system_final"
 
 
 async def _execute_intent(
@@ -339,7 +374,6 @@ async def _execute_confirmed(
     state, channel_userid, sender, conversation_state, resolution,
     query_product, query_customer, require_permissions,
 ):
-    from hub.ports import ParsedIntent
     intent = ParsedIntent(
         intent_type=state["intent_type"],
         fields=state.get("fields", {}),
@@ -351,14 +385,6 @@ async def _execute_confirmed(
         query_product, query_customer, require_permissions,
     )
 
-
-def _summarize_intent(intent) -> str:
-    if intent.intent_type == "query_product":
-        return f"查商品 {intent.fields.get('sku_or_keyword', '')}"
-    if intent.intent_type == "query_customer_history":
-        return (f"查 {intent.fields.get('sku_or_keyword', '')} "
-                f"给客户「{intent.fields.get('customer_keyword', '')}」的历史价")
-    return "未知操作"
 
 
 async def _send_text(sender, userid: str, text: str) -> None:

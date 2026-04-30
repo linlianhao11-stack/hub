@@ -72,6 +72,15 @@ def mock_conversation_state():
     return state
 
 
+@pytest.fixture
+def mock_pending_state_repo():
+    repo = AsyncMock()
+    repo.load = AsyncMock(return_value=None)
+    repo.save = AsyncMock()
+    repo.clear = AsyncMock()
+    return repo
+
+
 # ===== Case 1：RE_CONFIRM 识别多种确认词 =====
 
 def test_re_confirm_matches_all_variants():
@@ -188,18 +197,58 @@ async def test_inbound_error_result_sends_friendly_message(
     assert "AI 响应超时" in sent_text
 
 
-# ===== Case 6：ChainAgent 未预期异常 → 降级 RuleParser =====
+# ===== Case 6：ChainAgent 未预期异常 → 降级 RuleParser（I1 加固）=====
 
 @pytest.mark.asyncio
 async def test_inbound_unhandled_exception_falls_back_to_rule_parser(
     mock_chain_agent, mock_sender, mock_identity, mock_binding, mock_conversation_state,
 ):
-    """ChainAgent.run 抛未预期异常 → 调 rule_parser.parse 降级。"""
+    """I1 加固：ChainAgent.run 抛未预期异常 + rule 命中 → query_product.execute 真执行。
+
+    原测试只断言 rule_parser.parse 被调；I1 修复后 rule 命中要真执行 use case。
+    """
+    mock_chain_agent.run.side_effect = RuntimeError("Redis 崩了")
+
+    mock_rule = AsyncMock()
+    rule_intent = MagicMock()
+    rule_intent.intent_type = "query_product"
+    rule_intent.confidence = 1.0
+    rule_intent.fields = {"sku_or_keyword": "SKU50139"}
+    mock_rule.parse = AsyncMock(return_value=rule_intent)
+
+    mock_query_product = AsyncMock()
+    mock_query_product.execute = AsyncMock(return_value=None)
+
+    payload = _make_payload("查 SKU50139")
+
+    await handle_inbound(
+        payload,
+        binding_service=mock_binding,
+        identity_service=mock_identity,
+        sender=mock_sender,
+        chain_agent=mock_chain_agent,
+        rule_parser=mock_rule,
+        conversation_state=mock_conversation_state,
+        query_product_usecase=mock_query_product,
+        require_permissions=AsyncMock(return_value=None),
+    )
+
+    mock_rule.parse.assert_awaited()
+    # I1 关键断言：rule 命中后 use case 真被执行
+    mock_query_product.execute.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inbound_unhandled_exception_rule_unknown_sends_friendly_message(
+    mock_chain_agent, mock_sender, mock_identity, mock_binding, mock_conversation_state,
+):
+    """I1 补充：ChainAgent 抛错 + rule 返 unknown → 友好兜底文案（不循环）。"""
     mock_chain_agent.run.side_effect = RuntimeError("Redis 崩了")
 
     mock_rule = AsyncMock()
     rule_intent = MagicMock()
     rule_intent.intent_type = "unknown"
+    rule_intent.confidence = 1.0
     mock_rule.parse = AsyncMock(return_value=rule_intent)
 
     payload = _make_payload("查 SKU50139")
@@ -216,6 +265,10 @@ async def test_inbound_unhandled_exception_falls_back_to_rule_parser(
 
     mock_rule.parse.assert_awaited()
     mock_sender.send_text.assert_awaited()
+    sent_text = mock_sender.send_text.call_args.kwargs.get("text") or \
+                mock_sender.send_text.call_args[1].get("text")
+    # 不应出现"请用「查 商品名」格式重发"——这是导致用户循环的旧文案
+    assert "请用「查 商品名」格式重发" not in sent_text
 
 
 # ===== Case 7：ChainAgent 异常且无 rule_parser → 友好兜底文案 =====
@@ -372,3 +425,40 @@ async def test_inbound_unbound_user_does_not_invoke_agent(
 
     mock_chain_agent.run.assert_not_called()
     mock_sender.send_text.assert_awaited()
+
+
+# ===== Case 13：I2 pending_confirm 优先级（不进 ChainAgent）=====
+
+@pytest.mark.asyncio
+async def test_pending_confirm_yes_takes_precedence_over_chain_agent(
+    mock_chain_agent, mock_sender, mock_identity, mock_binding,
+):
+    """v2 加固（review I2）：pending_confirm 状态下用户回'是' → 走 _execute_confirmed，不进 ChainAgent。"""
+    state_data = {
+        "pending_confirm": "yes",
+        "intent_type": "query_product",
+        "fields": {"sku_or_keyword": "SKU1", "customer_keyword": None},
+    }
+    mock_conv_state = AsyncMock()
+    mock_conv_state.load = AsyncMock(return_value=state_data)
+    mock_conv_state.clear = AsyncMock()
+
+    mock_query_product = AsyncMock()
+    mock_query_product.execute = AsyncMock(return_value=None)
+
+    payload = _make_payload("是")
+
+    await handle_inbound(
+        payload,
+        binding_service=mock_binding,
+        identity_service=mock_identity,
+        sender=mock_sender,
+        chain_agent=mock_chain_agent,
+        conversation_state=mock_conv_state,
+        query_product_usecase=mock_query_product,
+        require_permissions=AsyncMock(return_value=None),
+    )
+
+    # 关键断言：pending_confirm 优先 → chain_agent 没被调；query_product 真被执行
+    mock_chain_agent.run.assert_not_called()
+    mock_query_product.execute.assert_awaited()
