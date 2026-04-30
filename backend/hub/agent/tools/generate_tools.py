@@ -11,14 +11,13 @@ import logging
 from datetime import date
 
 from hub.adapters.channel.dingtalk_sender import DingTalkSender, DingTalkSendError
-from hub.adapters.downstream.erp4 import Erp4Adapter
+from hub.adapters.downstream.erp4 import Erp4Adapter, ErpAdapterError, ErpNotFoundError
 from hub.agent.document.contract import (
     ContractRenderer,
     TemplateNotFoundError,
     TemplateRenderError,
 )
 from hub.agent.document.excel import ExcelExporter
-from hub.agent.document.storage import DocumentStorage
 from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import ToolType
 from hub.models.contract import ContractDraft, ContractTemplate
@@ -76,45 +75,68 @@ async def generate_contract_draft(
         template_id: ContractTemplate.id
         customer_id: ERP 客户 ID
         items: [{"product_id", "name", "qty", "price"}]
-        extras: 额外占位符如 contract_no / payment_terms
+        extras: 额外占位符字段（合同号 / 付款条款等）；
+               值类型应为 str/int/float/bool；嵌套 dict/list 可能让模板渲染丢失。
+               注意：extras 字段会出现在 LLM 看到的 schema 中（GENERATE 类不含
+               confirmation_action_id 等内部字段，但其他业务参数全部对 LLM 可见）。
 
     Returns:
         {"draft_id", "file_sent", "file_name"}
+
+    已知运维限制（plan 6 第一版）：send_file 抛 DingTalkSendError 后
+    ContractDraft 已持久化 + 抛错让 worker 重试。worker 重试时会**重新执行整段
+    流程**导致创建第 2 条 ContractDraft —— 用户语义上"我请求 1 次"会得到"DB 多条"。
+    监控运维上需注意：失败重试场景下 ContractDraft 行数 != 用户请求次数。
+    完整幂等待 Plan 6 follow-up 加 (hub_user_id, conversation_id, template_id, ...) 唯一索引。
     """
-    # 1. 拉客户信息（ERP 无 get_customer；用 search_customers 后按 id 过滤）
+    # 1. 拉客户信息（精确 get_customer 避免 keyword 搜索几乎必走 fallback 的问题）
     erp = current_erp_adapter()
-    search_resp = await erp.search_customers(
-        query=str(customer_id),
-        acting_as_user_id=acting_as_user_id,
-    )
-    customers = search_resp.get("items", []) if isinstance(search_resp, dict) else []
-    customer = next(
-        (c for c in customers if c.get("id") == customer_id),
-        None,
-    )
-    if not customer:
-        # fallback：只有 id，人工字段空
+    try:
+        customer = await erp.get_customer(
+            customer_id=customer_id, acting_as_user_id=acting_as_user_id,
+        )
+    except (ErpNotFoundError, ErpAdapterError) as e:
+        logger.warning(
+            "get_customer %s 失败（fallback 用 id 占位）conv=%s err=%s",
+            customer_id, conversation_id, e,
+        )
         customer = {"id": customer_id, "name": f"客户{customer_id}", "address": ""}
 
     # 2. 渲染 docx（可能抛 TemplateNotFoundError / TemplateRenderError）
     renderer = ContractRenderer()
-    docx_bytes = await renderer.render(
-        template_id=template_id,
-        customer=customer,
-        items=items,
-        extras=extras or {},
-    )
+    try:
+        docx_bytes = await renderer.render(
+            template_id=template_id,
+            customer=customer,
+            items=items,
+            extras=extras or {},
+        )
+    except TemplateNotFoundError:
+        logger.warning("合同模板 %s 不存在 conv=%s", template_id, conversation_id)
+        return {
+            "draft_id": None,
+            "file_sent": False,
+            "error": f"合同模板 {template_id} 不存在或未启用，请联系管理员",
+        }
+    except TemplateRenderError as e:
+        logger.exception("合同模板 %s 渲染失败 conv=%s", template_id, conversation_id)
+        return {
+            "draft_id": None,
+            "file_sent": False,
+            "error": f"合同模板渲染失败: {e}（可能是 items 数据缺字段）",
+        }
 
-    # 3. 加密存储 + 持久化 ContractDraft
-    storage = DocumentStorage()
-    await storage.put(docx_bytes, encrypted=True)  # 生产场景写 bytea；第一版不落额外字段
-
+    # 3. 持久化 ContractDraft（metadata 审计用）
+    # 第一版：文件不持久化 bytes（待 Plan 11 admin 后台 + 文件存储真正落地后改）。
+    # 当前流程：渲染 → 直接 send_file 到钉钉 → 钉钉端有完整 docx；
+    # ContractDraft 仅记录 metadata（template_id, items, conversation_id）以便审计。
+    # 加密路径（DocumentStorage）已就绪，等加 ContractDraft.rendered_file_bytes BinaryField 后启用。
     draft = await ContractDraft.create(
         template_id=template_id,
         requester_hub_user_id=hub_user_id,
         customer_id=customer_id,
         items=items,
-        rendered_file_storage_key=str(template_id),  # 简化：用 template_id 作 key
+        rendered_file_storage_key=None,  # 第一版不存文件 bytes
         conversation_id=conversation_id,
     )
 
@@ -122,6 +144,7 @@ async def generate_contract_draft(
     sender = current_sender()
     binding = await ChannelUserBinding.filter(
         hub_user_id=hub_user_id,
+        channel_type="dingtalk",
         status="active",
     ).first()
     if not binding:
@@ -148,6 +171,9 @@ async def generate_contract_draft(
         logger.exception("send_file 失败 draft_id=%s", draft.id)
         raise
 
+    draft.status = "sent"
+    await draft.save(update_fields=["status"])
+
     return {
         "draft_id": draft.id,
         "file_sent": True,
@@ -173,6 +199,10 @@ async def generate_price_quote(
         is_active=True,
     ).first()
     if not template:
+        logger.warning(
+            "用户 hub_user_id=%s 调 generate_price_quote 但无 quote 模板 conv=%s",
+            hub_user_id, conversation_id,
+        )
         return {
             "draft_id": None,
             "file_sent": False,
@@ -213,6 +243,7 @@ async def export_to_excel(
     sender = current_sender()
     binding = await ChannelUserBinding.filter(
         hub_user_id=hub_user_id,
+        channel_type="dingtalk",
         status="active",
     ).first()
     if not binding:

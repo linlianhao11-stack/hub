@@ -2,11 +2,29 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 
 from openpyxl import Workbook
 
 logger = logging.getLogger("hub.agent.document.excel")
+
+
+def _sanitize_cell(v: object) -> object:
+    """openpyxl 单元格值清理：dict/list/tuple/set 转 JSON 字符串；其他原样。"""
+    if v is None:
+        return ""
+    if isinstance(v, (dict, list, tuple, set)):
+        try:
+            return json.dumps(v, ensure_ascii=False, default=str)
+        except Exception:
+            return str(v)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float, str)):
+        return v
+    # 其他类型（datetime / Decimal 等）转 str
+    return str(v)
 
 
 class ExcelExporter:
@@ -55,7 +73,7 @@ class ExcelExporter:
         ws.append(headers)
         for row in table_data:
             if isinstance(row, dict):
-                ws.append([row.get(h, "") for h in headers])
+                ws.append([_sanitize_cell(row.get(h)) for h in headers])
 
         output = io.BytesIO()
         wb.save(output)

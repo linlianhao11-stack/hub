@@ -15,7 +15,8 @@ from __future__ import annotations
 import base64
 import io
 import logging
-from datetime import date, datetime, UTC
+import re
+from datetime import UTC, date, datetime
 
 from docx import Document  # python-docx
 
@@ -33,7 +34,15 @@ class TemplateRenderError(Exception):
 
 
 class ContractRenderer:
-    """合同模板渲染：从 ContractTemplate 加载 docx → 替换占位符 → 返 bytes。"""
+    """合同模板渲染：从 ContractTemplate 加载 docx → 替换占位符 → 返 bytes。
+
+    模板设计规范（Plan 11 admin 上传模板时遵守）：
+    - 占位符 {{xxx}} 必须独立成段落或独立成 cell，不要与其它格式 run 混用
+    - 例：✅ 单独段落 "客户：{{customer_name}}"
+    - 例：❌ 同一段落 "客户：{{customer_name}}（**重要**）" — bold 格式会丢失
+    第一版段落级 + 表格级两级替换；多 run 格式合并问题待 follow-up
+    （需"找连续含 {{ 的 run 串、合并文本、保留首 run 格式"逻辑）。
+    """
 
     async def render(
         self,
@@ -74,6 +83,21 @@ class ContractRenderer:
             ctx = self._build_context(template, customer, items, extras or {})
             self._replace_paragraphs(doc, ctx)
             self._replace_tables(doc, ctx)
+            # 扫描渲染后仍含 {{xxx}} 的占位符（模板 typo 或数据缺字段）
+            unknown_placeholders: set[str] = set()
+            for para in doc.paragraphs:
+                for m in re.finditer(r"\{\{(\w+)\}\}", para.text):
+                    unknown_placeholders.add(m.group(1))
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for m in re.finditer(r"\{\{(\w+)\}\}", cell.text):
+                            unknown_placeholders.add(m.group(1))
+            if unknown_placeholders:
+                logger.warning(
+                    "合同模板 %s 渲染后仍含未知占位符: %s（可能是模板 typo）",
+                    template.id, sorted(unknown_placeholders),
+                )
             output = io.BytesIO()
             doc.save(output)
             return output.getvalue()
@@ -153,10 +177,18 @@ class ContractRenderer:
 
     @staticmethod
     def _replace_tables(doc: Document, ctx: dict) -> None:
-        """表格级 {{items_table}} 占位符 → 展开成多行；其余 cell 内占位符替换。"""
+        """表格级 {{items_table}} 占位符 → 展开成多行；其余 cell 内占位符替换。
+
+        merged cell 防重复处理：python-docx 对 merged cell 会多次返回同一 cell 对象，
+        用 seen 集合按 id() 跳过已处理 cell。
+        """
+        seen: set[int] = set()
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
+                    if id(cell) in seen:
+                        continue
+                    seen.add(id(cell))
                     cell_text = cell.text
                     if "{{items_table}}" in cell_text:
                         items = ctx.get("items") or []

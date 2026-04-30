@@ -14,9 +14,9 @@ import secrets
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from hub.crypto.aes_gcm import DecryptError, NONCE_LENGTH
-from hub.crypto.hkdf import derive_key
 from hub.config import get_settings
+from hub.crypto.aes_gcm import NONCE_LENGTH, DecryptError
+from hub.crypto.hkdf import derive_key
 
 logger = logging.getLogger("hub.agent.document.storage")
 

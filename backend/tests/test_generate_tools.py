@@ -35,9 +35,8 @@ def mock_sender():
     s = MagicMock()
     s.send_file = AsyncMock()
     erp = MagicMock()
-    erp.search_customers = AsyncMock(return_value={"items": [
-        {"id": 100, "name": "测试客户", "address": "上海市"},
-    ]})
+    # I3: 改用精确 get_customer 而非 search_customers keyword 搜索
+    erp.get_customer = AsyncMock(return_value={"id": 100, "name": "测试客户", "address": "上海市"})
     generate_tools.set_dependencies(sender=s, erp=erp)
     yield s
     generate_tools.set_dependencies(sender=None, erp=None)
@@ -49,6 +48,45 @@ SAMPLE_ITEMS = [
 
 
 # ===== ExcelExporter tests =====
+
+async def test_excel_exporter_handles_nested_dict_value():
+    """ExcelExporter：dict 类型 cell 不抛 openpyxl ValueError，转成 JSON 字符串。"""
+    from hub.agent.document.excel import ExcelExporter
+    from openpyxl import load_workbook
+
+    data = [{"名称": "A", "extra": {"nested": "value", "num": 1}}]
+    exporter = ExcelExporter()
+    result = await exporter.export(table_data=data)
+
+    assert result[:2] == b"PK", "应是合法 xlsx"
+    wb = load_workbook(io.BytesIO(result))
+    ws = wb.active
+    # 找 extra 列
+    headers = [ws.cell(1, i + 1).value for i in range(ws.max_column)]
+    extra_col = headers.index("extra") + 1
+    cell_val = ws.cell(2, extra_col).value
+    assert isinstance(cell_val, str), "dict 应被序列化为 str"
+    assert "nested" in cell_val
+
+
+async def test_excel_exporter_handles_list_value():
+    """ExcelExporter：list 类型 cell 不抛 openpyxl ValueError，转成 JSON 字符串。"""
+    from hub.agent.document.excel import ExcelExporter
+    from openpyxl import load_workbook
+
+    data = [{"名称": "B", "tags": ["tag1", "tag2"]}]
+    exporter = ExcelExporter()
+    result = await exporter.export(table_data=data)
+
+    assert result[:2] == b"PK"
+    wb = load_workbook(io.BytesIO(result))
+    ws = wb.active
+    headers = [ws.cell(1, i + 1).value for i in range(ws.max_column)]
+    tags_col = headers.index("tags") + 1
+    cell_val = ws.cell(2, tags_col).value
+    assert isinstance(cell_val, str), "list 应被序列化为 str"
+    assert "tag1" in cell_val
+
 
 async def test_export_to_excel_basic():
     """export_to_excel 生成合法 xlsx（以 PK magic bytes 开头）。"""
@@ -187,6 +225,7 @@ async def test_generate_contract_draft_basic(mock_sender):
     # mock ContractDraft.create → 假 draft
     draft = MagicMock()
     draft.id = 42
+    draft.save = AsyncMock()
 
     # mock binding
     binding = MagicMock()
@@ -197,13 +236,7 @@ async def test_generate_contract_draft_basic(mock_sender):
         patch("hub.agent.document.contract.ContractTemplate") as MockContractTemplate,
         patch("hub.agent.tools.generate_tools.ContractDraft") as MockDraft,
         patch("hub.agent.tools.generate_tools.ChannelUserBinding") as MockBinding,
-        patch("hub.agent.document.storage.get_settings") as mock_settings,
     ):
-        # 让 AES-GCM 可以正常工作（需要 32-byte key）
-        settings = MagicMock()
-        settings.master_key_bytes = bytes(range(32))
-        mock_settings.return_value = settings
-
         # ContractTemplate.filter().first()
         tqs = MagicMock()
         tqs.first = AsyncMock(return_value=template)
@@ -230,28 +263,36 @@ async def test_generate_contract_draft_basic(mock_sender):
     assert result["file_sent"] is True
     assert result["file_name"].endswith(".docx")
     MockDraft.create.assert_awaited_once()
+    # C1 验证：rendered_file_storage_key 传 None
+    create_kwargs = MockDraft.create.call_args.kwargs
+    assert create_kwargs["rendered_file_storage_key"] is None
     mock_sender.send_file.assert_awaited_once()
+    # M4 验证：send_file 成功后 status 推进到 sent
+    draft.save.assert_awaited_once()
 
 
 async def test_generate_contract_draft_template_not_found(mock_sender):
-    """template_id 不存在 → 抛 TemplateNotFoundError。"""
-    from hub.agent.document.contract import TemplateNotFoundError
+    """template_id 不存在 → 返回 file_sent=False + error 字段（I4：转友好返回 dict）。"""
     from hub.agent.tools.generate_tools import generate_contract_draft
 
-    with patch("hub.agent.tools.generate_tools.ContractTemplate") as MockTemplate:
+    with patch("hub.agent.document.contract.ContractTemplate") as MockTemplate:
         tqs = MagicMock()
         tqs.first = AsyncMock(return_value=None)
         MockTemplate.filter.return_value = tqs
 
-        with pytest.raises(TemplateNotFoundError):
-            await generate_contract_draft(
-                template_id=999,
-                customer_id=100,
-                items=SAMPLE_ITEMS,
-                hub_user_id=1,
-                conversation_id="conv-1",
-                acting_as_user_id=1,
-            )
+        result = await generate_contract_draft(
+            template_id=999,
+            customer_id=100,
+            items=SAMPLE_ITEMS,
+            hub_user_id=1,
+            conversation_id="conv-1",
+            acting_as_user_id=1,
+        )
+
+    assert result["file_sent"] is False
+    assert result["draft_id"] is None
+    assert "error" in result
+    assert "999" in result["error"]
 
 
 async def test_generate_contract_draft_no_active_binding(mock_sender):
@@ -271,12 +312,7 @@ async def test_generate_contract_draft_no_active_binding(mock_sender):
         patch("hub.agent.document.contract.ContractTemplate") as MockContractTemplate,
         patch("hub.agent.tools.generate_tools.ContractDraft") as MockDraft,
         patch("hub.agent.tools.generate_tools.ChannelUserBinding") as MockBinding,
-        patch("hub.agent.document.storage.get_settings") as mock_settings,
     ):
-        settings = MagicMock()
-        settings.master_key_bytes = bytes(range(32))
-        mock_settings.return_value = settings
-
         tqs = MagicMock()
         tqs.first = AsyncMock(return_value=template)
         MockContractTemplate.filter.return_value = tqs
@@ -301,6 +337,9 @@ async def test_generate_contract_draft_no_active_binding(mock_sender):
     assert result["draft_id"] == 43  # 草稿已持久化
     MockDraft.create.assert_awaited_once()
     mock_sender.send_file.assert_not_called()
+    # C2 验证：ChannelUserBinding.filter 必须带 channel_type="dingtalk"
+    filter_kwargs = MockBinding.filter.call_args.kwargs
+    assert filter_kwargs.get("channel_type") == "dingtalk"
 
 
 async def test_generate_contract_draft_send_file_failure_propagates(mock_sender):
@@ -326,12 +365,7 @@ async def test_generate_contract_draft_send_file_failure_propagates(mock_sender)
         patch("hub.agent.document.contract.ContractTemplate") as MockContractTemplate,
         patch("hub.agent.tools.generate_tools.ContractDraft") as MockDraft,
         patch("hub.agent.tools.generate_tools.ChannelUserBinding") as MockBinding,
-        patch("hub.agent.document.storage.get_settings") as mock_settings,
     ):
-        settings = MagicMock()
-        settings.master_key_bytes = bytes(range(32))
-        mock_settings.return_value = settings
-
         tqs = MagicMock()
         tqs.first = AsyncMock(return_value=template)
         MockContractTemplate.filter.return_value = tqs
@@ -354,6 +388,59 @@ async def test_generate_contract_draft_send_file_failure_propagates(mock_sender)
 
     # 草稿已创建（在 send_file 之前）
     MockDraft.create.assert_awaited_once()
+
+
+async def test_generate_contract_draft_get_customer_fallback(mock_sender):
+    """I3：get_customer 失败时 fallback 到 id 占位，合同正常生成（不抛异常）。"""
+    from hub.adapters.downstream.erp4 import ErpNotFoundError
+    from hub.agent.tools import generate_tools
+    from hub.agent.tools.generate_tools import generate_contract_draft
+
+    # 覆盖 erp.get_customer 为抛 ErpNotFoundError
+    erp = MagicMock()
+    erp.get_customer = AsyncMock(side_effect=ErpNotFoundError("customer 100 not found"))
+    generate_tools.set_dependencies(sender=generate_tools._dingtalk_sender, erp=erp)
+
+    template = MagicMock()
+    template.id = 1
+    template.is_active = True
+    template.file_storage_key = _make_template_docx_b64()
+    template.placeholders = []
+
+    draft = MagicMock()
+    draft.id = 55
+    draft.save = AsyncMock()
+
+    binding = MagicMock()
+    binding.channel_userid = "ding-u1"
+
+    with (
+        patch("hub.agent.document.contract.ContractTemplate") as MockContractTemplate,
+        patch("hub.agent.tools.generate_tools.ContractDraft") as MockDraft,
+        patch("hub.agent.tools.generate_tools.ChannelUserBinding") as MockBinding,
+    ):
+        tqs = MagicMock()
+        tqs.first = AsyncMock(return_value=template)
+        MockContractTemplate.filter.return_value = tqs
+        MockDraft.create = AsyncMock(return_value=draft)
+        bqs = MagicMock()
+        bqs.first = AsyncMock(return_value=binding)
+        MockBinding.filter.return_value = bqs
+
+        result = await generate_contract_draft(
+            template_id=1,
+            customer_id=100,
+            items=SAMPLE_ITEMS,
+            hub_user_id=1,
+            conversation_id="conv-fallback",
+            acting_as_user_id=1,
+        )
+
+    # fallback 时合同仍能生成
+    assert result["file_sent"] is True
+    assert result["draft_id"] == 55
+    # 恢复 mock_sender erp 注入
+    generate_tools.set_dependencies(sender=generate_tools._dingtalk_sender, erp=None)
 
 
 # ===== generate_price_quote tests =====

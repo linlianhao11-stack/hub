@@ -160,6 +160,12 @@ class Erp4Adapter:
             f"/api/v1/products/{product_id}", acting_as_user_id,
         )
 
+    async def get_customer(self, customer_id: int, *, acting_as_user_id: int | None) -> dict:
+        """ERP `/api/v1/customers/{id}`：单客户详情（精确反查，避免 keyword 搜索误匹配）。"""
+        return await self._act_as_get(
+            f"/api/v1/customers/{customer_id}", acting_as_user_id,
+        )
+
     async def get_product_customer_prices(
         self, product_id: int, customer_id: int, limit: int = 5,
         *, acting_as_user_id: int | None,

@@ -174,6 +174,13 @@ class DingTalkSender:
                     body = r.json()
                     if body.get("errcode") == 0:
                         return body["media_id"]
+                    errcode = body.get("errcode")
+                    # 88 / 40014 = access_token expired；强制失效缓存后重试一次
+                    if errcode in (88, 40014) and attempt < max_retry:
+                        self._token_expires_at = 0.0  # 失效缓存，下次循环重新取 token
+                        token = await self._get_access_token()
+                        last_err = DingTalkSendError(f"token expired errcode={errcode}")
+                        continue
                     raise DingTalkSendError(f"上传失败: {body}")
                 if r.status_code >= 500 and attempt < max_retry:
                     # 5xx：记录错误，继续重试
