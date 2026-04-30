@@ -36,6 +36,9 @@ PERMISSIONS = [
      "允许审批通过的报销/付款自动生成会计凭证（D 阶段启用）"),
     ("usecase.contract_templates.write", "usecase", "contract_templates", "write", "管理合同模板",
      "可以在后台上传、编辑、启用/禁用合同模板"),
+    # v2 加固（review C1）：read 权限独立，方便 viewer 角色查看不修改
+    ("usecase.contract_templates.read", "usecase", "contract_templates", "read", "查看合同模板",
+     "可以查看合同模板列表及占位符，不能上传或修改"),
     # channel.*
     ("channel.dingtalk.use", "channel", "dingtalk", "use", "使用钉钉接入",
      "允许通过钉钉机器人交互"),
@@ -60,7 +63,11 @@ ROLES = {
     "platform_viewer": {
         "name": "只读观察员",
         "description": "只能查看任务记录和操作日志，不能做任何修改",
-        "permissions": ["platform.tasks.read", "platform.audit.read"],
+        "permissions": [
+            "platform.tasks.read", "platform.audit.read",
+            # v2 加固（review C1）：viewer 可查看合同模板但不能修改
+            "usecase.contract_templates.read",
+        ],
     },
     "bot_user_basic": {
         "name": "机器人 - 基础查询",

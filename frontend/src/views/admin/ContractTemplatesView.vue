@@ -1,3 +1,12 @@
+<!--
+  Plan 6 Task 11 admin 合同模板管理页。
+
+  TODO（follow-up）：当前文件行数较多，建议拆成：
+  - ContractTemplateUploadModal.vue（上传逻辑 + 文件输入 + form）
+  - ContractTemplatePlaceholdersModal.vue（占位符列表展示）
+  - ContractTemplateEditModal.vue（编辑元信息）
+  保持本 view 仅做"列表 + 路由 + 模态打开"。
+-->
 <template>
   <div class="hub-page">
     <div class="hub-page__header">
@@ -64,7 +73,7 @@
               <AppButton variant="ghost" size="xs" @click="openPlaceholders(tpl)">占位符</AppButton>
               <AppButton variant="ghost" size="xs" @click="openEdit(tpl)">编辑</AppButton>
               <AppButton
-                :variant="tpl.is_active ? 'ghost' : 'ghost'"
+                variant="ghost"
                 :class="tpl.is_active ? 'action-danger' : 'action-success'"
                 size="xs"
                 @click="toggleActive(tpl)"
