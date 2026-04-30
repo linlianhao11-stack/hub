@@ -52,7 +52,7 @@ async def log_tool_call(
                 conversation_id=conversation_id,
                 round_idx=round_idx,
                 tool_name=tool_name,
-                args_json=_truncate_for_log(args, max_size_kb=10),  # M1: args 同样截断，防止超大 JSONB
+                args_json=truncate_for_log(args, max_size_kb=10),  # M1: args 同样截断，防止超大 JSONB
                 result_json=ctx._result,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 error=ctx._error,
@@ -73,10 +73,10 @@ class _ToolCallContext:
 
     def set_result(self, result: object) -> None:
         """设置 tool 调用结果，超过 10KB 自动截断。"""
-        self._result = _truncate_for_log(result, max_size_kb=10)
+        self._result = truncate_for_log(result, max_size_kb=10)
 
 
-def _truncate_for_log(value: object, max_size_kb: int = 10) -> object:
+def truncate_for_log(value: object, max_size_kb: int = 10) -> object:
     """截断大 JSON，防止 JSONB 写入过大。
 
     策略：
@@ -91,7 +91,7 @@ def _truncate_for_log(value: object, max_size_kb: int = 10) -> object:
 
     边界：单 key value 太大时（>max_size_kb），返回值仅含 schema 提示，实际数据不保留。
     例如当字典中某个 value 本身就超限时：
-        >>> _truncate_for_log({"data": "x" * 20000})
+        >>> truncate_for_log({"data": "x" * 20000})
         {"_truncated": True, "_original_keys": ["data"]}
     调用方须注意：此时只能知道原来有哪些 key，具体内容不在日志中。
     """

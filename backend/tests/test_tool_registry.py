@@ -19,6 +19,7 @@ from hub.agent.tools.types import (
     MissingConfirmationError,
     ClaimFailedError,
     ToolArgsValidationError,
+    ToolRegistrationError,
 )
 from hub.error_codes import BizError
 
@@ -593,7 +594,7 @@ async def test_write_tool_must_declare_action_id_param_at_register_time(reg):
         return {"id": 1}
 
     # 关键：注册时就 raise，不等到 call
-    with pytest.raises(RuntimeError, match="confirmation_action_id"):
+    with pytest.raises(ToolRegistrationError, match="confirmation_action_id"):
         reg.register("create_voucher_draft", bad_write_fn,
                      perm="usecase.create_voucher.use",
                      tool_type=ToolType.WRITE_DRAFT, description="创建凭证草稿")
@@ -696,7 +697,7 @@ async def test_register_validates_signature(reg):
     async def erp_fn_bad(amount: int) -> dict:
         return {}
 
-    with pytest.raises(RuntimeError, match="confirmation_action_id"):
+    with pytest.raises(ToolRegistrationError, match="confirmation_action_id"):
         reg.register("erp_op", erp_fn_bad,
                      perm="usecase.erp.use",
                      tool_type=ToolType.WRITE_ERP, description="ERP 写操作")
@@ -733,6 +734,23 @@ async def test_call_validates_args_against_schema(reg):
                                  hub_user_id=1, acting_as=2,
                                  conversation_id="c1", round_idx=1)
         assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_call_rejects_extra_args_when_strict(reg):
+    """v11 round 2 I-4：jsonschema strict mode 拦截 LLM 塞额外字段（如试图越权字段）。"""
+    async def fn(query: str) -> list:
+        return []
+
+    reg.register("search", fn,
+                 perm="usecase.query_product.use",
+                 tool_type=ToolType.READ, description="搜索")
+
+    with patch("hub.agent.tools.registry.require_permissions", AsyncMock(return_value=None)):
+        with pytest.raises(ToolArgsValidationError):
+            await reg.call("search", {"query": "X", "evil_extra_field": 999},
+                           hub_user_id=1, acting_as=2,
+                           conversation_id="c1", round_idx=0)
 
 
 @pytest.mark.asyncio

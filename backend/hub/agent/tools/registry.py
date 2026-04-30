@@ -10,7 +10,7 @@ from hub.observability.tool_logger import log_tool_call
 from hub.agent.tools.types import (
     ToolType, ToolDef,
     UnconfirmedWriteToolError, MissingConfirmationError, ClaimFailedError,
-    ToolNotFoundError, ToolArgsValidationError,
+    ToolNotFoundError, ToolArgsValidationError, ToolRegistrationError,
 )
 from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.agent.tools.entity_extractor import EntityExtractor
@@ -45,7 +45,7 @@ class ToolRegistry:
         # ✱ register-time 硬校验：写类 tool 必须声明 confirmation_action_id（v9 round 2 P1-#1）
         if tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP):
             if "confirmation_action_id" not in sig.parameters:
-                raise RuntimeError(
+                raise ToolRegistrationError(
                     f"写类 tool '{name}' 必须在函数签名声明 confirmation_action_id: str 参数，"
                     "且实现内部用它做幂等查询/唯一约束。"
                     "ToolRegistry.restore_action 依赖这一点保证失败重试不重复副作用。"
@@ -91,7 +91,12 @@ class ToolRegistry:
             properties[pname] = {"type": self._py_to_json_type(ptype)}
             if param.default == inspect.Parameter.empty:
                 required.append(pname)
-        return {"type": "object", "properties": properties, "required": required}
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,  # v11 round 2 I-4：strict mode 防 LLM 塞垃圾字段
+        }
 
     def _py_to_json_type(self, t):
         """Python type → OpenAI function schema type。"""
@@ -260,10 +265,21 @@ class ToolRegistry:
             raise ToolArgsValidationError(str(e)) from e
 
     async def _log_blocked_call(self, conversation_id, round_idx, name, args, *, reason):
-        """拦截掉的 tool call 也写一条 tool_call_log（error 字段标 reason）。"""
-        from hub.models.conversation import ToolCallLog
-        await ToolCallLog.create(
-            conversation_id=conversation_id, round_idx=round_idx,
-            tool_name=name, args_json=args,
-            error=f"blocked: {reason}",
-        )
+        """拦截掉的 tool call 也写一条 tool_call_log（error 字段标 reason）。
+
+        可观测性不阻塞业务：DB 写入失败仅记 logger.exception，不向上抛（review v11 round 2 I-1）。
+        """
+        try:
+            from hub.models.conversation import ToolCallLog
+            from hub.observability.tool_logger import truncate_for_log
+            await ToolCallLog.create(
+                conversation_id=conversation_id, round_idx=round_idx,
+                tool_name=name, args_json=truncate_for_log(args, max_size_kb=10),
+                error=f"blocked: {reason}",
+            )
+        except Exception:
+            logger.exception(
+                "_log_blocked_call 写入失败（不阻塞业务）"
+                " conv=%s tool=%s reason=%s",
+                conversation_id, name, reason,
+            )

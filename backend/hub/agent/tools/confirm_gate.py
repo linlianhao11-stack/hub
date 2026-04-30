@@ -200,7 +200,7 @@ class ConfirmGate:
         confirmed_raw = result[0] if isinstance(result[0], str) else result[0].decode()
         pending_raw_or_false = result[1] if len(result) > 1 else False
         pending_raw: str | None = None
-        if pending_raw_or_false and pending_raw_or_false is not False:
+        if pending_raw_or_false:
             pending_raw = (
                 pending_raw_or_false if isinstance(pending_raw_or_false, str)
                 else pending_raw_or_false.decode()

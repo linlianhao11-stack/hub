@@ -27,9 +27,11 @@ class EntityExtractor:
                 elif key == "product_id" and isinstance(val, int):
                     refs.product_ids.add(val)
                 elif key == "id" and "customer" in str(node.get("type", "")).lower():
-                    refs.customer_ids.add(val) if isinstance(val, int) else None
+                    if isinstance(val, int):
+                        refs.customer_ids.add(val)
                 elif key == "id" and "product" in str(node.get("type", "")).lower():
-                    refs.product_ids.add(val) if isinstance(val, int) else None
+                    if isinstance(val, int):
+                        refs.product_ids.add(val)
                 else:
                     self._walk(val, refs)
         elif isinstance(node, list):

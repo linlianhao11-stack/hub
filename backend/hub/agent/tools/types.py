@@ -42,3 +42,7 @@ class ClaimFailedError(UnconfirmedWriteToolError):
 
 class ToolNotFoundError(Exception): ...
 class ToolArgsValidationError(Exception): ...
+
+
+class ToolRegistrationError(Exception):
+    """tool 注册时签名 / 类型校验失败（如写类 tool 漏声明 confirmation_action_id）。"""

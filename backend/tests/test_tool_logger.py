@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from hub.models.conversation import ConversationLog, ToolCallLog
-from hub.observability.tool_logger import log_tool_call, _truncate_for_log
+from hub.observability.tool_logger import log_tool_call, truncate_for_log
 
 
 async def _make_conversation(conversation_id: str = "conv-test") -> ConversationLog:
