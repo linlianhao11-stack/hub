@@ -21,9 +21,9 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
         -- ─── conversation_log ─────────────────────────────────────────────
         CREATE TABLE IF NOT EXISTS "conversation_log" (
             "id"               BIGSERIAL NOT NULL PRIMARY KEY,
-            "conversation_id"  TEXT NOT NULL UNIQUE,
+            "conversation_id"  VARCHAR(200) NOT NULL UNIQUE,
             "hub_user_id"      INT,
-            "channel_userid"   TEXT NOT NULL,
+            "channel_userid"   VARCHAR(200) NOT NULL,
             "started_at"       TIMESTAMPTZ NOT NULL,
             "ended_at"         TIMESTAMPTZ,
             "rounds_count"     INT NOT NULL DEFAULT 0,
@@ -40,7 +40,7 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
         -- conversation_id 无 FK 约束，支持孤立写入（观测不阻塞业务）
         CREATE TABLE IF NOT EXISTS "tool_call_log" (
             "id"              BIGSERIAL NOT NULL PRIMARY KEY,
-            "conversation_id" TEXT NOT NULL,
+            "conversation_id" VARCHAR(200) NOT NULL,
             "round_idx"       INT NOT NULL,
             "tool_name"       TEXT NOT NULL,
             "args_json"       JSONB,
@@ -102,7 +102,7 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
             "items"                    JSONB NOT NULL,
             "rendered_file_storage_key" TEXT,
             "status"                   TEXT NOT NULL DEFAULT 'generated',
-            "conversation_id"          TEXT,
+            "conversation_id"          VARCHAR(200),
             "created_at"               TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         COMMENT ON TABLE "contract_draft" IS 'Agent 生成的合同草稿（不需审批流）。';
@@ -121,7 +121,7 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
             "approved_at"             TIMESTAMPTZ,
             "rejection_reason"        TEXT,
             "erp_voucher_id"          INT,
-            "conversation_id"         TEXT,
+            "conversation_id"         VARCHAR(200),
             "confirmation_action_id"  VARCHAR(64),
             "created_at"              TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
@@ -148,7 +148,7 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
             "approved_by_hub_user_id" INT,
             "approved_at"             TIMESTAMPTZ,
             "rejection_reason"        TEXT,
-            "conversation_id"         TEXT,
+            "conversation_id"         VARCHAR(200),
             "confirmation_action_id"  VARCHAR(64),
             "created_at"              TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
@@ -173,7 +173,7 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
             "approved_by_hub_user_id" INT,
             "approved_at"             TIMESTAMPTZ,
             "rejection_reason"        TEXT,
-            "conversation_id"         TEXT,
+            "conversation_id"         VARCHAR(200),
             "confirmation_action_id"  VARCHAR(64),
             "created_at"              TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );

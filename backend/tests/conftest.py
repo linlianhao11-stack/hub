@@ -77,6 +77,33 @@ async def setup_db():
     except Exception:
         pass  # 索引可能已存在或表还没建
 
+    # Plan 6 Task 1：generate_schemas(safe=True) 不会同步迁移里加的 CHECK 约束
+    # 和部分唯一索引；这里手工补齐让测试 DB 跟生产 DB 行为一致
+    try:
+        await _conn.execute_query(
+            "ALTER TABLE voucher_draft ADD CONSTRAINT chk_voucher_draft_status "
+            "CHECK (status IN ('pending','creating','created','approved','rejected'))"
+        )
+    except Exception:
+        pass  # 已存在则忽略
+
+    # 三张写草稿表的部分唯一索引
+    for _stmt in (
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_voucher_draft_action_id_unique '
+        'ON voucher_draft (requester_hub_user_id, confirmation_action_id) '
+        'WHERE confirmation_action_id IS NOT NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_price_adj_action_id_unique '
+        'ON price_adjustment_request (requester_hub_user_id, confirmation_action_id) '
+        'WHERE confirmation_action_id IS NOT NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_adj_action_id_unique '
+        'ON stock_adjustment_request (requester_hub_user_id, confirmation_action_id) '
+        'WHERE confirmation_action_id IS NOT NULL',
+    ):
+        try:
+            await _conn.execute_query(_stmt)
+        except Exception:
+            pass
+
     from tortoise import connections
     conn = connections.get("default")
     for table in TABLES_TO_TRUNCATE:

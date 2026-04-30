@@ -100,7 +100,9 @@ def _truncate_for_log(value: object, max_size_kb: int = 10) -> object:
         return str(value)[:max_bytes]
 
     if len(serialized.encode("utf-8")) <= max_bytes:
-        return value  # 未超限，原样返回
+        # v1 加固：把 Decimal / datetime / set / bytes 等非 JSON 原生类型预转 str，
+        # 避免 JSONField 写库时抛 TypeError 后被 try/except 静默吞日志
+        return json.loads(serialized)
 
     # 超限截断
     if isinstance(value, dict):
@@ -112,7 +114,7 @@ def _truncate_for_log(value: object, max_size_kb: int = 10) -> object:
             if len(json.dumps(candidate, ensure_ascii=False, default=str).encode("utf-8")) > max_bytes:
                 break
             truncated[k] = v
-        return truncated
+        return json.loads(json.dumps(truncated, ensure_ascii=False, default=str))
 
     if isinstance(value, list):
         # 逐个追加元素，直到超限
@@ -123,7 +125,8 @@ def _truncate_for_log(value: object, max_size_kb: int = 10) -> object:
             if len(candidate_json.encode("utf-8")) > max_bytes:
                 break
             result_list.append(item)
-        return {"_truncated": True, "items": result_list, "_original_count": len(value)}
+        out = {"_truncated": True, "items": result_list, "_original_count": len(value)}
+        return json.loads(json.dumps(out, ensure_ascii=False, default=str))
 
     # 其他类型：str 截断
     return serialized[:max_bytes]

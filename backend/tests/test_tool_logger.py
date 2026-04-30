@@ -162,3 +162,38 @@ async def test_concurrent_tool_calls_write_independent_rows():
     for row in rows:
         assert row.error is None
         assert row.duration_ms is not None
+
+
+# ─── Case 6: Decimal/datetime 不被静默吞日志 ─────────────────────────────────
+@pytest.mark.asyncio
+async def test_truncate_handles_decimal_and_datetime():
+    """v1 加固：result 含 Decimal/datetime 不应让 tool_call_log 静默丢失。"""
+    from decimal import Decimal
+    from datetime import datetime, UTC
+
+    conv_id = "test-decimal-conv"
+    # 不建父 ConversationLog，验 FK 不存在仍写入
+
+    erp_like_result = {
+        "order_id": 12345,
+        "amount": Decimal("100.50"),
+        "created_at": datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        "items": [
+            {"sku": "X1", "price": Decimal("9.99")},
+            {"sku": "X2", "price": Decimal("19.99")},
+        ],
+    }
+
+    async with log_tool_call(
+        conversation_id=conv_id, round_idx=0,
+        tool_name="search_orders", args={},
+    ) as ctx:
+        ctx.set_result(erp_like_result)
+
+    # 关键：必须真写入了一行（不是 ToolCallLog.create 抛 TypeError 被吞掉）
+    rows = await ToolCallLog.filter(conversation_id=conv_id).all()
+    assert len(rows) == 1
+    # result_json 里的 Decimal/datetime 都应转成 str
+    assert rows[0].result_json["amount"] == "100.50"
+    assert "2026-01-01" in rows[0].result_json["created_at"]
+    assert rows[0].result_json["items"][0]["price"] == "9.99"
