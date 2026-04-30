@@ -148,35 +148,79 @@ class ToolRegistry:
 
     async def call(self, name, args, *, hub_user_id: int, acting_as: int,
                    conversation_id: str, round_idx: int) -> Any:
-        """统一入口：写操作硬门禁 → require_permissions → 调 fn → 记 tool_call_log。"""
+        """统一入口：require_permissions + schema → claim_action（写类）→ 调 fn → 失败 restore。"""
         tool = self._tools[name]
 
-        # ❗ 写类 tool 硬门禁：必须带有效 confirmation_token
-        if tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP):
-            token = args.pop("confirmation_token", None)  # 从 args 取出（不传给 fn）
-            if not await self._is_confirmed(conversation_id, name, args, token):
+        # 写类 tool：先取出 confirmation_action_id + confirmation_token（schema 不暴露这俩）
+        is_write = tool.tool_type in (ToolType.WRITE_DRAFT, ToolType.WRITE_ERP)
+        action_id, token = None, None
+        if is_write:
+            action_id = args.pop("confirmation_action_id", None)
+            token = args.pop("confirmation_token", None)
+
+        # ❶ 权限 + schema 校验（**移到 claim 前**，stateless；失败不消费 confirmed token）
+        await require_permissions(hub_user_id, [tool.perm])
+        self._validate_args(args, tool.schema)
+
+        # ❷ 写类 tool 硬门禁：原子 claim（Redis Lua HGET+HDEL 同时跨 confirmed_hash 和 pending_hash）
+        bundle = None
+        if is_write:
+            bundle = await self.confirm_gate.claim_action(
+                conversation_id, hub_user_id, action_id, token, name, args,
+            )
+            if bundle is None:
                 raise UnconfirmedWriteToolError(
-                    f"写类 tool '{name}' 必须先经用户确认。"
-                    "请用 text 把操作预览发给用户，待用户回'是'后由 agent 重新发起带 token 的调用。"
+                    f"写类 tool '{name}' 未确认 / token 错 / args 篡改 / 已被并发领取。"
                 )
-        # ... require_permissions / call fn / log
+
+        # ❸ 调 fn；失败 → restore_action（confirmed + pending 都还回去）；成功路径无需 cleanup
+        try:
+            return await tool.fn(**args, ...)
+        except Exception:
+            if is_write and bundle:
+                await self.confirm_gate.restore_action(
+                    conversation_id, hub_user_id, action_id, bundle,
+                )
+            raise
 ```
 
-**confirmation_token 协议**：
+**confirmation 协议（v6 round 2 加固版）**：
 
-`token = sha256(conversation_id + ":" + tool_name + ":" + canonical_json(args))`
+`token = sha256(conversation_id : hub_user_id : action_id : tool_name : canonical_json(args))`
 
-- 第一次 LLM 调写 tool 不带 token → `UnconfirmedWriteToolError` 抛 LLM；
-- ChainAgent 把 error 注入 message → LLM 改用 text 给用户发预览；
-- 用户回 "是"/"确认" → ChainAgent 算出待确认动作的 token 写 Redis（`hub:agent:confirmed:<conversation_id>` SET，TTL 30min）+ 在下一轮 system message 中告知 LLM "用户已确认，token=<x>，请重试调用并带上这个 token"；
-- LLM 第二次调用带正确 token → ToolRegistry `_is_confirmed` 命中 Redis → 通过；
-- args 任何变化 → token 不同 → 必须重新确认（防"用户确认了 ¥1000，LLM 偷偷改成 ¥10000"攻击）。
+LLM 调写类 tool 必须**同时传 `confirmation_action_id` 和 `confirmation_token` 两个字段**（schema 都排除，只通过 ChainAgent 的 system hint 传递）。
+
+**生命周期**：
+
+| 步骤 | 动作 | 存储变化 |
+|---|---|---|
+| 1 | LLM 第一次调写 tool（无 action_id/token）→ ToolRegistry.call **claim_action 返 None** → `UnconfirmedWriteToolError` 抛上去 | `pending_hash[action_id] = {tool_name, args}`（ChainAgent 写）|
+| 2 | ChainAgent 把 error 翻成"先发 text 预览给用户"指令；LLM 改用 text 输出预览 | 同上 |
+| 3 | 用户回 "是" / "确认" → ChainAgent 调 `confirm_all_pending` → 把 `pending_hash` 中所有 action 对应写一份到 `confirmed_hash[action_id] = {token, ...}` | 两 hash 都有 |
+| 4 | ChainAgent system hint："已确认 N 项，每项调用必须同时传 `confirmation_action_id=<a>` 和 `confirmation_token=<t>`，每对只能用一次" | 同上 |
+| 5 | LLM 重新调用带 (action_id, token) → ToolRegistry `claim_action` Lua 脚本**原子 HGET+HDEL** confirmed[action_id] **同时** HDEL pending[action_id] → 校验 token/tool/args 一致 → 返 bundle | 两 hash 都已删除（持久终态） |
+| 6a | tool.fn 成功 → 直接返结果（无任何 cleanup 需要；claim 已是终态）| 无变化 |
+| 6b | tool.fn 抛错 → ToolRegistry 调 `restore_action`（Lua 原子还回 confirmed + pending）| 两 hash 都还原；用户/重试可同 token 再来 |
+
+**关键不变量**：
+1. **真正抗并发**：claim 是 Redis Lua 原子；asyncio.gather N 个同 token 调用，只有 1 个拿到 bundle 进 tool.fn（review v6 P1）
+2. **失败不消费 token**：权限/schema 校验在 claim 前；失败时 confirmed 状态完全不动（review v6 round 2 P1-#1）
+3. **持久终态**：claim 时 confirmed + pending **同时**删除；写 tool 成功后无需任何 Redis cleanup（避免 remove_pending 失败导致重复执行；review v6 round 2 P1-#2）
+4. **args/action_id 防篡改**：claim 内三重一致性校验（token + tool_name + args），任一不一致原子 restore + 拒绝
+5. **同 args 多 pending 不撞**：token 含 action_id；LLM 单 round 调 12 张凭证，12 个独立 token 互不影响
 
 测试覆盖（必须）：
-- 未带 token 调写 tool → 拦截
-- 错 token 调写 tool → 拦截
-- 正确 token + args 变化 → 拦截
-- 正确 token + args 一致 → 通过
+- 未带 (action_id, token) 调写 tool → 拦截
+- 错 token / 错 action_id / args 篡改 → 拦截 + restore（其他合法调用方仍可用）
+- 正确 (action_id, token) → 通过 + claim 原子删两个 hash
+- 同 (action_id, token) 第二次调用 → 拦截（已被消费）
+- asyncio.gather 5 个并发同 token → 只 1 个 tool.fn 跑（写副作用不重复）
+- tool.fn 抛错 → 用同 (action_id, token) 重试可成功（restore 起效）
+- 单 round 同 tool 同 args 多 pending → 各自独立 token 不冲突
+- 跨 action 复用 token（拿 a.token 配 b.action_id）→ 拦截
+- **权限校验失败 → confirmed token 不被消费（修复 v6 P1-#1）**
+- **schema 校验失败 → confirmed token 不被消费**
+- **claim 成功后用户再回'是'不会重 mark 同 action（pending 已被原子删除；修复 v6 P1-#2）**
 
 第一版注册的 tool（档 3）：
 
@@ -824,7 +868,14 @@ bot_user_finance       → 加 create_voucher.use（已有）+ adjust_stock.use
 ### 8.4 防 LLM 幻觉
 
 - **tool 参数严格 schema**：所有 ID 字段（customer_id / product_id / amount）schema 标 type+required+min/max；LLM 输出非法值 → call() 直接拒绝
-- **写操作前强制 confirm（前置硬门禁）**：见 §3.1 — ToolRegistry 在 call() 入口对 WRITE_DRAFT/WRITE_ERP 类 tool 强制要求 `confirmation_token`（Redis 已确认动作的 sha256），未确认或 token 不匹配 args 直接抛 `UnconfirmedWriteToolError`，**不依赖 LLM 自觉**。LLM 看到 error 自然走"先用 text 预览给用户"路径
+- **写操作前强制 confirm（前置硬门禁，v6 round 2 加固版）**：见 §3.1 — ToolRegistry.call 对 WRITE_DRAFT / WRITE_ERP 类 tool 强制走 `claim_action` 原子领取流程：
+    - LLM 必须**同时传 `confirmation_action_id` + `confirmation_token`** 两个字段
+    - token = `sha256(conv_id : hub_user_id : action_id : tool_name : canonical_json(args))`
+    - claim 是 Redis Lua HGET+HDEL 原子操作，**同时跨 confirmed_hash 和 pending_hash**：成功路径直接是持久终态
+    - 三重一致性校验（token + tool_name + args）：任一不一致 → 原子 restore + 拒绝（不污染合法调用方）
+    - 失败 restore 也是原子 Lua（confirmed 和 pending 都还回去）
+    - 权限校验 / schema 校验**移到 claim 之前**（v6 round 2 P1-#1）：失败时不消费 confirmed token
+    - **不依赖 LLM 自觉**；asyncio.gather 并发同 token 也只能跑 1 次 tool.fn
 - **金额硬上限**：单凭证金额上限 ¥1M（system_config 可调），超限 agent 直接拒绝创建
 - **客户/产品 ID 必须从 search_* 结果引用**：不能 LLM 自己编 ID — 如果 LLM 把没出现在过去 tool result 的 customer_id 传进来，记 warning 但仍由 ERP 端 404 兜底（HUB 端不做白名单校验，因为分页/上下文裁剪后旧 result 可能丢）
 
@@ -1003,9 +1054,15 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 
 ---
 
-**Spec 结束（v4）**
+**Spec 结束（v5）**
 
 > v4 改动（同步 plan 第三轮 review 6 条修复）：
 > - §4.2 凭证审批场景改为两阶段提交 + 幂等键 + creating 5 min 租约恢复语义
 > - §5.4 voucher_draft 加 creating_started_at 字段 + status 五值（含 creating）+ idx_creating_lease 索引
 > - §14.2 把 ERP voucher 从"已有可直接复用"挪到"需要修改"，明确 client_request_id 字段为 Plan 6 强阻塞依赖
+>
+> v5 改动（同步 plan v6/v7 review 第五-六轮 confirmation 链路加固）：
+> - §3.1 confirmation 协议从"单 token + SET + sha256(conv:user:tool:args)"改为"action_id+token 双字段 + hash {action_id: data} + sha256(conv:user:**action_id**:tool:args) + Redis Lua 原子 claim_action（同时跨 confirmed_hash 和 pending_hash）+ restore_action 失败还原"
+> - §3.1 ToolRegistry.call 顺序明确：require_permissions + schema 校验**移到 claim 前**（失败不消费 confirmed token）
+> - §3.1 测试覆盖列表扩到 11 项（含权限失败不消费 token / schema 失败不消费 token / claim 原子删 pending 防重复 confirm 等 v6 round 2 加固项）
+> - §8.4 防 LLM 幻觉描述同步 v6 round 2 加固版（claim_action / restore_action / 三重一致性校验 / 权限+schema 前置）
