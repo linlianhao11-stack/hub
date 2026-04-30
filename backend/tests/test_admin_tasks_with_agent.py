@@ -332,3 +332,64 @@ async def test_task_detail_tool_call_with_error(admin_client):
     assert tc["tool_name"] == "query_erp"
     assert tc["error"] == "ERP timeout after 5000ms"
     assert tc["duration_ms"] == 5000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Case 9-11: 时间窗口边界精确测试（M2 review）
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_task_detail_time_window_boundary_inside(admin_client):
+    """29 秒内 → 匹配。"""
+    ac, _ = admin_client
+    now = datetime.now(UTC)
+    await TaskLog.create(
+        task_id="task-29s", channel_userid="dingtalk:UB",
+        task_type="dingtalk_inbound", channel_type="dingtalk",
+        status="success", created_at=now,
+    )
+    await ConversationLog.create(
+        conversation_id="conv-29s", channel_userid="dingtalk:UB",
+        started_at=now + timedelta(seconds=29),
+        rounds_count=1, tokens_used=100,
+    )
+    resp = await ac.get("/hub/v1/admin/tasks/task-29s")
+    assert resp.json()["conversation_log"] is not None
+
+
+@pytest.mark.asyncio
+async def test_task_detail_time_window_boundary_exact(admin_client):
+    """恰好 30 秒（__lte 闭区间）→ 匹配。"""
+    ac, _ = admin_client
+    now = datetime.now(UTC)
+    await TaskLog.create(
+        task_id="task-30s", channel_userid="dingtalk:UC",
+        task_type="dingtalk_inbound", channel_type="dingtalk",
+        status="success", created_at=now,
+    )
+    await ConversationLog.create(
+        conversation_id="conv-30s", channel_userid="dingtalk:UC",
+        started_at=now + timedelta(seconds=30),
+        rounds_count=1, tokens_used=100,
+    )
+    resp = await ac.get("/hub/v1/admin/tasks/task-30s")
+    assert resp.json()["conversation_log"] is not None
+
+
+@pytest.mark.asyncio
+async def test_task_detail_time_window_boundary_outside(admin_client):
+    """31 秒 → 不匹配（超出 ±30s 窗口）。"""
+    ac, _ = admin_client
+    now = datetime.now(UTC)
+    await TaskLog.create(
+        task_id="task-31s", channel_userid="dingtalk:UD",
+        task_type="dingtalk_inbound", channel_type="dingtalk",
+        status="success", created_at=now,
+    )
+    await ConversationLog.create(
+        conversation_id="conv-31s", channel_userid="dingtalk:UD",
+        started_at=now + timedelta(seconds=31),
+        rounds_count=1, tokens_used=100,
+    )
+    resp = await ac.get("/hub/v1/admin/tasks/task-31s")
+    assert resp.json()["conversation_log"] is None

@@ -80,6 +80,11 @@ async def get_task_detail(request: Request, task_id: str):
     """获取 task 详情（含 payload）→ 触发 meta_audit_log。
 
     payload 30 天 TTL：超期直接返 None 不解密；进入详情才写 meta 审计。
+
+    已知限制（Plan 6 Task 13 第一版）：
+    多轮对话只能匹配首轮 task；后续轮次因 ConversationLog.started_at 锚定首轮，
+    落出 ±30s 窗口 → 关联失败。长期修复方向：ConversationLog 加 turn_idx 字段，
+    或在 TaskLog 直接加 conversation_id 字段精确关联。
     """
     task = await TaskLog.filter(task_id=task_id).first()
     if task is None:

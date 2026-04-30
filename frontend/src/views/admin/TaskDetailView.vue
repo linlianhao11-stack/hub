@@ -54,79 +54,12 @@
         </template>
       </section>
 
-      <!-- Plan 6 Task 13：Agent 决策链（仅当 conversation_log 非空时显示）-->
-      <section v-if="detail.conversation_log" class="hub-detail__card">
-        <h3 class="hub-detail__title">Agent 决策链</h3>
-
-        <!-- 汇总指标 -->
-        <div class="hub-agent__summary">
-          <div class="hub-agent__summary-item">
-            <span class="hub-agent__summary-label">LLM 轮数</span>
-            <span class="hub-agent__summary-value std-num">{{ detail.conversation_log.rounds_count ?? 0 }}</span>
-          </div>
-          <div class="hub-agent__summary-item">
-            <span class="hub-agent__summary-label">Token 用量</span>
-            <span class="hub-agent__summary-value std-num">{{ formatNumber(detail.conversation_log.tokens_used) }}</span>
-          </div>
-          <div class="hub-agent__summary-item">
-            <span class="hub-agent__summary-label">估算成本</span>
-            <span class="hub-agent__summary-value std-num">
-              {{ detail.conversation_log.tokens_cost_yuan != null
-                  ? '¥' + formatCost(detail.conversation_log.tokens_cost_yuan)
-                  : '-' }}
-            </span>
-          </div>
-          <div class="hub-agent__summary-item">
-            <span class="hub-agent__summary-label">状态</span>
-            <AppBadge :variant="conversationStatusVariant(detail.conversation_log.final_status)">
-              {{ conversationStatusLabel(detail.conversation_log.final_status) }}
-            </AppBadge>
-          </div>
-        </div>
-
-        <!-- 对话错误摘要 -->
-        <div v-if="detail.conversation_log.error_summary" class="hub-detail__error">
-          <span>错误：</span>{{ detail.conversation_log.error_summary }}
-        </div>
-
-        <!-- 工具调用时间线 -->
-        <template v-if="detail.tool_calls && detail.tool_calls.length > 0">
-          <div class="hub-agent__tool-header">
-            工具调用（{{ detail.tool_calls.length }} 次）
-          </div>
-          <div
-            v-for="tc in detail.tool_calls"
-            :key="tc.id"
-            class="hub-agent__tool-item"
-          >
-            <div class="hub-agent__tool-row">
-              <span class="hub-agent__round-tag">Round {{ tc.round_idx }}</span>
-              <strong class="hub-agent__tool-name">{{ tc.tool_name }}</strong>
-              <span class="hub-agent__duration">{{ tc.duration_ms != null ? tc.duration_ms + ' ms' : '-' }}</span>
-              <AppBadge v-if="tc.error" variant="error">失败</AppBadge>
-              <AppBadge v-else variant="success">成功</AppBadge>
-            </div>
-            <details class="hub-agent__tool-detail">
-              <summary class="hub-agent__tool-summary">展开 args / result</summary>
-              <div class="hub-agent__kv">
-                <span class="hub-agent__kv-label">args:</span>
-                <pre class="hub-detail__pre">{{ JSON.stringify(tc.args_json, null, 2) }}</pre>
-              </div>
-              <div class="hub-agent__kv">
-                <span class="hub-agent__kv-label">result:</span>
-                <pre class="hub-detail__pre">{{ tc.result_json != null ? JSON.stringify(tc.result_json, null, 2) : '(无)' }}</pre>
-              </div>
-              <div v-if="tc.error" class="hub-agent__kv hub-agent__kv--error">
-                <span class="hub-agent__kv-label">error:</span>
-                <pre class="hub-detail__pre hub-detail__pre--error">{{ tc.error }}</pre>
-              </div>
-            </details>
-          </div>
-        </template>
-        <p v-else class="hub-page__hint">
-          未记录到工具调用 —— 可能是 LLM 直接文字回答或对话失败。
-        </p>
-      </section>
+      <!-- Plan 6 Task 13：对话决策记录（仅当 conversation_log 非空时显示）-->
+      <AgentDecisionChain
+        v-if="detail.conversation_log"
+        :conversation-log="detail.conversation_log"
+        :tool-calls="detail.tool_calls || []"
+      />
     </template>
   </div>
 </template>
@@ -139,6 +72,7 @@ import { pickErrorDetail } from '../../api'
 import { fmtDateTime, statusLabel, statusVariant } from '../../utils/format'
 import AppButton from '../../components/ui/AppButton.vue'
 import AppBadge from '../../components/ui/AppBadge.vue'
+import AgentDecisionChain from '../../components/admin/AgentDecisionChain.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -154,38 +88,6 @@ async function load() {
 }
 
 onMounted(load)
-
-// ── Plan 6 Task 13：Agent 决策链辅助函数 ──────────────────────────────────
-
-function formatNumber(n) {
-  if (n === null || n === undefined) return '-'
-  return Number(n).toLocaleString('zh-CN')
-}
-
-function formatCost(yuan) {
-  if (yuan === null || yuan === undefined) return '0.0000'
-  return Number(yuan).toFixed(4)
-}
-
-function conversationStatusLabel(status) {
-  const labels = {
-    success: '完成',
-    failed_user: '失败（用户层）',
-    failed_system: '失败（系统）',
-    fallback_to_rule: '已降级规则解析',
-  }
-  return labels[status] || status || '-'
-}
-
-function conversationStatusVariant(status) {
-  const variants = {
-    success: 'success',
-    failed_user: 'warning',
-    failed_system: 'error',
-    fallback_to_rule: 'info',
-  }
-  return variants[status] || 'gray'
-}
 </script>
 
 <style scoped>
@@ -271,79 +173,4 @@ function conversationStatusVariant(status) {
   background: transparent !important;
   font-style: italic;
 }
-.hub-detail__pre--error { color: var(--error); }
-
-/* ── Plan 6 Task 13：Agent 决策链 ──────────────────────────────────── */
-.hub-agent__summary {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.hub-agent__summary-item { display: flex; flex-direction: column; gap: 4px; }
-.hub-agent__summary-label { font-size: 12px; color: var(--text-muted); }
-.hub-agent__summary-value { font-size: 14px; font-weight: 500; color: var(--text); }
-
-.hub-agent__tool-header {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-}
-.hub-agent__tool-item {
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 8px 12px;
-  margin-bottom: 8px;
-  background: var(--elevated);
-}
-.hub-agent__tool-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.hub-agent__round-tag {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-}
-.hub-agent__tool-name {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  color: var(--text);
-}
-.hub-agent__duration {
-  font-size: 12px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-}
-.hub-agent__tool-detail {
-  margin-top: 8px;
-}
-.hub-agent__tool-summary {
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--text-muted);
-  padding: 2px 0;
-  user-select: none;
-}
-.hub-agent__tool-summary:hover { color: var(--text); }
-.hub-agent__kv {
-  margin-top: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.hub-agent__kv-label {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-}
-.hub-agent__kv--error .hub-agent__kv-label { color: var(--error); }
 </style>
