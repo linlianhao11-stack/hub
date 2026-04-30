@@ -135,3 +135,96 @@ def test_builder_custom_dict_overrides_default():
     dict_section_end = prompt.index("[同义词]")
     dict_section = prompt[dict_section_start:dict_section_end]
     assert "- 压货:" not in dict_section  # 默认词典已被自定义词典替换
+
+
+# ===== I2: normalize 边界 case 测试 =====
+
+def test_normalize_empty_string_returns_empty():
+    """空字符串原样返回。"""
+    assert normalize("") == ""
+
+
+def test_normalize_no_match_returns_unchanged():
+    """无匹配时原样返回。"""
+    assert normalize("完全不相关的文字") == "完全不相关的文字"
+
+
+def test_normalize_canonical_already_present_unchanged():
+    """canonical 已在 text 中不应被反向替换。"""
+    assert normalize("销售额是多少") == "销售额是多少"
+
+
+def test_normalize_no_chained_replacement_bug():
+    """v2 修：'已经完成' 不应塌陷成 '已已'。
+    因为白名单不含动词，"已经"和"完成"都不在 normalize 范围内，原样保留。
+    """
+    result = normalize("订单已经完成了")
+    assert "已已" not in result
+    assert "订单" in result
+
+
+def test_normalize_preserves_business_dict_compound_words():
+    """v2 修：business_dict 复合词如 '做凭证'/'做账' 不被打散。
+    '做' 是动词 alt，但白名单排除动词，所以保留。
+    """
+    assert "做凭证" in normalize("我要做凭证")
+    assert "做账" in normalize("赶紧做账")
+
+
+def test_normalize_handles_overlapping_alts():
+    """自定义 synonyms 时，长 alt 优先（pairs sort by len desc）。"""
+    custom = {"完成": ["完毕", "OK"], "现在": ["此刻", "目前"]}
+    assert normalize("此刻完毕", synonyms=custom) == "现在完成"
+
+
+def test_normalize_custom_synonyms_override():
+    """自定义 synonyms 覆盖默认，仅匹配自定义范围内的 alt。"""
+    custom = {"客户": ["client"]}
+    assert normalize("the client wants", synonyms=custom) == "the 客户 wants"
+
+
+# ===== I3+I4: lazy section header 测试 =====
+
+def test_builder_omits_header_when_facts_empty():
+    """v2 修 I3/I4：facts 为空 list 不应渲染 section header。"""
+    builder = PromptBuilder()
+    memory = Memory(
+        session=ConversationHistory(conversation_id="c1"),
+        user={"facts": [], "preferences": {}},
+        customers={5: {"facts": []}},
+        products={42: {"facts": []}},
+    )
+    prompt = builder.build(memory=memory)
+    assert "[当前用户偏好]" not in prompt
+    assert "[当前对话提及的客户]" not in prompt
+    assert "[当前对话提及的商品]" not in prompt
+
+
+def test_builder_omits_header_when_facts_not_dict():
+    """user_facts 是 list[str]（异常上游数据）不渲染 header。"""
+    builder = PromptBuilder()
+    memory = Memory(
+        session=ConversationHistory(conversation_id="c1"),
+        user={"facts": ["plain string fact"], "preferences": {}},
+        customers={},
+        products={},
+    )
+    prompt = builder.build(memory=memory)
+    assert "[当前用户偏好]" not in prompt
+
+
+# ===== I5: confidence 不应渲染到 prompt 测试 =====
+
+def test_builder_does_not_leak_confidence_to_prompt():
+    """fact 含 confidence 字段，prompt 渲染应只取 fact 文本，不带 confidence。"""
+    builder = PromptBuilder()
+    memory = Memory(
+        session=ConversationHistory(conversation_id="c1"),
+        user={"facts": [{"fact": "用户偏好分期付款", "confidence": 0.85}]},
+        customers={},
+        products={},
+    )
+    prompt = builder.build(memory=memory)
+    assert "用户偏好分期付款" in prompt
+    assert "0.85" not in prompt  # confidence 不应泄漏给 LLM
+    assert "confidence" not in prompt

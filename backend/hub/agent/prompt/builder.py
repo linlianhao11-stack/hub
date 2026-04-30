@@ -34,8 +34,9 @@ class PromptBuilder:
                  business_dict: dict[str, str] | None = None,
                  synonyms: dict[str, list[str]] | None = None,
                  few_shots: list[FewShot] | None = None):
-        self.business_dict = business_dict or DEFAULT_DICT
-        self.synonyms = synonyms or DEFAULT_SYNONYMS
+        # M1: 统一用 is not None，避免空 dict/list 被误作 falsy 丢弃
+        self.business_dict = business_dict if business_dict is not None else DEFAULT_DICT
+        self.synonyms = synonyms if synonyms is not None else DEFAULT_SYNONYMS
         self.few_shots = few_shots if few_shots is not None else DEFAULT_FEW_SHOTS
 
     def build(self, *, memory: Memory | None = None,
@@ -55,14 +56,23 @@ class PromptBuilder:
 
         sections.append(f"[业务词典]\n{render_dict(self.business_dict)}")
         sections.append(f"[同义词]\n{render_synonyms(self.synonyms)}")
-        sections.append(f"[Few-shot 例子]{render_few_shots(self.few_shots)}")
+        # M4: builder 侧加 \n，render_few_shots 内部去掉前置 \n，格式统一
+        sections.append(f"[Few-shot 例子]\n{render_few_shots(self.few_shots)}")
 
-        if tools_schema:
-            tool_names = [t["function"]["name"] for t in tools_schema]
-            sections.append(
-                f"[当前可用 tool ({len(tool_names)} 个)]\n"
-                + ", ".join(tool_names)
-            )
+        # M2+M3: tools_schema 加 .get 防御 + 空 list 显式提示
+        if tools_schema is not None:
+            tool_names = [t.get("function", {}).get("name") for t in tools_schema]
+            tool_names = [n for n in tool_names if n]
+            if tool_names:
+                sections.append(
+                    f"[当前可用 tool ({len(tool_names)} 个)]\n"
+                    + ", ".join(tool_names)
+                )
+            else:
+                # M3: 空 list 或全无效 schema → 显式提示用户无 tool 权限
+                sections.append(
+                    "[当前可用 tool (0 个)]\n（用户无任何 tool 调用权限，请告知用户联系管理员）"
+                )
 
         if memory is not None:
             mem_section = self._render_memory(memory)
@@ -73,41 +83,53 @@ class PromptBuilder:
         return "\n\n".join(sections)
 
     def _render_memory(self, memory: Memory) -> str:
-        """把 Memory dataclass 渲染成 prompt 段落。"""
+        """把 Memory dataclass 渲染成 prompt 段落。
+
+        I3+I4: lazy header —— 只在第一条合法 fact 实际入列时才 append header，
+        避免 facts 为空时残留孤立的 section header。
+        """
         parts: list[str] = []
 
-        # 用户层
+        # 用户层（lazy header）
         user_facts = memory.user.get("facts", []) if memory.user else []
         user_prefs = memory.user.get("preferences", {}) if memory.user else {}
-        if user_facts or user_prefs:
+        user_lines: list[str] = []
+        for f in user_facts:
+            if isinstance(f, dict) and f.get("fact"):
+                user_lines.append(f"  - {f['fact']}")
+        if user_prefs:
+            user_lines.append(f"  偏好: {json.dumps(user_prefs, ensure_ascii=False)}")
+        if user_lines:
             parts.append("[当前用户偏好]")
-            for f in user_facts:
-                if isinstance(f, dict) and f.get("fact"):
-                    parts.append(f"  - {f['fact']}")
-            if user_prefs:
-                parts.append(f"  偏好: {json.dumps(user_prefs, ensure_ascii=False)}")
+            parts.extend(user_lines)
 
-        # 客户层
+        # 客户层（lazy header）
+        customer_lines: list[str] = []
         if memory.customers:
-            parts.append("[当前对话提及的客户]")
             for cid, m in memory.customers.items():
-                facts = m.get("facts", [])
-                if facts:
-                    parts.append(f"  客户 {cid}:")
-                    for f in facts:
-                        if isinstance(f, dict) and f.get("fact"):
-                            parts.append(f"    - {f['fact']}")
+                facts = m.get("facts", []) if m else []
+                valid = [f for f in facts if isinstance(f, dict) and f.get("fact")]
+                if valid:
+                    customer_lines.append(f"  客户 {cid}:")
+                    for f in valid:
+                        customer_lines.append(f"    - {f['fact']}")
+        if customer_lines:
+            parts.append("[当前对话提及的客户]")
+            parts.extend(customer_lines)
 
-        # 商品层
+        # 商品层（lazy header）
+        product_lines: list[str] = []
         if memory.products:
-            parts.append("[当前对话提及的商品]")
             for pid, m in memory.products.items():
-                facts = m.get("facts", [])
-                if facts:
-                    parts.append(f"  商品 {pid}:")
-                    for f in facts:
-                        if isinstance(f, dict) and f.get("fact"):
-                            parts.append(f"    - {f['fact']}")
+                facts = m.get("facts", []) if m else []
+                valid = [f for f in facts if isinstance(f, dict) and f.get("fact")]
+                if valid:
+                    product_lines.append(f"  商品 {pid}:")
+                    for f in valid:
+                        product_lines.append(f"    - {f['fact']}")
+        if product_lines:
+            parts.append("[当前对话提及的商品]")
+            parts.extend(product_lines)
 
         if not parts:
             return ""

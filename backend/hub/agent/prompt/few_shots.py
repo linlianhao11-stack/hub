@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 
 @dataclass
 class FewShot:
-    user: str
-    expected_calls: list[dict] = field(default_factory=list)
-    expected_text: str | None = None
+    user: str  # 用户输入消息
+    expected_calls: list[dict] = field(default_factory=list)  # 预期 tool call 链
+    expected_text: str | None = None  # 应直接回的 text（不调 tool）
     note: str | None = None  # 给 LLM 的额外说明
 
 
@@ -75,7 +75,11 @@ DEFAULT_FEW_SHOTS: list[FewShot] = [
                  "confirmation_token": "<ChainAgent 注入>",
              }},
         ],
-        note="用户确认后，按 ChainAgent 提供的 (action_id, token) 重新调用写 tool",
+        # M6: 加 prior_context 说明，警示无上下文时不应贸然调写 tool
+        note=(
+            "上下文依赖：本例假定上一轮 history 中存在差旅凭证预览（如例 4 输出）。"
+            "用户单独说'是'但无对应预览时，应反问澄清而非贸然调写 tool。"
+        ),
     ),
 
     # ===== 长尾说法 =====
@@ -113,7 +117,11 @@ def render_few_shots(shots: list[FewShot] | None = None) -> str:
         return ""
     lines = []
     for i, s in enumerate(shots, 1):
-        lines.append(f"\n例 {i}：")
+        # M4: 去掉前置 \n（builder 侧已在 f"[Few-shot 例子]\n" 里加好了）
+        # 例子之间用空行分隔
+        if i > 1:
+            lines.append("")
+        lines.append(f"例 {i}：")
         lines.append(f"  用户: {s.user}")
         if s.expected_calls:
             lines.append("  应调用:")
