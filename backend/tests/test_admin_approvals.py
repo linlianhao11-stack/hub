@@ -221,7 +221,8 @@ async def test_batch_approve_voucher_full_success(voucher_admin_client, mock_erp
     body = resp.json()
     assert body["approved_count"] == 1
     assert draft.id in body["approved_draft_ids"]
-    assert body["failed"] == []
+    assert body["creation_failed"] == []   # M2: 改用 creation_failed
+    assert body["approve_failed"] == []    # M2: 改用 approve_failed
 
     # 验证状态
     await draft.refresh_from_db()
@@ -252,8 +253,8 @@ async def test_batch_approve_phase1_partial_failure(voucher_admin_client, mock_e
     assert resp.status_code == 200
     body = resp.json()
     assert body["approved_count"] == 0
-    assert len(body["failed"]) == 1
-    assert body["failed"][0]["draft_id"] == draft.id
+    assert len(body["creation_failed"]) == 1   # M2: 改用 creation_failed
+    assert body["creation_failed"][0]["draft_id"] == draft.id
 
     await draft.refresh_from_db()
     # 回滚到 pending
@@ -284,8 +285,8 @@ async def test_batch_approve_phase2_partial_failure(voucher_admin_client, mock_e
     assert resp.status_code == 200
     body = resp.json()
     assert body["approved_count"] == 0
-    assert len(body["failed"]) == 1
-    assert "会计拒绝" in body["failed"][0]["reason"]
+    assert len(body["approve_failed"]) == 1    # M2: 改用 approve_failed
+    assert "会计拒绝" in body["approve_failed"][0]["reason"]
 
     await draft.refresh_from_db()
     # phase2 失败 → 保持 created（可重试）
@@ -449,7 +450,7 @@ async def test_batch_approve_lease_active_returns_in_progress(voucher_admin_clie
     body = resp.json()
     assert len(body["in_progress"]) == 1
     assert body["in_progress"][0]["draft_id"] == draft.id
-    assert "另一会话" in body["in_progress"][0]["reason"]
+    assert "另一位审批员" in body["in_progress"][0]["reason"]  # M7: 友好中文文案
     assert body["approved_count"] == 0
 
 
@@ -485,4 +486,145 @@ async def test_all_in_progress_early_return_writes_audit_log(voucher_admin_clien
     log = await AuditLog.filter(action="batch_approve_vouchers").first()
     assert log is not None
     assert log.who_hub_user_id == user.id
-    assert log.detail.get("early_return_reason") == "no_actionable_drafts"
+    assert log.detail.get("early_return_reason") == "all_drafts_in_progress"  # M1: 精确 reason
+    # C1: target_id 是短摘要格式
+    assert log.target_id == "batch-3"
+
+
+# ============================================================
+# Case 13 (新增): C1 - 20 个 draft 批量审批 audit 不超长
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_voucher_batch_approve_with_20_drafts_audit_succeeds(
+    voucher_admin_client, mock_erp_for_approvals
+):
+    """Case 13 (C1): 20 个 draft 批量审批，audit target_id 不超 64 字符不挂。"""
+    ac, user = voucher_admin_client
+    # 设置 mock：20 个不同 erp_voucher_id
+    erp_ids = list(range(100, 120))
+    mock_erp_for_approvals.create_voucher = AsyncMock(
+        side_effect=[{"id": eid} for eid in erp_ids]
+    )
+    mock_erp_for_approvals.batch_approve_vouchers = AsyncMock(
+        return_value={"success": erp_ids, "failed": []}
+    )
+
+    draft_ids = []
+    for i in range(20):
+        d = await VoucherDraft.create(
+            requester_hub_user_id=1, voucher_data=SAMPLE_VOUCHER_DATA,
+            status="pending", confirmation_action_id=f"m-{i}",
+        )
+        draft_ids.append(d.id)
+
+    resp = await ac.post(
+        "/hub/v1/admin/approvals/voucher/batch-approve",
+        json={"draft_ids": draft_ids},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["approved_count"] == 20
+
+    # C1: audit target_id 不超 64 字符，不会抛 DataError
+    log = await AuditLog.filter(action="batch_approve_vouchers").first()
+    assert log is not None
+    assert log.target_id == "batch-20"
+    assert len(log.target_id) <= 64
+
+
+# ============================================================
+# Case 14 (新增): I5 - rows_updated==0 (并发抢占) 加入 in_progress
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_voucher_batch_approve_concurrent_locks_in_progress(
+    voucher_admin_client, mock_erp_for_approvals
+):
+    """Case 14 (I5): phase1 update 返 0（并发抢占）→ in_progress 含此 draft + reason 含并发抢占。
+
+    用 patch "hub.routers.admin.approvals.VoucherDraft" 的 filter 链 → update 返 0
+    模拟另一进程已先抢占该 draft。
+    """
+    from unittest.mock import patch, AsyncMock, MagicMock
+    ac, _ = voucher_admin_client
+
+    draft = await VoucherDraft.create(
+        requester_hub_user_id=1, voucher_data=SAMPLE_VOUCHER_DATA,
+        status="pending", confirmation_action_id="n1",
+    )
+
+    # 构建一个 fake filter chain，让 phase1 的 filter(id=...).filter(...).update 返 0
+    # 其他 filter 调用（初始查询、重新拉 created_drafts、AuditLog.create）走真实路径
+    real_filter = VoucherDraft.filter
+    phase1_update_call_count = 0
+
+    async def fake_update(**kwargs):
+        nonlocal phase1_update_call_count
+        if kwargs.get("status") == "creating":
+            phase1_update_call_count += 1
+            return 0  # 模拟并发抢占
+        return 0
+
+    class FakeChainQS:
+        """支持 .filter(...).update(...) 链式调用，返回 0。"""
+        def filter(self, *args, **kwargs):
+            return self
+
+        async def update(self, **kwargs):
+            return await fake_update(**kwargs)
+
+    # 只 patch 带 id__in 的首次全量查询用真实 filter；
+    # 带单 id= 的 phase1 update 链用 FakeChainQS
+    _call_seq = []
+
+    def selective_filter(*args, **kwargs):
+        # phase1 update 链：filter(id=d.id)
+        if set(kwargs.keys()) == {"id"} and not args:
+            return FakeChainQS()
+        return real_filter(*args, **kwargs)
+
+    with patch("hub.routers.admin.approvals.VoucherDraft.filter", side_effect=selective_filter):
+        resp = await ac.post(
+            "/hub/v1/admin/approvals/voucher/batch-approve",
+            json={"draft_ids": [draft.id]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["approved_count"] == 0
+    assert len(body["in_progress"]) == 1
+    assert body["in_progress"][0]["draft_id"] == draft.id
+    assert "并发抢占" in body["in_progress"][0]["reason"]
+
+
+# ============================================================
+# Case 15 (新增): I2 - new_price=None 跳过审批记入 failed
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_batch_approve_price_none_price_skipped(price_admin_client, mock_erp_for_approvals):
+    """Case 15 (I2): new_price=None → failed 含 reason，不 fallback 0.0 写 ERP。"""
+    from hub.models.draft import PriceAdjustmentRequest
+
+    ac, _ = price_admin_client
+
+    # 直接插入 new_price=None 的记录
+    req = await PriceAdjustmentRequest.create(
+        requester_hub_user_id=1, customer_id=10, product_id=20,
+        new_price=None, reason="测试", status="pending",
+        confirmation_action_id="o1",
+    )
+
+    resp = await ac.post(
+        "/hub/v1/admin/approvals/price/batch-approve",
+        json={"request_ids": [req.id]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["approved_count"] == 0
+    assert len(body["failed"]) == 1
+    assert "缺少新价格" in body["failed"][0]["reason"]
+
+    # ERP 没有被调用（不发破坏性写入）
+    mock_erp_for_approvals.upsert_customer_price_rule.assert_not_called()

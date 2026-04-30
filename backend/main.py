@@ -52,6 +52,9 @@ async def lifespan(app: FastAPI):
     ds_for_session = await DownstreamSystem.filter(
         downstream_type="erp", status="active",
     ).first()
+    # C2: 提前 import agent tool 模块，startup 时统一 wire
+    from hub.agent.tools import draft_tools, erp_tools, generate_tools
+
     if ds_for_session is not None:
         erp_api_key_for_session = decrypt_secret(
             ds_for_session.encrypted_apikey, purpose="config_secrets",
@@ -61,11 +64,19 @@ async def lifespan(app: FastAPI):
         )
         app.state.session_auth = ErpSessionAuth(erp_adapter=erp_for_session)
         app.state._session_erp_adapter = erp_for_session  # 留引用方便 shutdown 关闭
-        # 注入 approvals router 所需的 ERP adapter
+        # 注入 approvals router + agent tool 模块所需的 ERP adapter
         admin_approvals.set_erp_adapter(erp_for_session)
+        draft_tools.set_erp_adapter(erp_for_session)   # C2: agent 写草稿 tool
+        erp_tools.set_erp_adapter(erp_for_session)     # C2: agent 读 ERP tool
+        # C2: generate_tools 需要 sender（钉钉主动 push），gateway 进程不构建 sender，传 None
+        # sender 由 worker.py 注入（worker 才持有 DingTalkSender 长连接凭据）
+        generate_tools.set_dependencies(sender=None, erp=erp_for_session)
     else:
         app.state.session_auth = None
         admin_approvals.set_erp_adapter(None)
+        draft_tools.set_erp_adapter(None)
+        erp_tools.set_erp_adapter(None)
+        generate_tools.set_dependencies(sender=None, erp=None)
 
     # 3. 首启动检测：未初始化（system_initialized=false）且无未使用 token → 生成并打印
     from datetime import datetime
@@ -148,6 +159,9 @@ async def lifespan(app: FastAPI):
     logger.info("HUB Gateway 关闭")
     # 关闭顺序：先停 scheduler、再取消连接 task、最后 redis / db
     admin_approvals.set_erp_adapter(None)
+    draft_tools.set_erp_adapter(None)     # C2: 清除 stale 引用
+    erp_tools.set_erp_adapter(None)       # C2: 清除 stale 引用
+    generate_tools.set_dependencies(sender=None, erp=None)  # C2: 清除 stale 引用
     if hasattr(app.state, "scheduler"):
         try:
             await app.state.scheduler.stop()

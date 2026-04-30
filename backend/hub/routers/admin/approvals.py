@@ -98,7 +98,7 @@ async def list_voucher_drafts(status: str = "pending",
 
 
 class BatchApproveVoucherRequest(BaseModel):
-    draft_ids: list[int] = Field(..., min_length=1)
+    draft_ids: list[int] = Field(..., min_length=1, max_length=50)
 
 
 @router.post(
@@ -107,7 +107,7 @@ class BatchApproveVoucherRequest(BaseModel):
 )
 async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Request):
     """两阶段提交 + creating 崩溃恢复。"""
-    now = dt.datetime.now(dt.UTC)
+    now = dt.datetime.now(dt.UTC)  # M8: 统一取 now，phase1/2 时间戳一致
     lease_cutoff = now - LEASE_TIMEOUT
 
     drafts = await VoucherDraft.filter(
@@ -133,6 +133,8 @@ async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Reque
                 ),
                 "reason": "另一会话正在处理此草稿，请稍后重试或等租约自动过期",
             })
+            # M7: 友好中文说明
+            in_progress[-1]["reason"] = "该凭证正在被另一位审批员处理（5 分钟内自动释放）"
         else:
             actionable_drafts.append(d)
 
@@ -151,7 +153,14 @@ async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Reque
             creating_started_at=now,
         )
         if rows_updated == 0:
-            continue  # 别的请求/线程已抢先
+            # I5: 并发抢占，加入 in_progress 让 UI 告知用户
+            in_progress.append({
+                "draft_id": d.id,
+                "since": None,
+                "lease_expires_at": None,
+                "reason": "并发抢占：另一位审批员刚刚开始处理此凭证",
+            })
+            continue
 
         try:
             erp_resp = await erp.create_voucher(
@@ -176,21 +185,28 @@ async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Reque
 
     if not created_drafts:
         # 早返回：写 audit log
+        # M1: 拆两种 early_return_reason
+        if in_progress and len(in_progress) == len(req.draft_ids):
+            early_return_reason = "all_drafts_in_progress"
+        else:
+            early_return_reason = "all_phase1_creates_failed"
         await AuditLog.create(
             who_hub_user_id=actor.id, action="batch_approve_vouchers",
             target_type="voucher_draft",
-            target_id=str(req.draft_ids),
+            target_id=f"batch-{len(req.draft_ids)}",  # C1: 短摘要，防 13+ ID 超 64 字符
             detail={
+                "draft_ids": req.draft_ids,  # 完整 ids 在 detail（无长度限制）
                 "approved": [],
                 "creation_failed": creation_failures,
                 "approve_failed": [],
                 "in_progress": [p["draft_id"] for p in in_progress],
-                "early_return_reason": "no_actionable_drafts",
+                "early_return_reason": early_return_reason,
             },
         )
         return {
             "approved_count": 0, "approved_draft_ids": [],
-            "failed": creation_failures,
+            "creation_failed": creation_failures,  # M2: 拆 creation_failed
+            "approve_failed": [],                   # M2: 拆 approve_failed
             "in_progress": in_progress,
         }
 
@@ -213,7 +229,7 @@ async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Reque
         if d.erp_voucher_id in approved_set:
             d.status = "approved"
             d.approved_by_hub_user_id = actor.id
-            d.approved_at = dt.datetime.now(dt.UTC)
+            d.approved_at = now  # M8: 用函数顶部统一取的 now
             await d.save()
             approved_draft_ids.append(d.id)
         else:
@@ -225,8 +241,9 @@ async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Reque
     await AuditLog.create(
         who_hub_user_id=actor.id, action="batch_approve_vouchers",
         target_type="voucher_draft",
-        target_id=str(req.draft_ids),
+        target_id=f"batch-{len(req.draft_ids)}",  # C1: 短摘要，防 13+ ID 超 64 字符
         detail={
+            "draft_ids": req.draft_ids,  # 完整 ids 在 detail（无长度限制）
             "approved": approved_draft_ids,
             "creation_failed": creation_failures,
             "approve_failed": approve_failures,
@@ -236,13 +253,14 @@ async def batch_approve_vouchers(req: BatchApproveVoucherRequest, request: Reque
     return {
         "approved_count": len(approved_draft_ids),
         "approved_draft_ids": approved_draft_ids,
-        "failed": creation_failures + approve_failures,
+        "creation_failed": creation_failures,   # M2: 拆 creation_failed
+        "approve_failed": approve_failures,      # M2: 拆 approve_failed
         "in_progress": in_progress,
     }
 
 
 class BatchRejectVoucherRequest(BaseModel):
-    draft_ids: list[int] = Field(..., min_length=1)
+    draft_ids: list[int] = Field(..., min_length=1, max_length=50)
     reason: str = Field(..., min_length=1, max_length=500)
 
 
@@ -267,7 +285,7 @@ async def batch_reject_vouchers(req: BatchRejectVoucherRequest, request: Request
     await AuditLog.create(
         who_hub_user_id=actor.id, action="batch_reject_vouchers",
         target_type="voucher_draft",
-        target_id=str(req.draft_ids),
+        target_id=f"batch-{len(req.draft_ids)}",  # C1: 短摘要
         detail={"rejected": req.draft_ids, "reason": req.reason},
     )
     return {"rejected_count": len(drafts)}
@@ -305,7 +323,19 @@ def _serialize_price(r: PriceAdjustmentRequest) -> dict:
 
 
 class BatchApprovePriceRequest(BaseModel):
-    request_ids: list[int] = Field(..., min_length=1)
+    request_ids: list[int] = Field(..., min_length=1, max_length=50)
+
+
+class BatchRejectPriceRequest(BaseModel):
+    """I3: 独立 schema（用 request_ids 与 approve 保持一致）。"""
+    request_ids: list[int] = Field(..., min_length=1, max_length=50)
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class BatchRejectStockRequest(BaseModel):
+    """I3: 独立 schema（用 request_ids 与 approve 保持一致）。"""
+    request_ids: list[int] = Field(..., min_length=1, max_length=50)
+    reason: str = Field(..., min_length=1, max_length=500)
 
 
 @router.post(
@@ -325,10 +355,14 @@ async def batch_approve_price(req: BatchApprovePriceRequest, request: Request):
     approved: list[int] = []
     failed: list[dict] = []
     for r in rows:
+        # I2: new_price=None 不 fallback 0.0（会破坏性写入 ERP），跳过并记录原因
+        if r.new_price is None:
+            failed.append({"request_id": r.id, "reason": "缺少新价格，跳过审批"})
+            continue
         try:
             await erp.upsert_customer_price_rule(
                 customer_id=r.customer_id, product_id=r.product_id,
-                new_price=float(r.new_price) if r.new_price is not None else 0.0,
+                new_price=float(r.new_price),
                 reason=r.reason,
                 client_request_id=f"hub-price-{r.id}",
                 acting_as_user_id=request.state.erp_user["id"],
@@ -344,8 +378,8 @@ async def batch_approve_price(req: BatchApprovePriceRequest, request: Request):
     await AuditLog.create(
         who_hub_user_id=actor.id, action="batch_approve_price",
         target_type="price_adjustment_request",
-        target_id=str(req.request_ids),
-        detail={"approved": approved, "failed": failed},
+        target_id=f"batch-{len(req.request_ids)}",  # C1: 短摘要
+        detail={"request_ids": req.request_ids, "approved": approved, "failed": failed},
     )
     return {"approved_count": len(approved), "approved_ids": approved, "failed": failed}
 
@@ -354,12 +388,12 @@ async def batch_approve_price(req: BatchApprovePriceRequest, request: Request):
     "/price/batch-reject",
     dependencies=[Depends(require_hub_perm("usecase.adjust_price.approve"))],
 )
-async def batch_reject_price(req: BatchRejectVoucherRequest, request: Request):
-    """批量拒绝价格调整申请（复用 BatchRejectVoucherRequest schema）。"""
+async def batch_reject_price(req: BatchRejectPriceRequest, request: Request):
+    """批量拒绝价格调整申请（I3: 独立 schema BatchRejectPriceRequest，用 request_ids）。"""
     rows = await PriceAdjustmentRequest.filter(
-        id__in=req.draft_ids, status="pending",
+        id__in=req.request_ids, status="pending",
     ).all()
-    if len(rows) != len(req.draft_ids):
+    if len(rows) != len(req.request_ids):
         raise HTTPException(400, "包含已审/不存在的 request_id")
     actor = request.state.hub_user
     for r in rows:
@@ -369,8 +403,8 @@ async def batch_reject_price(req: BatchRejectVoucherRequest, request: Request):
     await AuditLog.create(
         who_hub_user_id=actor.id, action="batch_reject_price",
         target_type="price_adjustment_request",
-        target_id=str(req.draft_ids),
-        detail={"rejected": req.draft_ids, "reason": req.reason},
+        target_id=f"batch-{len(req.request_ids)}",  # C1: 短摘要
+        detail={"request_ids": req.request_ids, "reason": req.reason},
     )
     return {"rejected_count": len(rows)}
 
@@ -424,8 +458,8 @@ async def batch_approve_stock(req: BatchApprovePriceRequest, request: Request):
     await AuditLog.create(
         who_hub_user_id=actor.id, action="batch_approve_stock",
         target_type="stock_adjustment_request",
-        target_id=str(req.request_ids),
-        detail={"approved": [r.id for r in rows]},
+        target_id=f"batch-{len(req.request_ids)}",  # C1: 短摘要
+        detail={"request_ids": req.request_ids, "approved": [r.id for r in rows]},
     )
     return {"approved_count": len(rows), "approved_ids": [r.id for r in rows]}
 
@@ -434,11 +468,12 @@ async def batch_approve_stock(req: BatchApprovePriceRequest, request: Request):
     "/stock/batch-reject",
     dependencies=[Depends(require_hub_perm("usecase.adjust_stock.approve"))],
 )
-async def batch_reject_stock(req: BatchRejectVoucherRequest, request: Request):
+async def batch_reject_stock(req: BatchRejectStockRequest, request: Request):
+    """I3: 独立 schema BatchRejectStockRequest，用 request_ids。"""
     rows = await StockAdjustmentRequest.filter(
-        id__in=req.draft_ids, status="pending",
+        id__in=req.request_ids, status="pending",
     ).all()
-    if len(rows) != len(req.draft_ids):
+    if len(rows) != len(req.request_ids):
         raise HTTPException(400, "包含已审/不存在的 request_id")
     actor = request.state.hub_user
     for r in rows:
@@ -448,7 +483,7 @@ async def batch_reject_stock(req: BatchRejectVoucherRequest, request: Request):
     await AuditLog.create(
         who_hub_user_id=actor.id, action="batch_reject_stock",
         target_type="stock_adjustment_request",
-        target_id=str(req.draft_ids),
-        detail={"rejected": req.draft_ids, "reason": req.reason},
+        target_id=f"batch-{len(req.request_ids)}",  # C1: 短摘要
+        detail={"request_ids": req.request_ids, "reason": req.reason},
     )
     return {"rejected_count": len(rows)}

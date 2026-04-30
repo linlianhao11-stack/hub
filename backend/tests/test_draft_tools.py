@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -46,6 +47,11 @@ BASE_CTX = {
     "conversation_id": "conv-test",
     "acting_as_user_id": 101,
 }
+
+
+def _make_action_id() -> str:
+    """M10: 用真实 uuid hex 作为 action_id（避免 "a1" 这类短 fake）。"""
+    return f"action-{uuid.uuid4().hex}"
 
 
 @pytest.fixture
@@ -350,13 +356,17 @@ async def test_stock_concurrent_same_action_id(mock_erp):
 
 @pytest.mark.asyncio
 async def test_voucher_integrity_error_reraise(mock_erp):
-    """Case 17: IntegrityError 发生但回查不到记录 → 重新抛出。"""
-    # patch VoucherDraft.create 抛 IntegrityError；patch filter 返回 None
+    """Case 17: IntegrityError 发生但回查不到记录 → 重新抛出。
+
+    M9: side_effect 明确两次 None（幂等先查返 None；IntegrityError 后回查也返 None）。
+    """
+    # patch VoucherDraft.create 抛 IntegrityError；patch filter 返回 None（两次）
     with patch("hub.agent.tools.draft_tools.VoucherDraft.create",
                side_effect=IntegrityError("unique constraint")):
         with patch("hub.agent.tools.draft_tools.VoucherDraft.filter") as mock_filter:
             mock_qs = AsyncMock()
-            mock_qs.first = AsyncMock(return_value=None)
+            # M9: 明确两次 None（先查 + 回查）
+            mock_qs.first = AsyncMock(side_effect=[None, None])
             mock_filter.return_value = mock_qs
             with pytest.raises(IntegrityError):
                 await create_voucher_draft(
@@ -367,21 +377,73 @@ async def test_voucher_integrity_error_reraise(mock_erp):
 
 
 # ============================================================
-# Case 18: register_all 不抛 ToolRegistrationError
+# Case 18: register_all 用真 ToolRegistry 验 fail-fast 通过（I6）
 # ============================================================
 
 @pytest.mark.asyncio
-async def test_register_all_succeeds():
-    """Case 18: register_all 注册 3 个 WRITE_DRAFT tool 不抛异常（签名均声明 confirmation_action_id）。"""
-    from unittest.mock import MagicMock
+async def test_register_all_uses_real_registry_passes_fail_fast():
+    """Case 18 (I6 加固): 用真 ToolRegistry 验 register fail-fast 通过。
+
+    v2: 改用真实 ToolRegistry（而非 MagicMock），这样 inspect.signature 校验真正执行，
+    3 个 tool 没有声明 confirmation_action_id 的话会抛 ToolRegistrationError。
+    """
+    import os
+    from redis.asyncio import Redis
     from hub.agent.tools.draft_tools import register_all
     from hub.agent.tools.registry import ToolRegistry
+    from hub.agent.tools.confirm_gate import ConfirmGate
+    from hub.agent.memory.session import SessionMemory
 
-    mock_registry = MagicMock(spec=ToolRegistry)
-    # 验证 register 被调用了 3 次（不抛 ToolRegistrationError）
-    register_all(mock_registry)
-    assert mock_registry.register.call_count == 3
-    call_names = [call.args[0] for call in mock_registry.register.call_args_list]
-    assert "create_voucher_draft" in call_names
-    assert "create_price_adjustment_request" in call_names
-    assert "create_stock_adjustment_request" in call_names
+    redis_url = os.environ.get("HUB_REDIS_URL", "redis://localhost:6380/0")
+    redis_client = Redis.from_url(redis_url, decode_responses=False)
+    try:
+        cg = ConfirmGate(redis_client)
+        sm = SessionMemory(redis_client)
+        reg = ToolRegistry(confirm_gate=cg, session_memory=sm)
+
+        # 用真实 registry 注册——inspect.signature 校验会真正执行
+        register_all(reg)
+
+        assert "create_voucher_draft" in reg._tools
+        assert "create_price_adjustment_request" in reg._tools
+        assert "create_stock_adjustment_request" in reg._tools
+    finally:
+        await redis_client.aclose()
+
+
+# ============================================================
+# Case 19 (新增): I1 - _fetch_current_price 不吞 RuntimeError
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_fetch_current_price_does_not_swallow_runtime_error():
+    """Case 19 (I1): adapter 未初始化时 RuntimeError 上抛，不被 except 吞。"""
+    from hub.agent.tools.draft_tools import _fetch_current_price
+
+    # 确保 adapter 未初始化
+    set_erp_adapter(None)
+    try:
+        with pytest.raises(RuntimeError, match="ERP adapter 未初始化"):
+            await _fetch_current_price(
+                customer_id=1, product_id=1, acting_as_user_id=1,
+            )
+    finally:
+        set_erp_adapter(None)
+
+
+@pytest.mark.asyncio
+async def test_fetch_current_price_swallows_erp_adapter_error():
+    """Case 20 (I1): ERP 调用抛 ErpAdapterError → 吞掉返 None（fail-soft）。"""
+    from hub.adapters.downstream.erp4 import ErpAdapterError
+    from hub.agent.tools.draft_tools import _fetch_current_price
+
+    m = AsyncMock()
+    m.get_product_customer_prices = AsyncMock(side_effect=ErpAdapterError("network error"))
+    set_erp_adapter(m)
+    try:
+        result = await _fetch_current_price(
+            customer_id=1, product_id=1, acting_as_user_id=1,
+        )
+        assert result is None
+    finally:
+        set_erp_adapter(None)

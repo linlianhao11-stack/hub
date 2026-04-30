@@ -14,7 +14,12 @@ from __future__ import annotations
 import logging
 from tortoise.exceptions import IntegrityError
 
-from hub.adapters.downstream.erp4 import Erp4Adapter
+from hub.adapters.downstream.erp4 import (
+    Erp4Adapter,
+    ErpAdapterError,
+    ErpNotFoundError,
+    ErpSystemError,
+)
 from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import ToolArgsValidationError, ToolType
 from hub.models.draft import (
@@ -62,7 +67,10 @@ async def _get_max_voucher_amount() -> int:
 
 async def _fetch_current_price(customer_id: int, product_id: int,
                                 acting_as_user_id: int) -> float | None:
-    """调 ERP get_product_customer_prices 取最近成交价（fail-soft）。"""
+    """调 ERP get_product_customer_prices 取最近成交价（fail-soft）。
+
+    I1: 只吞 ERP 网络/熔断/404 错误；RuntimeError（adapter 未初始化）让它上抛暴露 startup bug。
+    """
     try:
         erp = current_erp_adapter()
         resp = await erp.get_product_customer_prices(
@@ -71,8 +79,10 @@ async def _fetch_current_price(customer_id: int, product_id: int,
         )
         items = resp.get("items", [])
         if items:
-            return float(items[0].get("price", 0)) or None
-    except Exception:
+            # M4: 0.0 也是合法价格，不用 or None
+            return float(items[0].get("price", 0))
+    except (ErpAdapterError, ErpSystemError, ErpNotFoundError):
+        # 仅吞 ERP 网络/熔断/404；RuntimeError(adapter 未初始化) 让它上抛暴露 startup bug
         pass
     return None
 
@@ -126,14 +136,13 @@ async def create_voucher_draft(
     Args:
         voucher_data: 凭证内容，必须含 entries / total_amount / summary
         rule_matched: 匹配到的凭证模板名（可选）
-    """
-    # 1. 入参校验
-    _validate_voucher_data(voucher_data)
-    total_amount = float(voucher_data.get("total_amount", 0))
-    max_amount = await _get_max_voucher_amount()
-    _validate_amount_within_limit(total_amount, max_amount)
 
-    # 2. 幂等先查
+    M11 类型不变量：本 tool 仅写 HUB 草稿表（VoucherDraft），不调 ERP 写接口；
+    ERP 落地由 admin 审批端点（admin/approvals/voucher/batch-approve）完成。
+    未来重构不要把 ERP 写调用挪到此处。
+    """
+    # M3: 先幂等查，再校验（回放路径不重新 query system_config）
+    # 1. 幂等先查
     existing = await VoucherDraft.filter(
         requester_hub_user_id=hub_user_id,
         confirmation_action_id=confirmation_action_id,
@@ -149,6 +158,12 @@ async def create_voucher_draft(
             "approval_url": _approval_url(existing.id),
             "idempotent_replay": True,
         }
+
+    # 2. 入参校验（回放路径跳过，不重新 query system_config）
+    _validate_voucher_data(voucher_data)
+    total_amount = float(voucher_data.get("total_amount", 0))
+    max_amount = await _get_max_voucher_amount()
+    _validate_amount_within_limit(total_amount, max_amount)
 
     # 3. INSERT（可能 IntegrityError）
     try:
@@ -212,6 +227,10 @@ async def create_price_adjustment_request(
         product_id: ERP 商品 ID
         new_price: 申请调整后的价格
         reason: 调价原因（可选）
+
+    M11 类型不变量：本 tool 仅写 HUB 草稿表（PriceAdjustmentRequest），不调 ERP 写接口；
+    ERP 落地由 admin 审批端点（admin/approvals/price/batch-approve）完成。
+    未来重构不要把 ERP 写调用挪到此处。
     """
     if new_price <= 0:
         raise ToolArgsValidationError("调价价格必须大于 0")
@@ -242,9 +261,11 @@ async def create_price_adjustment_request(
     )
 
     # 计算折扣比例（如果有当前价）
+    # M5: clamp 到 DecimalField(max_digits=5, decimal_places=4) 上限 9.9999，防溢出
     discount_pct = None
-    if current_price and current_price > 0:
-        discount_pct = round(new_price / current_price, 4)
+    if current_price and current_price > 0 and new_price > 0:
+        raw = new_price / current_price
+        discount_pct = max(0.0, min(round(raw, 4), 9.9999))
 
     # INSERT
     try:
@@ -313,6 +334,14 @@ async def create_stock_adjustment_request(
         adjustment_qty: 调整数量（正数增加，负数减少）
         reason: 调整原因（可选）
         warehouse_id: 仓库 ID（可选）
+
+    M11 类型不变量：本 tool 仅写 HUB 草稿表（StockAdjustmentRequest），不调 ERP 写接口；
+    ERP 落地由 admin 审批端点（admin/approvals/stock/batch-approve）完成。
+    未来重构不要把 ERP 写调用挪到此处。
+
+    M12 参数命名：plan §2522 字面写 delta_quantity: int，但实际模型字段
+    （StockAdjustmentRequest.adjustment_qty）以及 ERP 接口都用 adjustment_qty: float。
+    本 tool 与模型字段保持一致。
     """
     if adjustment_qty == 0:
         raise ToolArgsValidationError("调整数量不能为 0")
