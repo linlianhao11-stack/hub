@@ -221,7 +221,7 @@ aerich 不能自动检测 JSONB index / GIN，所以手写：
 - voucher_draft.creating_started_at TIMESTAMPTZ NULL（v3 round 2 加：creating 状态租约时间戳）
 - voucher_draft idx_creating_lease（status, creating_started_at）— 崩溃恢复扫 status=creating + 租约过期的草稿用
 - voucher_draft.status CHECK 约束（pending / creating / created / approved / rejected 五值）
-- **v8 round 2 P1：三张写草稿表都加 `confirmation_action_id VARCHAR(16) NULL` 字段 + 部分唯一索引**（仅当 NOT NULL 时按 `(requester_hub_user_id, confirmation_action_id)` 唯一）：
+- **v8 round 2 P1：三张写草稿表都加 `confirmation_action_id VARCHAR(64) NULL` 字段 + 部分唯一索引**（仅当 NOT NULL 时按 `(requester_hub_user_id, confirmation_action_id)` 唯一）：
   - `idx_voucher_draft_action_id_unique`
   - `idx_price_adj_action_id_unique`
   - `idx_stock_adj_action_id_unique`
@@ -390,7 +390,7 @@ async def test_write_tool_token_is_one_time_use():
         "confirmation_token": token,
     }
 
-    # 第一次：成功 → claim 已 HDEL；remove_pending 已清 pending
+    # 第一次：成功 → claim_action Lua 已原子 HDEL confirmed + pending（持久终态）
     result1 = await reg.call("create_voucher_draft", payload,
                               hub_user_id=1, acting_as=2,
                               conversation_id="c1", round_idx=0)
@@ -1167,7 +1167,7 @@ class ConfirmGate:
     async def add_pending(self, conversation_id: str, hub_user_id: int,
                           tool_name: str, args: dict) -> str:
         """ChainAgent 在 tool 被门禁拦截时调；返回 action_id。同 round 多个写都能存。"""
-        action_id = uuid.uuid4().hex[:8]
+        action_id = uuid.uuid4().hex  # v10 round 2 P2：32-hex 完整 (128 bit) 防长期碰撞
         normalized = self.canonicalize(args)
         await self.redis.hset(
             self._pending_key(conversation_id, hub_user_id),
@@ -2085,8 +2085,9 @@ class ChainAgent:
                     "成功后 HUB 会原子消费，不可再用。"
                 )
                 confirm_hint = "\n".join(lines)
-                # 不在这里 clear_pending；ToolRegistry.call 在 tool 成功后调
-                # ConfirmGate.remove_pending 按 action_id 单条清；其他 pending 不受影响。
+                # 不在这里 clear_pending；ToolRegistry.call 调 ConfirmGate.claim_action
+                # 时 Lua 脚本会原子同时 HDEL confirmed + pending（v6 round 2 P1-#2 加固后的持久终态语义）；
+                # 成功路径无需任何后续 cleanup，其他 pending 也不受影响。
             # 没 pending：用户随口"是"，confirm_hint 留 None，正常进 LLM
 
         # ❷ 主循环
@@ -2365,7 +2366,7 @@ git commit -m "feat(hub): Plan 6 Task 7（生成型 tool：合同 docx / 报价 
 
 - [ ] **Step 1: draft_tools.py 三个写草稿 tool（v8 round 2 P1：必须用 confirmation_action_id 做幂等键）**
 
-**ToolRegistry 注入约束**（review v8 round 2 P1）：写类 tool fn **必须**在签名声明 `confirmation_action_id: str` 参数；ToolRegistry 在调用前自动注入（值 = ConfirmGate 在 add_pending 时生成的 8 位 hex action_id）。tool fn 实现内必须用它做"先查后插 + IntegrityError 兜底"幂等保护，DB 层加 `(requester_hub_user_id, confirmation_action_id)` 部分唯一索引。
+**ToolRegistry 注入约束**（review v8 round 2 P1）：写类 tool fn **必须**在签名声明 `confirmation_action_id: str` 参数；ToolRegistry 在调用前自动注入（值 = ConfirmGate 在 add_pending 时生成的 32-hex action_id，128 bit 熵防长期碰撞，v10 round 2 P2 更新）。tool fn 实现内必须用它做"先查后插 + IntegrityError 兜底"幂等保护，DB 层加 `(requester_hub_user_id, confirmation_action_id)` 部分唯一索引。
 
 为什么必须这样：ToolRegistry.call 的 `restore_action` 设计前提是写 tool 失败重试**真幂等**。如果 tool fn 已 commit DB 但抛错（比如 commit 后发钉钉超时），restore 让用户重试 → 第二次执行如果不查 action_id 就是重复创建。
 
@@ -2383,7 +2384,7 @@ async def create_voucher_draft(
 ) -> dict:
     """生成凭证草稿，挂会计审批 inbox。
 
-    幂等性：confirmation_action_id 是 ConfirmGate 给本次确认动作分配的 8-hex；
+    幂等性：confirmation_action_id 是 ConfirmGate 给本次确认动作分配的 32-hex（uuid4，128 bit）；
     DB 唯一索引 (requester_hub_user_id, confirmation_action_id) 保证重试不重复创建。
     """
     # 1. 校验 voucher_data 必填字段
@@ -3709,7 +3710,7 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
 **Plan 6 v9 结束（应用第八轮 review 2 条反馈，写 tool 重试幂等性 + docstring 修正）**：
 - P1 #1：**写 tool 重试必须真幂等**（review v8 P1-#1）—— v8 restore-on-failure 让用户用同 token 重试，但 confirmation_action_id 没注入到 fn，写 tool 无法用它做幂等键；如果 tool fn 已 commit DB 但抛错（比如 commit 后发钉钉超时 / 网络断开），重试会重复创建草稿/写 ERP。完整修复：
   1. ToolRegistry.call 把 `confirmation_action_id` 作为内部 context 注入写类 tool fn（与 `acting_as_user_id` 等同列）；register 时校验签名必须声明此参数（否则 RuntimeError）
-  2. spec §5.4 三张写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）都加 `confirmation_action_id VARCHAR(16) NULL` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
+  2. spec §5.4 三张写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）都加 `confirmation_action_id VARCHAR(64) NULL` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
   3. Task 8 `create_voucher_draft` / `create_price_adjustment_request` / `create_stock_adjustment_request` 的 fn 实现完整改为"先按 (user, action_id) 查 → 命中返 idempotent_replay → 否则 INSERT → IntegrityError catch 回查 → 极端情况 reraise"三段幂等保护
   4. spec §8.4 加新条目说明"写 tool 重试幂等性"作为 restore_action 设计的安全前提；§3.1 ToolRegistry.call 伪代码加 action_id 注入
   5. Task 1 migration 加三张表的 confirmation_action_id 列 + 部分唯一索引
@@ -3720,6 +3721,15 @@ D 阶段（凭证自动化深度）已为 Plan 6 后续预留：
   - Task 8 case 7：同 (user, action_id) 第二次调用返 idempotent_replay
   - Task 8 case 10：asyncio.gather 并发同 (user, action_id) DB 只 1 条
   - Task 8 case 12：fn 已 commit DB 但抛错后 restore + 重试，DB 不重复创建
+
+**Plan 6 v11 结束（应用第十轮 review 2 条反馈，action_id 防碰撞 + 第二处 docstring 修正）**：
+- P2 #1：**action_id 从 8-hex 改为 32-hex 完整 uuid4**（review v10 P2-#1）—— 8-hex (32 bit) 在单用户长期累计几万次写后生日碰撞概率不可忽略，碰撞会让新写操作被误判成旧 draft 的 idempotent_replay。完整修复：
+  1. ConfirmGate.add_pending 改 `uuid.uuid4().hex`（32-hex 完整 = 128 bit 熵）
+  2. spec §5.4 三张写草稿表 `confirmation_action_id` 列改 `VARCHAR(64)`（从 16）
+  3. plan Task 1 migration / Task 8 docstring / spec §8.4 描述、footer 全部同步
+- P3 #2：**第二处 docstring 提 remove_pending 修正**（review v10 P3-#2）—— v9 修了 ConfirmGate.confirm_all_pending 一处，但 ChainAgent.run 主循环 confirm_hint 拼接后还有一行注释 "ToolRegistry.call 调 ConfirmGate.remove_pending 按 action_id 单条清"，与 v6 round 2 持久终态语义冲突。修复：注释明确说"claim_action Lua 原子 HDEL 两 hash，无 cleanup"；同时改一处测试注释 "remove_pending 已清 pending" → "claim_action Lua 已原子 HDEL confirmed + pending"。
+
+---
 
 **Plan 6 v10 结束（应用第九轮 review 2 条反馈，签名校验前置 + 调价/库存 tool 完整展开）**：
 - P1 #1：**签名校验从 call 时移到 register 时**（review v9 P1-#1）—— v9 的 RuntimeError 检查在 ToolRegistry.call 中、且发生在 claim_action 已原子删除 confirmed+pending 之后；如果某个写 tool 漏声明 `confirmation_action_id` 参数，第一次调用会 RuntimeError，但确认态已被消费且不会 restore（错误不在 try/except 内）。修复：

@@ -704,7 +704,8 @@ CREATE TABLE voucher_draft (
     -- v8 round 2 P1：confirmation_action_id 作为写入幂等键（restore-on-failure 重试不重复创建）
     --   ToolRegistry 在调写 tool fn 时把 ConfirmGate 的 action_id 注入；
     --   tool fn 用它做"先查后插 + IntegrityError catch"幂等保护
-    confirmation_action_id VARCHAR(16),
+    -- v10 round 2 P2：action_id = uuid4().hex 完整 32 字符（128 bit），VARCHAR(64) 留余量
+    confirmation_action_id VARCHAR(64),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     INDEX idx_pending (status, created_at),
     INDEX idx_creating_lease (status, creating_started_at)  -- 崩溃恢复扫描用
@@ -733,7 +734,7 @@ CREATE TABLE price_adjustment_request (
     approved_at TIMESTAMPTZ,
     rejection_reason TEXT,
     conversation_id TEXT,
-    confirmation_action_id VARCHAR(16),  -- v8 round 2 P1：幂等键（同上）
+    confirmation_action_id VARCHAR(64),  -- v8 round 2 P1：幂等键；v10 round 2 P2：32-hex 防碰撞
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE UNIQUE INDEX idx_price_adj_action_id_unique
@@ -741,7 +742,7 @@ CREATE UNIQUE INDEX idx_price_adj_action_id_unique
     WHERE confirmation_action_id IS NOT NULL;
 
 CREATE TABLE stock_adjustment_request (
-    -- 类似 price_adjustment_request；同样含 confirmation_action_id VARCHAR(16) + 部分唯一索引
+    -- 类似 price_adjustment_request；同样含 confirmation_action_id VARCHAR(64) + 部分唯一索引
 );
 ```
 
@@ -895,7 +896,7 @@ bot_user_finance       → 加 create_voucher.use（已有）+ adjust_stock.use
     - **不依赖 LLM 自觉**；asyncio.gather 并发同 token 也只能跑 1 次 tool.fn
 - **写 tool 重试幂等性（v8 round 2 P1，关键）**：claim_action restore 让用户用同 token 重试的设计前提是写 tool fn 真幂等：
     - ToolRegistry 把 `confirmation_action_id` 作为内部参数注入所有 WRITE_DRAFT / WRITE_ERP tool（不暴露给 LLM 但 fn 必须声明）
-    - 所有 HUB 写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）加 `confirmation_action_id VARCHAR(16)` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
+    - 所有 HUB 写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）加 `confirmation_action_id VARCHAR(64)` 字段（v10 round 2 P2：从 16 提到 64，因 action_id 改为完整 32-hex 防长期碰撞）+ 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
     - 写 tool fn 必须实现"先查（按 user+action_id）→ 命中返 idempotent_replay → 否则 INSERT → IntegrityError catch 回查"三段幂等保护
     - tool fn 已 commit DB 但 commit 后副作用（钉钉通知 / 文件写入 / 后续 RPC）抛错时，restore + 重试不会重复创建草稿
     - ERP 写（batch_approve_vouchers 内部 phase1 调 ERP create_voucher）已用 `client_request_id="hub-draft-{draft.id}"` 做 ERP 端幂等键（与本层互补；见 §14.2）
@@ -1077,7 +1078,7 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 
 ---
 
-**Spec 结束（v6）**
+**Spec 结束（v7）**
 
 > v4 改动（同步 plan 第三轮 review 6 条修复）：
 > - §4.2 凭证审批场景改为两阶段提交 + 幂等键 + creating 5 min 租约恢复语义
@@ -1092,5 +1093,9 @@ C 阶段 90% 代码无改动 — Plan 6 在它上面加层。明确"哪些直接
 >
 > v6 改动（同步 plan v9 review 第八轮 写 tool 真幂等）：
 > - §3.1 ToolRegistry.call 伪代码加 action_id 注入：`kwargs["confirmation_action_id"] = action_id`
-> - §5.4 三张写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）加 `confirmation_action_id VARCHAR(16)` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
+> - §5.4 三张写草稿表（voucher_draft / price_adjustment_request / stock_adjustment_request）加 `confirmation_action_id` 字段 + 部分唯一索引 `(requester_hub_user_id, confirmation_action_id) WHERE NOT NULL`
 > - §8.4 加"写 tool 重试幂等性"条目：作为 restore-on-failure 设计的安全前提；写 tool fn 必须用 action_id 做"先查后插 + IntegrityError catch"幂等保护
+>
+> v7 改动（同步 plan v11 review 第十轮 action_id 防长期碰撞）：
+> - action_id 从 `uuid4().hex[:8]`（32 bit 熵）改为完整 `uuid4().hex`（128 bit 熵），消除单用户长期累计几万写操作后的生日碰撞风险
+> - §5.4 三张写草稿表 `confirmation_action_id` 列从 `VARCHAR(16)` 改为 `VARCHAR(64)`
