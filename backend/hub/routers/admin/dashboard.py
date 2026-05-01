@@ -11,12 +11,15 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Request
 
 from hub.auth.admin_perms import require_hub_perm
 from hub.models import TaskLog
+
+logger = logging.getLogger("hub.routers.admin.dashboard")
 
 router = APIRouter(prefix="/hub/v1/admin/dashboard", tags=["admin-dashboard"])
 
@@ -130,24 +133,31 @@ async def dashboard(request: Request):
 # ============================================================
 
 async def _get_llm_cost_metrics() -> dict:
-    """计算 LLM 成本指标（今日 + 本月 + 预算告警）。"""
+    """计算 LLM 成本指标（今日 + 本月 + 预算告警）。
+
+    性能提示：本月数据加载到 Python 后聚合（O(N) 内存）；
+    今日子集 in-memory 过滤（避免 2 次 DB round-trip）。
+    生产数据量大时可改 Tortoise annotate(Sum) 让 DB 算（follow-up）。
+
+    时区：按 UTC 算 today_start / month_start；UI"今日"/"本月"语义按 UTC，
+    与项目其他 since-24h 计算（task_log）一致。
+    """
     from hub.models.conversation import ConversationLog
 
     now = datetime.now(UTC)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    # 今日数据
-    today_logs = await ConversationLog.filter(started_at__gte=today_start).all()
+    # 一次拉本月，今日子集 in-memory 过滤
+    month_logs = await ConversationLog.filter(started_at__gte=month_start).all()
+    today_logs = [log for log in month_logs if log.started_at >= today_start]
+
     today_calls = len(today_logs)
     today_tokens = sum(log.tokens_used or 0 for log in today_logs)
     today_cost = sum(
         float(log.tokens_cost_yuan) if log.tokens_cost_yuan is not None else 0.0
         for log in today_logs
     )
-
-    # 本月累计
-    month_logs = await ConversationLog.filter(started_at__gte=month_start).all()
     month_cost = sum(
         float(log.tokens_cost_yuan) if log.tokens_cost_yuan is not None else 0.0
         for log in month_logs
@@ -185,5 +195,5 @@ async def _get_month_budget() -> float:
             if isinstance(val, dict) and "value" in val:
                 return float(val["value"])
     except Exception:
-        pass
+        logger.exception("读 month_llm_budget_yuan 失败，回落默认 1000")
     return 1000.0

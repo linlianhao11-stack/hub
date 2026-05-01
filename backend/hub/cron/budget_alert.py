@@ -1,6 +1,6 @@
 """Plan 6 Task 14：月度 LLM 预算超 80% 钉钉告警 cron。
 
-每天 09:10 跑（错开既有 cron）；
+每天 09:00 跑（scheduler at_hour=9，整点触发）；
 若本月累计 cost ≥ budget * 80% 且 24h 内未告过警 → 钉钉发所有 platform_admin 用户。
 
 四个分支：
@@ -26,6 +26,13 @@ async def run_budget_alert(*, sender: DingTalkSender) -> dict:
     """跑一次预算告警检查。返回 {sent: bool, reason: str}。
 
     供 cron 调度调用 + 测试单元复用。
+
+    设计取舍：
+    - cooldown 在 send 之后写：发送失败时不消耗 cooldown，能立即重试。
+      副作用：手动复跑 + 并发场景理论上能发出双告警；cron 一天 1 次实际几乎不触发。
+    - 部分成功也写 cooldown：N 个 admin 中 1 个成功就视为已通知；
+      失败的 N-1 个不重试。理由：失败大概率是结构性（access_token 失效），
+      24h 内不重发避免风暴；admin 应通过 audit log 看到失败再修。
     """
     from hub.routers.admin.dashboard import _get_llm_cost_metrics
 

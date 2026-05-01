@@ -17,9 +17,9 @@ from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup, setup_full
 from hub.routers.admin import ai_providers as admin_ai_providers
 from hub.routers.admin import approvals as admin_approvals
-from hub.routers.admin import contract_templates as admin_contract_templates
 from hub.routers.admin import audit as admin_audit
 from hub.routers.admin import channels as admin_channels
+from hub.routers.admin import contract_templates as admin_contract_templates
 from hub.routers.admin import conversation as admin_conversation
 from hub.routers.admin import dashboard as admin_dashboard
 from hub.routers.admin import downstreams as admin_downstreams
@@ -140,7 +140,7 @@ async def lifespan(app: FastAPI):
     app.state.dingtalk_connect_task = connect_task
 
     # 6. cron 调度器（Plan 5 Task 10）：每天 03:00 巡检 + 04:00 清理 payload
-    #    Plan 6 Task 14：09:10 月度 LLM 预算告警
+    #    Plan 6 Task 14：09:00 月度 LLM 预算告警
     from hub.cron.jobs import run_daily_audit, run_payload_cleanup
     from hub.cron.scheduler import CronScheduler
     scheduler = CronScheduler()
@@ -153,13 +153,12 @@ async def lifespan(app: FastAPI):
     async def _job_cleanup():
         await run_payload_cleanup()
 
-    # Plan 6 Task 14：每天 09:10 检查月度 LLM 预算，超 80% 发钉钉告警
+    # Plan 6 Task 14：每天 09:00 检查月度 LLM 预算，超 80% 发钉钉告警
     # 注意：sender 依赖 ChannelApp 配置，若未配置则 cron 内部跳过并记 WARNING
     @scheduler.at_hour(9)
     async def _job_budget_alert():
-        from hub.cron.budget_alert import run_budget_alert
         from hub.adapters.channel.dingtalk_sender import DingTalkSender
-        from hub.adapters.channel.dingtalk_stream import DingTalkStreamAdapter
+        from hub.cron.budget_alert import run_budget_alert
         from hub.crypto import decrypt_secret
         from hub.models import ChannelApp
 

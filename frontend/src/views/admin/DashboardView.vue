@@ -1,3 +1,7 @@
+<!--
+  Plan 6 Task 14 加 LLM 成本 section 后已 ~390 行；
+  follow-up：抽出 DashboardLlmCostSection.vue 子组件让本 view 回到 ~250 行。
+-->
 <template>
   <div class="hub-page">
     <h1 class="hub-page__title">仪表盘</h1>
@@ -350,8 +354,8 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 .hub-dashboard__budget--alert {
-  border-color: var(--warning, #f59e0b);
-  background: color-mix(in srgb, var(--warning, #f59e0b) 8%, var(--surface));
+  border-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
 }
 .hub-dashboard__budget-header {
   display: flex;
@@ -372,16 +376,16 @@ onBeforeUnmount(() => {
 }
 .hub-dashboard__progress-fill {
   height: 100%;
-  background: var(--success, #10b981);
+  background: var(--success);
   border-radius: 4px;
   transition: width 0.3s ease-out;
 }
 .hub-dashboard__budget--alert .hub-dashboard__progress-fill {
-  background: var(--warning, #f59e0b);
+  background: var(--warning);
 }
 .hub-dashboard__budget-alert-msg {
   font-size: 13px;
-  color: var(--warning, #f59e0b);
+  color: var(--warning);
   font-weight: 500;
 }
 @media (max-width: 1100px) {

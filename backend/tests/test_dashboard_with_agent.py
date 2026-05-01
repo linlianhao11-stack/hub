@@ -10,9 +10,8 @@ import pytest_asyncio
 from fakeredis import aioredis as fakeredis_aio
 from httpx import ASGITransport, AsyncClient
 
-from hub.models import SystemConfig, TaskLog
+from hub.models import SystemConfig
 from hub.models.conversation import ConversationLog
-
 
 # ============================================================
 # 共用 helper：复用 test_admin_dashboard.py 的 _setup_admin 模式
@@ -295,3 +294,34 @@ async def test_llm_cost_preserves_existing_dashboard_fields(fake_redis):
         assert "success_rate" in body["today"]
         # hourly 为列表
         assert isinstance(body["hourly"], list)
+
+
+# ============================================================
+# Case 9：恰好 80% 边界 → budget_alert=True（review M10）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_llm_cost_budget_alert_exactly_80pct(fake_redis):
+    """v2 加固（review M10）：cost = budget * 80% 恰好边界 → budget_alert=True。"""
+    app, cookie = await _setup_admin(erp_user_id=108)
+    app.state.redis = fake_redis
+
+    now = datetime.now(UTC)
+    # 默认 budget=1000；800.0 = 80%
+    await ConversationLog.create(
+        conversation_id="c-exact-80",
+        started_at=now, channel_userid="u-exact-80",
+        rounds_count=1, tokens_used=10000,
+        tokens_cost_yuan=Decimal("800.0"),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://t",
+        cookies={"hub_session": cookie},
+    ) as ac:
+        resp = await ac.get("/hub/v1/admin/dashboard")
+        assert resp.status_code == 200
+        cost = resp.json()["llm_cost"]
+        assert cost["budget_alert"] is True
+        assert cost["budget_used_pct"] >= 80.0

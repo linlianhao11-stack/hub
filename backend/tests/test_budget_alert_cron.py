@@ -8,13 +8,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from hub.cron.budget_alert import (
-    _mark_alerted,
     _recently_alerted,
     run_budget_alert,
 )
 from hub.models import SystemConfig
 from hub.models.conversation import ConversationLog
-
 
 # ============================================================
 # Case 1：成本 < 80% → 不发告警
@@ -24,7 +22,12 @@ from hub.models.conversation import ConversationLog
 async def test_budget_alert_below_threshold_skips_send():
     """成本 < 80%（无 ConversationLog）→ 不发告警。"""
     sender = AsyncMock()
-    result = await run_budget_alert(sender=sender)
+    # 显式 mock budget = 1000（避免依赖默认值漂移）
+    with patch(
+        "hub.routers.admin.dashboard._get_month_budget",
+        new=AsyncMock(return_value=1000.0),
+    ):
+        result = await run_budget_alert(sender=sender)
     assert result["sent"] is False
     assert "未达" in result["reason"]
     sender.send_text.assert_not_called()
@@ -137,7 +140,37 @@ async def test_budget_alert_sends_to_admin_dingtalk():
 
 
 # ============================================================
-# Case 5：_recently_alerted 逻辑（刚告警 < 24h → True）
+# Case 5：有 admin 用户但无钉钉绑定 → reason="无 admin 钉钉绑定"（review I4）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_budget_alert_admin_users_exist_but_no_binding():
+    """v2 加固（review I4）：有 admin 用户但都没钉钉绑定 → reason='无 admin 钉钉绑定'。"""
+    sender = AsyncMock()
+
+    # 制造高成本数据（触发 budget_alert）
+    now = datetime.now(UTC)
+    await ConversationLog.create(
+        conversation_id="c-budget-no-binding",
+        started_at=now, channel_userid="u-no-binding",
+        rounds_count=1, tokens_used=10000,
+        tokens_cost_yuan=Decimal("850.0"),
+    )
+
+    # mock 返回若干 admin user_id，但 ChannelUserBinding 表查不到对应钉钉绑定
+    with patch(
+        "hub.cron.budget_alert._list_platform_admin_user_ids",
+        new=AsyncMock(return_value=[999, 1000]),
+    ):
+        result = await run_budget_alert(sender=sender)
+
+    assert result["sent"] is False
+    assert "钉钉绑定" in result["reason"]
+    sender.send_text.assert_not_called()
+
+
+# ============================================================
+# Case 7：_recently_alerted 逻辑（刚告警 < 24h → True）
 # ============================================================
 
 @pytest.mark.asyncio
@@ -154,7 +187,7 @@ async def test_recently_alerted_returns_true_within_cooldown():
 
 
 # ============================================================
-# Case 6：_recently_alerted 逻辑（超过 24h → False）
+# Case 8：_recently_alerted 逻辑（超过 24h → False）
 # ============================================================
 
 @pytest.mark.asyncio
