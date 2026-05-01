@@ -16,14 +16,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from unittest.mock import AsyncMock
 
 from hub.models import ConversationLog, TaskLog, ToolCallLog
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: 复用 admin_client 的构建逻辑（不依赖跨文件 fixture import）

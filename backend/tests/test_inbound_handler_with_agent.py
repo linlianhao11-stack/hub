@@ -15,7 +15,6 @@ from hub.agent.types import AgentResult
 from hub.handlers.dingtalk_inbound import RE_CONFIRM, handle_inbound
 from hub.services.identity_service import IdentityResolution
 
-
 # ===== 公共 fixture =====
 
 def _make_payload(content: str, userid: str = "U1", conv_id: str = "dingtalk:U1") -> dict:

@@ -1,20 +1,26 @@
 # hub/agent/tools/registry.py
 from __future__ import annotations
+
 import inspect
 import logging
 import time
-from typing import Any, Callable, get_type_hints
+from collections.abc import Callable
+from typing import Any, get_type_hints
 
-from hub.permissions import require_permissions, has_permission
-from hub.observability.tool_logger import log_tool_call
-from hub.agent.tools.types import (
-    ToolType, ToolDef,
-    UnconfirmedWriteToolError, MissingConfirmationError, ClaimFailedError,
-    ToolNotFoundError, ToolArgsValidationError, ToolRegistrationError,
-)
+from hub.agent.memory.session import SessionMemory
 from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.agent.tools.entity_extractor import EntityExtractor
-from hub.agent.memory.session import SessionMemory
+from hub.agent.tools.types import (
+    ClaimFailedError,
+    MissingConfirmationError,
+    ToolArgsValidationError,
+    ToolDef,
+    ToolNotFoundError,
+    ToolRegistrationError,
+    ToolType,
+)
+from hub.observability.tool_logger import log_tool_call
+from hub.permissions import has_permission, require_permissions
 
 logger = logging.getLogger("hub.agent.tools.registry")
 
@@ -100,15 +106,22 @@ class ToolRegistry:
 
     def _py_to_json_type(self, t):
         """Python type → OpenAI function schema type。"""
-        if t is int: return "integer"
-        if t is str: return "string"
-        if t is float: return "number"
-        if t is bool: return "boolean"
+        if t is int:
+            return "integer"
+        if t is str:
+            return "string"
+        if t is float:
+            return "number"
+        if t is bool:
+            return "boolean"
         # typing.List / typing.Dict / typing.Optional[X] 等需要解 origin
         origin = getattr(t, "__origin__", None)
-        if origin is list: return "array"
-        if origin is dict: return "object"
-        if origin is type(None) or t is type(None): return "null"
+        if origin is list:
+            return "array"
+        if origin is dict:
+            return "object"
+        if origin is type(None) or t is type(None):
+            return "null"
         # Optional[X] 取 X
         args = getattr(t, "__args__", ())
         non_none = [a for a in args if a is not type(None)]
@@ -258,7 +271,7 @@ class ToolRegistry:
 
     def _validate_args(self, args: dict, schema: dict):
         """jsonschema validate；不符抛 ToolArgsValidationError。"""
-        from jsonschema import validate, ValidationError
+        from jsonschema import ValidationError, validate
         try:
             validate(instance=args, schema=schema["function"]["parameters"])
         except ValidationError as e:

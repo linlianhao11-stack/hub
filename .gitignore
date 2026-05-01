@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 .venv/
 *.egg-info/
+# uv 锁文件——project 当前不持久化（保持与 main 的现状一致；
+# 如需可重复构建迁移到 commit lockfile，需统一所有 dev/CI 环境一次更新）
+uv.lock
 
 # Env
 .env

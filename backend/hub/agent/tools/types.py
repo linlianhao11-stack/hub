@@ -1,7 +1,7 @@
 # hub/agent/tools/types.py
-from enum import StrEnum
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+from enum import StrEnum
 
 
 class ToolType(StrEnum):

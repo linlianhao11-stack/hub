@@ -1,15 +1,17 @@
 """Plan 6 Task 9：聚合分析 tool 测试（≥6 case）。"""
 import os
-import pytest
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
-from datetime import datetime, UTC
 
-from hub.agent.tools.analyze_tools import (
-    analyze_top_customers, analyze_slow_moving_products,
-    register_all, _parse_period_days,
-    MAX_ORDERS, MAX_PERIOD_DAYS,
-)
+import pytest
+
 from hub.agent.tools import erp_tools
+from hub.agent.tools.analyze_tools import (
+    _parse_period_days,
+    analyze_slow_moving_products,
+    analyze_top_customers,
+    register_all,
+)
 
 
 @pytest.fixture
@@ -184,8 +186,8 @@ async def test_analyze_slow_moving_products_top_n_limit(mock_erp):
 
 async def test_register_all_registers_2_analyze_tools(redis_client):
     """v2 加固：用真 ToolRegistry 验 register fail-fast 通过（READ 类不需 confirmation_action_id）。"""
-    from hub.agent.tools.registry import ToolRegistry
     from hub.agent.tools.confirm_gate import ConfirmGate
+    from hub.agent.tools.registry import ToolRegistry
     from hub.agent.tools.types import ToolType
     cg = ConfirmGate(redis_client)
     sm = AsyncMock()

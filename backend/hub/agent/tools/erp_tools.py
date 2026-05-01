@@ -7,12 +7,11 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 
 from hub.adapters.downstream.erp4 import Erp4Adapter
 from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import ToolType
-
 
 _erp_adapter: Erp4Adapter | None = None
 

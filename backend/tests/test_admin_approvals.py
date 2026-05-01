@@ -27,7 +27,6 @@ from hub.adapters.downstream.erp4 import ErpSystemError
 from hub.models.audit import AuditLog
 from hub.models.draft import VoucherDraft
 
-
 # ============================================================
 # 辅助：创建有指定权限的 admin 用户
 # ============================================================
@@ -39,7 +38,11 @@ async def _setup_approvals_admin(perm_codes: list[str], erp_user_id: int = ERP_U
     """创建具有指定权限的 admin 用户，返回 (transport, cookie, hub_user)。"""
     from hub.auth.erp_session import ErpSessionAuth
     from hub.models import (
-        DownstreamIdentity, HubPermission, HubRole, HubUser, HubUserRole,
+        DownstreamIdentity,
+        HubPermission,
+        HubRole,
+        HubUser,
+        HubUserRole,
     )
     from hub.seed import run_seed
     from main import app
@@ -546,7 +549,7 @@ async def test_voucher_batch_approve_concurrent_locks_in_progress(
     用 patch "hub.routers.admin.approvals.VoucherDraft" 的 filter 链 → update 返 0
     模拟另一进程已先抢占该 draft。
     """
-    from unittest.mock import patch, AsyncMock, MagicMock
+    from unittest.mock import patch
     ac, _ = voucher_admin_client
 
     draft = await VoucherDraft.create(

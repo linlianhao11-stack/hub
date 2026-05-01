@@ -1,12 +1,14 @@
 """Plan 6 Task 6：ContextBuilder 测试（4 case）。"""
 from __future__ import annotations
+
 import json
+
 import pytest
 
 from hub.agent.context_builder import ContextBuilder
-from hub.agent.types import PromptTooLargeError
-from hub.agent.memory.types import Memory, ConversationHistory
+from hub.agent.memory.types import ConversationHistory, Memory
 from hub.agent.prompt.builder import PromptBuilder
+from hub.agent.types import PromptTooLargeError
 
 
 def _empty_memory() -> Memory:
@@ -127,7 +129,7 @@ async def test_can_truncate_drops_low_priority_when_no_room():
     memory = _empty_memory()
 
     # 先用真实 build_round 拿到 system prompt 的 token 数，估算 budget
-    base_messages = await builder.build_round(
+    _base_messages = await builder.build_round(
         round_idx=0,
         base_memory=memory,
         tools_schema=[],

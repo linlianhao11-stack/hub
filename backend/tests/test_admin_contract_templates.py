@@ -30,7 +30,6 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-
 # ──────────────────────────────────────────────
 # 辅助：生成内含占位符的 docx 字节流
 # ──────────────────────────────────────────────

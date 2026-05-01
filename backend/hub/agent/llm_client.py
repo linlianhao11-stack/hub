@@ -4,6 +4,7 @@
 扩展支持 OpenAI tools=API 的 tool_calls 解析。
 """
 from __future__ import annotations
+
 import json
 import logging
 from typing import Any
@@ -11,7 +12,7 @@ from typing import Any
 import httpx
 
 from hub.agent.types import AgentLLMResponse, ToolCall
-from hub.capabilities.deepseek import LLMServiceError, LLMParseError
+from hub.capabilities.deepseek import LLMParseError, LLMServiceError
 
 logger = logging.getLogger("hub.agent.llm_client")
 

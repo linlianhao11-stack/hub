@@ -14,7 +14,6 @@ import pytest
 from hub.agent.types import AgentResult
 from hub.services.identity_service import IdentityResolution
 
-
 # ===== 辅助 =====
 
 def _payload(content: str, userid: str = "m1") -> dict:

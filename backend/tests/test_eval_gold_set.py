@@ -7,15 +7,15 @@
    断言 satisfaction_pct ≥ 80%（plan §3236 真实 CI 阈值）；CI 默认跳过 -m eval。
 """
 from __future__ import annotations
+
 import json
-import pytest
-from pathlib import Path
 from collections import Counter
 
-from hub.agent.eval import EvalRunner, EvalReport, load_gold_set
+import pytest
+
+from hub.agent.eval import EvalReport, EvalRunner, load_gold_set
 from hub.agent.eval.runner import CaseResult, _build_mock_llm_responses
 from hub.agent.types import AgentLLMResponse, AgentResult
-
 
 # ===========================================================================
 # Fixtures

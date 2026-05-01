@@ -7,27 +7,29 @@
 - ConversationLog 用真 PG（conftest.py setup_db 已处理）
 """
 from __future__ import annotations
+
 import asyncio
 import uuid
+from unittest.mock import AsyncMock
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from hub.agent.chain_agent import ChainAgent
-from hub.agent.context_builder import ContextBuilder
 from hub.agent.llm_client import AgentLLMClient
 from hub.agent.memory.loader import MemoryLoader
 from hub.agent.memory.session import SessionMemory
-from hub.agent.memory.types import Memory, ConversationHistory
+from hub.agent.memory.types import ConversationHistory, Memory
 from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.agent.tools.registry import ToolRegistry
-from hub.agent.tools.types import MissingConfirmationError, ClaimFailedError
+from hub.agent.tools.types import ClaimFailedError, MissingConfirmationError
 from hub.agent.types import (
-    AgentResult, AgentLLMResponse, ToolCall, AgentMaxRoundsExceeded,
+    AgentLLMResponse,
+    AgentMaxRoundsError,
+    ToolCall,
 )
-from hub.capabilities.deepseek import LLMServiceError, LLMParseError
+from hub.capabilities.deepseek import LLMParseError, LLMServiceError
 from hub.error_codes import BizError
-
 
 REDIS_URL = "redis://localhost:6380/0"
 TEST_CONV_PREFIX = "hub:agent:conv:test-chain-"
@@ -216,15 +218,15 @@ async def test_multi_round_tool_calls():
 
 @pytest.mark.asyncio
 async def test_max_rounds_exceeded_raises():
-    """mock LLM 永远调 tool → 5 round 后 AgentMaxRoundsExceeded 被捕获，返 error_result。"""
-    # ChainAgent.run 内部 raise AgentMaxRoundsExceeded 但它不被 reraise，而是写 log 然后在 finally 中返回
-    # 实际上 AgentMaxRoundsExceeded 是 raise 出去的，外层需要捕获
+    """mock LLM 永远调 tool → 5 round 后 AgentMaxRoundsError 被捕获，返 error_result。"""
+    # ChainAgent.run 内部 raise AgentMaxRoundsError 但它不被 reraise，而是写 log 然后在 finally 中返回
+    # 实际上 AgentMaxRoundsError 是 raise 出去的，外层需要捕获
     agent = _make_agent(llm_chat_return=_tool_call_response("some_tool", {}))
     registry = _make_mock_registry()
     registry.call = AsyncMock(return_value={"ok": True})
     agent.registry = registry
 
-    with pytest.raises(AgentMaxRoundsExceeded):
+    with pytest.raises(AgentMaxRoundsError):
         await agent.run(
             "无限循环测试",
             hub_user_id=1, conversation_id=_conv_id("max-rounds"),
@@ -399,7 +401,7 @@ async def test_user_just_confirmed_builds_hint(confirm_gate, session_memory):
         memory_loader=loader,
     )
 
-    result = await agent.run(
+    _result = await agent.run(
         "是",
         hub_user_id=1, conversation_id=conv_id,
         acting_as=101,

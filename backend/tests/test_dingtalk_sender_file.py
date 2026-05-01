@@ -1,7 +1,8 @@
 """Plan 6 Task 7：DingTalkSender.send_file 测试（5 case）。"""
-import pytest
-import httpx
 from unittest.mock import AsyncMock
+
+import httpx
+import pytest
 
 
 class _MultiResponseHandler:

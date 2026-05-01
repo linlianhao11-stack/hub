@@ -68,7 +68,6 @@ async def test_scheduler_start_is_idempotent():
 @pytest.mark.asyncio
 async def test_multiple_jobs_at_same_hour_all_triggered():
     """v2 加固（review C1）：同小时注册多个 job，所有都被调度。"""
-    from datetime import timedelta
     from zoneinfo import ZoneInfo
 
     counter_a = {"count": 0}

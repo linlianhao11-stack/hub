@@ -14,7 +14,7 @@ import base64
 import io
 import logging
 import re
-from typing import Literal, Optional
+from typing import Literal
 
 from docx import Document
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -44,18 +44,18 @@ class ContractTemplateRow(BaseModel):
     id: int
     name: str
     template_type: str
-    description: Optional[str] = None
+    description: str | None = None
     placeholders: list[dict]
     is_active: bool
-    created_by_hub_user_id: Optional[int] = None
+    created_by_hub_user_id: int | None = None
     created_at: str
 
 
 class ContractTemplateUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, max_length=200)
+    name: str | None = Field(default=None, max_length=200)
     # v2 加固（review M2）：用 Literal 替代手工校验
-    template_type: Optional[Literal["sales", "purchase", "framework", "quote", "other"]] = None
-    description: Optional[str] = Field(default=None, max_length=1000)
+    template_type: Literal["sales", "purchase", "framework", "quote", "other"] | None = None
+    description: str | None = Field(default=None, max_length=1000)
 
 
 def _scan_cell(cell, found: dict, pattern) -> None:
@@ -119,7 +119,7 @@ async def upload_template(
     name: str = Form(..., max_length=200),
     template_type: str = Form(..., max_length=50),
     # v2 加固（review M6）：description 改为 Optional，允许不传
-    description: Optional[str] = Form(None, max_length=1000),
+    description: str | None = Form(None, max_length=1000),
     file: UploadFile = File(...),
 ):
     """上传合同模板 docx 文件。
@@ -202,8 +202,8 @@ async def upload_template(
     summary="合同模板列表",
 )
 async def list_templates(
-    template_type: Optional[str] = None,
-    is_active: Optional[bool] = None,
+    template_type: str | None = None,
+    is_active: bool | None = None,
     # v2 加固（review M5）：limit/offset 加 clamp，防无限查询
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),

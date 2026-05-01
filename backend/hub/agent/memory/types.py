@@ -1,5 +1,6 @@
 """Plan 6 Task 4：Memory 类型定义。"""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any
 

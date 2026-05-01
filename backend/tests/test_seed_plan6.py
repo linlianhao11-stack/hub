@@ -1,14 +1,17 @@
 """Plan 6 Task 17：seed.py 升级测试（13 新权限 + 2 新角色 + 业务词典）。"""
 from __future__ import annotations
+
 import pytest
 
-from hub.seed import (
-    PERMISSIONS, ROLES, run_seed,
-    DEFAULT_BUSINESS_DICT_SEED, _seed_business_dict,
-)
 from hub.models import HubPermission, HubRole
 from hub.models.config import SystemConfig
-
+from hub.seed import (
+    DEFAULT_BUSINESS_DICT_SEED,
+    PERMISSIONS,
+    ROLES,
+    _seed_business_dict,
+    run_seed,
+)
 
 # ===== 静态 schema 检查（不需 DB） =====
 

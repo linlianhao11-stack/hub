@@ -1,10 +1,11 @@
 """Task 5: PromptBuilder + 业务词典 + 同义词 + few-shots 测试（12 case）。"""
 import pytest
+
+from hub.agent.memory.types import ConversationHistory, Memory
 from hub.agent.prompt.builder import PromptBuilder
 from hub.agent.prompt.business_dict import DEFAULT_DICT, render_dict
-from hub.agent.prompt.synonyms import DEFAULT_SYNONYMS, render_synonyms, normalize
-from hub.agent.prompt.few_shots import DEFAULT_FEW_SHOTS, FewShot, render_few_shots
-from hub.agent.memory.types import Memory, ConversationHistory
+from hub.agent.prompt.few_shots import DEFAULT_FEW_SHOTS
+from hub.agent.prompt.synonyms import DEFAULT_SYNONYMS, normalize
 
 
 def test_business_dict_has_required_keys():
@@ -228,3 +229,47 @@ def test_builder_does_not_leak_confidence_to_prompt():
     assert "用户偏好分期付款" in prompt
     assert "0.85" not in prompt  # confidence 不应泄漏给 LLM
     assert "confidence" not in prompt
+
+
+# ===== v8 review P2-#3: PromptBuilder.from_db 从 SystemConfig 加载 admin 配置 =====
+
+
+@pytest.mark.asyncio
+async def test_from_db_loads_admin_business_dict_overrides_default():
+    """admin 配置 business_dict 后 from_db() 加载到 builder（覆盖默认）。"""
+    from hub.models import SystemConfig
+
+    custom = {
+        "新业务术语": "管理员加的解释",
+        "压货": "改了的描述（覆盖 DEFAULT）",
+    }
+    await SystemConfig.create(key="business_dict", value=custom)
+
+    builder = await PromptBuilder.from_db()
+    # admin 加的新 key
+    assert builder.business_dict.get("新业务术语") == "管理员加的解释"
+    # admin 覆盖了 DEFAULT 里的 "压货"
+    assert builder.business_dict.get("压货") == "改了的描述（覆盖 DEFAULT）"
+    # DEFAULT_DICT 其他 key 仍保留（防 admin 误删）
+    assert "周转" in builder.business_dict
+
+
+@pytest.mark.asyncio
+async def test_from_db_uses_default_when_no_config():
+    """SystemConfig 中无 business_dict 时回落 DEFAULT_DICT。"""
+    builder = await PromptBuilder.from_db()
+    # 与 DEFAULT_DICT 至少含相同 key
+    assert "压货" in builder.business_dict
+    assert builder.business_dict["压货"] == DEFAULT_DICT["压货"]
+
+
+@pytest.mark.asyncio
+async def test_from_db_falls_back_when_value_not_dict():
+    """value 不是 dict 时（如 list）回落 DEFAULT_DICT，不挂。"""
+    from hub.models import SystemConfig
+
+    # JSONField 接受合法 JSON 但本场景期望 dict；list 应触发 isinstance 兜底
+    await SystemConfig.create(key="business_dict", value=["invalid", "list"])
+    builder = await PromptBuilder.from_db()
+    # 不挂；回落 DEFAULT
+    assert "压货" in builder.business_dict

@@ -1,13 +1,15 @@
 """Plan 6 Task 4：MemoryLoader 组装四层 + token 上限截断。"""
 from __future__ import annotations
+
 import logging
 
-from hub.agent.memory.session import SessionMemory
 from hub.agent.memory.persistent import (
-    UserMemoryService, CustomerMemoryService, ProductMemoryService,
+    CustomerMemoryService,
+    ProductMemoryService,
+    UserMemoryService,
 )
+from hub.agent.memory.session import SessionMemory
 from hub.agent.memory.types import Memory
-
 
 logger = logging.getLogger("hub.agent.memory.loader")
 

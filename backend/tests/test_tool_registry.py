@@ -8,21 +8,21 @@
 from __future__ import annotations
 
 import asyncio
-import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
-from hub.agent.tools.registry import ToolRegistry
+import pytest
+
 from hub.agent.tools.confirm_gate import ConfirmGate
+from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import (
-    ToolType,
-    UnconfirmedWriteToolError,
-    MissingConfirmationError,
     ClaimFailedError,
+    MissingConfirmationError,
     ToolArgsValidationError,
     ToolRegistrationError,
+    ToolType,
+    UnconfirmedWriteToolError,
 )
 from hub.error_codes import BizError
-
 
 # ====== Fixtures ======
 
@@ -392,11 +392,11 @@ async def test_action_id_uniqueness_for_duplicate_args(reg):
 
     with patch("hub.agent.tools.registry.require_permissions", AsyncMock(return_value=None)):
         # 调用第一个：成功，第二个仍可用
-        r1 = await reg.call("create_voucher_draft", {
+        _r1 = await reg.call("create_voucher_draft", {
             **args, "confirmation_action_id": confirmed[0]["action_id"],
             "confirmation_token": confirmed[0]["token"],
         }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)
-        r2 = await reg.call("create_voucher_draft", {
+        _r2 = await reg.call("create_voucher_draft", {
             **args, "confirmation_action_id": confirmed[1]["action_id"],
             "confirmation_token": confirmed[1]["token"],
         }, hub_user_id=1, acting_as=2, conversation_id="c1", round_idx=0)

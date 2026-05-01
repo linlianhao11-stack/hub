@@ -6,8 +6,9 @@
 - 30 min TTL 自动清理
 """
 from __future__ import annotations
+
 import json
-from typing import Iterable
+from collections.abc import Iterable
 
 from redis.asyncio import Redis
 

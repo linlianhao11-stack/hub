@@ -6,37 +6,36 @@
 """
 from __future__ import annotations
 
-import pytest
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 from httpx import MockTransport, Response
 
 from hub.adapters.downstream.erp4 import (
     Erp4Adapter,
+    ErpNotFoundError,
     ErpPermissionError,
     ErpSystemError,
-    ErpNotFoundError,
 )
+from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.agent.tools.erp_tools import (
-    set_erp_adapter,
-    current_erp_adapter,
-    search_products,
-    search_customers,
-    get_product_detail,
-    get_customer_history,
     check_inventory,
-    search_orders,
-    get_order_detail,
+    current_erp_adapter,
     get_customer_balance,
+    get_customer_history,
     get_inventory_aging,
+    get_order_detail,
+    get_product_detail,
     register_all,
+    search_customers,
+    search_orders,
+    search_products,
+    set_erp_adapter,
 )
 from hub.agent.tools.registry import ToolRegistry
-from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.error_codes import BizError
-
 
 # ============================================================
 # Fixtures

@@ -1,12 +1,16 @@
 """Plan 6 Task 4：MemoryWriter 测试（11 case）。"""
 from __future__ import annotations
-import pytest
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
-from hub.agent.memory.writer import MemoryWriter
+from unittest.mock import ANY, AsyncMock, MagicMock
+
+import pytest
+
 from hub.agent.memory.persistent import (
-    UserMemoryService, CustomerMemoryService, ProductMemoryService,
+    CustomerMemoryService,
+    ProductMemoryService,
+    UserMemoryService,
 )
+from hub.agent.memory.writer import MemoryWriter
 
 
 def _make_tool_log(tool_name: str, result_json=None, args_json=None):

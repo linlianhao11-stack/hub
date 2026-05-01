@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -63,12 +62,12 @@ class VoucherDraftRow(BaseModel):
     id: int
     requester_hub_user_id: int
     voucher_data: dict
-    rule_matched: Optional[str]
+    rule_matched: str | None
     status: str
     created_at: str
-    creating_started_at: Optional[str]
-    erp_voucher_id: Optional[int]
-    rejection_reason: Optional[str]
+    creating_started_at: str | None
+    erp_voucher_id: int | None
+    rejection_reason: str | None
 
 
 @router.get(

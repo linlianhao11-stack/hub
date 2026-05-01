@@ -4,6 +4,7 @@
 覆盖：基础查询 / 多步推理 / 写操作（必须 confirm）/ 长尾说法。
 """
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 

@@ -1,8 +1,8 @@
 """Plan 6 Task 6：ChainAgent 公共类型。"""
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any
-
 
 # ===== LLM 响应 =====
 
@@ -53,21 +53,21 @@ class AgentResult:
     error: str | None = None
 
     @classmethod
-    def text_result(cls, text: str) -> "AgentResult":
+    def text_result(cls, text: str) -> AgentResult:
         return cls(kind="text", text=text)
 
     @classmethod
-    def clarification(cls, text: str) -> "AgentResult":
+    def clarification(cls, text: str) -> AgentResult:
         return cls(kind="clarification", text=text)
 
     @classmethod
-    def error_result(cls, error: str) -> "AgentResult":
+    def error_result(cls, error: str) -> AgentResult:
         return cls(kind="error", error=error)
 
 
 # ===== 错误类 =====
 
-class AgentMaxRoundsExceeded(Exception):
+class AgentMaxRoundsError(Exception):
     """5 round 后还要调 tool → 抛此错。"""
 
 class PromptTooLargeError(Exception):

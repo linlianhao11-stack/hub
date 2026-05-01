@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import logging
 
-from hub.models import HubPermission, HubRole, SystemConfig
-
 # v2 加固（review I1）：业务词典与 prompt/business_dict.py::DEFAULT_DICT 共享真相源
 # 避免 seed 写 DB 一份 / prompt 用模块常量一份导致 admin UI 看到的和 LLM 看到的发散
 from hub.agent.prompt.business_dict import DEFAULT_DICT as DEFAULT_BUSINESS_DICT_SEED
+from hub.models import HubPermission, HubRole, SystemConfig
 
 logger = logging.getLogger("hub.seed")
 

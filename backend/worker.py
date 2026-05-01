@@ -25,7 +25,9 @@ async def main():
     from hub.agent.llm_client import AgentLLMClient
     from hub.agent.memory.loader import MemoryLoader
     from hub.agent.memory.persistent import (
-        CustomerMemoryService, ProductMemoryService, UserMemoryService,
+        CustomerMemoryService,
+        ProductMemoryService,
+        UserMemoryService,
     )
     from hub.agent.memory.session import SessionMemory
     from hub.agent.prompt.builder import PromptBuilder
@@ -130,8 +132,9 @@ async def main():
         product=ProductMemoryService(),
     )
 
-    # 5. PromptBuilder（默认词典 / 同义词 / few-shots）
-    prompt_builder = PromptBuilder()
+    # 5. PromptBuilder（v8 review P2-#3：从 SystemConfig 加载 admin 编辑的 business_dict 覆盖默认）
+    # admin 后台改 SystemConfig.business_dict 后需重启 worker 生效（无热重载）
+    prompt_builder = await PromptBuilder.from_db()
 
     # 6. ContextBuilder
     context_builder = ContextBuilder(prompt_builder=prompt_builder)

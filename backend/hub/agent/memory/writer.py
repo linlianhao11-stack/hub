@@ -1,13 +1,15 @@
 """Plan 6 Task 4：MemoryWriter 异步抽事实 + should_extract gate。"""
 from __future__ import annotations
+
 import logging
 from typing import Any
 
 from hub.agent.memory.persistent import (
-    UserMemoryService, CustomerMemoryService, ProductMemoryService,
+    CustomerMemoryService,
+    ProductMemoryService,
+    UserMemoryService,
 )
 from hub.models.conversation import ToolCallLog
-
 
 logger = logging.getLogger("hub.agent.memory.writer")
 

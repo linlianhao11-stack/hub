@@ -12,8 +12,9 @@
 长期改进：ERP 加 analytics endpoint 直接 GROUP BY 出聚合结果（spec §14 备注，不在 Plan 6 范围）。
 """
 from __future__ import annotations
+
 import re
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 
 from hub.agent.tools.erp_tools import current_erp_adapter
 from hub.agent.tools.registry import ToolRegistry

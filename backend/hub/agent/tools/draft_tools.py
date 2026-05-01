@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+
 from tortoise.exceptions import IntegrityError
 
 from hub.adapters.downstream.erp4 import (

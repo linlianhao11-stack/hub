@@ -2,7 +2,11 @@
 
 **日期**：2026-05-01
 **分支**：`feature/plan6-agent`（HUB 仓库）+ `main`（ERP-4 仓库已合并）
-**状态**：19 个 task 全部完成 + code review 全过 + 文档化
+**状态**：**代码完成，待 staging 验收**（不要直接合并部署生产）
+
+> 19 个 task 代码 + 单测 + 文档已落地；
+> **release gate（合并到 main + 部署生产前必过）**：真 docker e2e（6 个用户故事）+ 真 LLM eval（30 条 gold set 满意度 ≥ 80%），见 §八。
+> 单测 / build / ruff / static review 全部就绪可作为合并前的最低门槛 ✅。
 
 ---
 
@@ -293,45 +297,56 @@
 
 ### 5. 业务词典单一真相源
 - seed.py 和 prompt/business_dict.py **同一对象引用**（`from ... import DEFAULT_DICT as DEFAULT_BUSINESS_DICT_SEED`）
-- admin 编辑写 SystemConfig；PromptBuilder 当前读模块常量（follow-up：加 from_db() 工厂）
+- admin 编辑写 SystemConfig；**PromptBuilder.from_db() 启动时合并 DEFAULT + admin 覆盖**（worker 启动注入）
+- admin 删 key 不会让 LLM 失忆：`merged = dict(DEFAULT_DICT); merged.update(admin_dict)`，DEFAULT 始终兜底
+- value 不是 dict（异常上游数据）→ 回落 DEFAULT，记 warning
+- 热重载：当前需重启 worker 生效；后续可加 reload endpoint 或定时 reload
 
 ---
 
-## 八、需要后续做的（follow-up）
+## 八、release gate / follow-up
 
-### 必做（在生产部署前）
-1. **真 docker e2e 验证**（运维侧）：跑 plan §3556 的 6 个用户故事
-   - 销售生成合同 → 收 docx
-   - 会计生成凭证 → 后台收草稿
-   - 批量通过 → ERP 真落库
-   - 调价审批
-   - dashboard 看成本
-   - task detail 看决策链
+### release gate（**生产部署前必须完成**，不是事后补丁）
 
-2. **真 LLM eval（pytest -m eval）**（Task 19 follow-up）：
-   - 用真 DeepSeek-V3 跑 30 条 gold set
-   - 实测满意度 vs 80% 阈值
-   - 实测 token 消耗 → 验证成本预测
+> 这两项是合并 main + 部署生产的**门禁条件**，不是上线后慢慢做的优化。
+> 任何一项不过都视为 Plan 6 未完成验收，主分支不许打 release tag。
 
-### 应做（早期版本可接受）
-3. **PromptBuilder.from_db() 工厂方法**（Task 17 I2 follow-up）：
-   - 当前 admin 编辑 business_dict 不影响 LLM（PromptBuilder 读模块常量）
-   - 应该 ChainAgent 启动时从 SystemConfig.business_dict 加载
-   - 影响：admin 想加新业务术语只能改代码
+1. **真 docker e2e（6 个用户故事跑通）**：
+   - **跑哪 6 个**：销售生成合同 → 收 docx；会计生成凭证 → 后台收草稿；批量通过 → ERP 真落库；调价审批；dashboard 看成本；task detail 看决策链（plan §3556）
+   - **执行人**：运维 + 产品 owner 双签
+   - **环境**：staging（真 ERP-4 / 真钉钉应用 / 真 deepseek-V3 key）
+   - **门槛**：6/6 全过；任何一个故事失败都阻塞 release
+   - **产出物**：录屏 + 钉钉收文件截图 + ERP 后台凭证截图 + audit_log 抓取
+   - **回滚预案**：一旦发现写操作 happy path 异常立即停发并保留全部日志
 
-4. **ConversationLog.task_id 直接关联**（Task 13 follow-up）：
+2. **真 LLM eval（pytest -m eval）**：
+   - **执行命令**：`pytest -m eval` 跑 30 条 gold set
+   - **后端**：真 DeepSeek-V3 API（不是 mock）
+   - **门槛**：满意度 ≥ 80%（plan 当初定的 CI 阈值）
+   - **附带产出**：实测 token / round / cost → 验证 plan §10 成本预测（月 3K-8K¥ 估算）
+   - **失败处理**：< 80% 不许合并；找出哪些 case 类型崩了（query? multi_step? write? business_dict?）→ 改 prompt / few-shots / business_dict 后重跑
+   - **预算护栏**：30 case × 5 round × 18K token ≈ 0.27M token；按 deepseek-V3 ¥0.01/K input 计单次 eval ≤ ¥3，可承担
+
+### 必做 follow-up（与上线不冲突，可上线后短期内补）
+
+3. **ConversationLog.task_id 直接关联**（Task 13 follow-up）：
    - 当前 channel_userid + ±30s 时间窗口模糊匹配
    - 多轮对话只能匹配首轮 task；后续轮次因 started_at 锚定首轮 → 落出 30s 窗口
    - 应加 task_id 字段或 turn_idx
 
-5. **ERP-4 测试基础设施 fixture pollution**（pre-existing，不阻塞 Task 18）：
+4. **ERP-4 测试基础设施 fixture pollution**（pre-existing，不阻塞 Task 18）：
    - 全量 pytest 跑 158 fail；隔离/小批量跑全过
    - 与 Task 18 改动无关（stash 后该 fail 仍存在）
    - 影响 ERP-4 自身的 CI 流；HUB 和 ERP-4 分别 CI 不冲突
 
-6. **scheduler 加分钟级精度**（Task 15 follow-up）：
+5. **scheduler 加分钟级精度**（Task 15 follow-up）：
    - 当前 at_hour 整点；budget_alert + draft_reminder 都 09:00
    - 已修同小时多 job 都触发的 bug；但分钟级触发还需扩 scheduler 接口
+
+6. **business_dict 热重载**（v8 review P2-#3 follow-up）：
+   - 当前 PromptBuilder.from_db() 在 worker 启动时读一次 SystemConfig
+   - admin 改完业务词典需重启 worker 才生效
+   - 应加 reload endpoint 或定时 reload（30min 周期）
 
 ### 优化（中期）
 7. **DashboardView LLM 成本 section 拆子组件**（Task 14 M5）：当前 390 行
@@ -343,32 +358,55 @@
 ### 可选（长期）
 12. **EvalRunner 加 max_concurrency**：Task 19 真 LLM eval 30 case 串行 5min；并发 5 路降到 1min
 13. **业务词典 admin UI**（独立页面）：当前可在 system_config 通用 KV 编辑器改，但不直观
-14. **Task 19 真 docker e2e 自动化**：写脚本起容器 + 跑用户故事 + 抓日志
+14. **真 docker e2e 自动化脚本**：写脚本起容器 + 跑用户故事 + 抓日志（release gate 当前是手动跑）
 
 ---
 
-## 九、Plan 6 验收 ✅
+## 九、Plan 6 当前进展（**代码完成，待 staging 验收**）
 
-| 维度 | 完成 |
+### 已完成的合并前最低门槛
+
+| 维度 | 状态 |
 |------|------|
 | Spec §1-15 全覆盖 | ✅ |
 | 19 个 task 全实现 | ✅ |
-| HUB 647 单测全过 5:27 | ✅ |
+| HUB 647 单测全过（217s）| ✅ |
 | ERP 11 单测全过（隔离）| ✅ |
 | Frontend build 全过 | ✅ |
+| **ruff check . 全过（0 error）** | ✅ |
 | 18 轮 code review 全修 | ✅ |
 | 11 轮 plan review v1→v11 | ✅（编码前）|
 | 文档化（验证记录 + 总结报告）| ✅ |
+| business_dict admin 配置生效（PromptBuilder.from_db）| ✅ |
 
-**Plan 6 完成 → 用户可 review → 批准合并到 main + 部署到生产 → Task 19 真 docker e2e + 真 LLM eval（运维侧）**
+### release gate（合并 main + 部署生产前必过 — 见 §八）
+
+| 维度 | 状态 |
+|------|------|
+| 真 docker e2e（6 个用户故事在 staging 跑通）| ⏳ 待运维 + 产品 owner 双签 |
+| 真 LLM eval（pytest -m eval 30 case ≥ 80% 满意度）| ⏳ 待跑 |
+
+### 流转
+
+```
+当前 → 用户 review feature/plan6-agent
+   → staging 部署
+   → 跑 release gate 两项（真 e2e + 真 LLM eval）
+   → 全过则批准合并 main + 生产 deploy
+```
+
+**任何 release gate 任意一项不过 → 阻塞合并主分支**。
 
 ---
 
 ## 十、commit chain
 
-HUB 仓库 `feature/plan6-agent` → 37 个 commit（feat + polish 交替）：
+HUB 仓库 `feature/plan6-agent` → 38 个 commit（feat + polish 交替 + v8 review 修复 1 个）：
 
 ```
+<待补>  polish(hub): Plan 6 v8 review 修复（ruff 134→0 + PromptBuilder.from_db + uv.lock 加 .gitignore）
+f653f2b docs(hub): Plan 6 端到端验证记录补 docker 健康检查（/loop 验证）
+6c5b8b2 docs(hub): Plan 6 总结报告（用户 review 用）
 d437cf3 docs(hub): Plan 6 端到端验证记录（Task 19）
 d14fb72 polish(hub): Plan 6 Task 17 review 修复
 9c944f0 feat(hub): Plan 6 Task 17（seed 升级）

@@ -1,5 +1,6 @@
 """Plan 6 Task 6：ContextBuilder — 调用前 token 估算 + 裁剪。"""
 from __future__ import annotations
+
 import json
 import logging
 from dataclasses import dataclass

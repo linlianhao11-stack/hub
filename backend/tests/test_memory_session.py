@@ -1,11 +1,11 @@
 """Plan 6 Task 4：SessionMemory 测试（5 case，用真 redis:6380）。"""
 from __future__ import annotations
+
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
 
 from hub.agent.memory.session import SessionMemory
-
 
 REDIS_URL = "redis://localhost:6380/0"
 TEST_CONV_PREFIX = "hub:agent:conv:test-session-"

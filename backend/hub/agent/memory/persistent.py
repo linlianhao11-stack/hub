@@ -4,15 +4,20 @@
 service class 提供 load / upsert_facts 接口；不直接暴露 ORM model。
 """
 from __future__ import annotations
-from datetime import datetime, UTC
-from typing import Iterable
+
+from collections.abc import Iterable
+from datetime import UTC, datetime
 
 from tortoise.transactions import in_transaction
 
 from hub.models.memory import (
-    UserMemory as UserMemoryModel,
     CustomerMemory as CustomerMemoryModel,
+)
+from hub.models.memory import (
     ProductMemory as ProductMemoryModel,
+)
+from hub.models.memory import (
+    UserMemory as UserMemoryModel,
 )
 
 

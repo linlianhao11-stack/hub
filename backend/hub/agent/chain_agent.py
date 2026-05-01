@@ -1,9 +1,10 @@
 """Plan 6 Task 6：ChainAgent — LLM tool-calling 多 round 主循环 + RE_CONFIRM 链路。"""
 from __future__ import annotations
+
 import asyncio
 import json
 import logging
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 from hub.agent.context_builder import ContextBuilder
 from hub.agent.llm_client import AgentLLMClient
@@ -12,12 +13,15 @@ from hub.agent.memory.session import SessionMemory
 from hub.agent.tools.confirm_gate import ConfirmGate
 from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import (
-    UnconfirmedWriteToolError, MissingConfirmationError, ClaimFailedError,
+    ClaimFailedError,
+    MissingConfirmationError,
 )
 from hub.agent.types import (
-    AgentResult, AgentMaxRoundsExceeded, PromptTooLargeError,
+    AgentMaxRoundsError,
+    AgentResult,
+    PromptTooLargeError,
 )
-from hub.capabilities.deepseek import LLMServiceError, LLMParseError
+from hub.capabilities.deepseek import LLMParseError, LLMServiceError
 from hub.error_codes import BizError
 from hub.models.conversation import ConversationLog
 
@@ -160,7 +164,7 @@ class ChainAgent:
                         self.llm.chat(messages, tools=tools_schema, temperature=0.0),
                         timeout=self.LLM_TIMEOUT,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     final_status = "failed_system"
                     error_summary = "LLM 超时 30s"
                     return AgentResult.error_result("AI 响应超时，请稍后重试")
@@ -267,7 +271,7 @@ class ChainAgent:
             # 5 round 后还在调 tool
             final_status = "failed_system"
             error_summary = f"超 {self.MAX_ROUNDS} round 仍未收敛"
-            raise AgentMaxRoundsExceeded(error_summary)
+            raise AgentMaxRoundsError(error_summary)
 
         finally:
             rounds = round_idx + 1 if round_idx >= 0 else 0

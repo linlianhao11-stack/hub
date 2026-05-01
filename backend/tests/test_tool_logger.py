@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from hub.models.conversation import ConversationLog, ToolCallLog
-from hub.observability.tool_logger import log_tool_call, truncate_for_log
+from hub.observability.tool_logger import log_tool_call
 
 
 async def _make_conversation(conversation_id: str = "conv-test") -> ConversationLog:
@@ -65,7 +65,7 @@ async def test_exception_logs_error_and_reraises():
             round_idx=1,
             tool_name="create_voucher",
             args={"amount": 500},
-        ) as ctx:
+        ) as _ctx:
             raise ValueError("模拟 ERP 超时")
 
     row = await ToolCallLog.get(conversation_id="conv-case2", tool_name="create_voucher")
@@ -168,8 +168,8 @@ async def test_concurrent_tool_calls_write_independent_rows():
 @pytest.mark.asyncio
 async def test_truncate_handles_decimal_and_datetime():
     """v1 加固：result 含 Decimal/datetime 不应让 tool_call_log 静默丢失。"""
+    from datetime import UTC, datetime
     from decimal import Decimal
-    from datetime import datetime, UTC
 
     conv_id = "test-decimal-conv"
     # 不建父 ConversationLog，验 FK 不存在仍写入

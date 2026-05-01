@@ -26,11 +26,8 @@ from hub.agent.tools.draft_tools import (
     set_erp_adapter,
 )
 from hub.models.draft import (
-    PriceAdjustmentRequest,
-    StockAdjustmentRequest,
     VoucherDraft,
 )
-
 
 # ============================================================
 # Fixtures
@@ -388,11 +385,13 @@ async def test_register_all_uses_real_registry_passes_fail_fast():
     3 个 tool 没有声明 confirmation_action_id 的话会抛 ToolRegistrationError。
     """
     import os
+
     from redis.asyncio import Redis
+
+    from hub.agent.memory.session import SessionMemory
+    from hub.agent.tools.confirm_gate import ConfirmGate
     from hub.agent.tools.draft_tools import register_all
     from hub.agent.tools.registry import ToolRegistry
-    from hub.agent.tools.confirm_gate import ConfirmGate
-    from hub.agent.memory.session import SessionMemory
 
     redis_url = os.environ.get("HUB_REDIS_URL", "redis://localhost:6380/0")
     redis_client = Redis.from_url(redis_url, decode_responses=False)

@@ -1,12 +1,12 @@
 """组装 LLM system prompt：业务词典 + 同义词 + few-shots + 当前 memory。"""
 from __future__ import annotations
+
 import json
 
 from hub.agent.memory.types import Memory
 from hub.agent.prompt.business_dict import DEFAULT_DICT, render_dict
-from hub.agent.prompt.synonyms import DEFAULT_SYNONYMS, render_synonyms
 from hub.agent.prompt.few_shots import DEFAULT_FEW_SHOTS, FewShot, render_few_shots
-
+from hub.agent.prompt.synonyms import DEFAULT_SYNONYMS, render_synonyms
 
 _SYSTEM_HEADER = """\
 你是 HUB 业务 Agent，连接钉钉机器人和 ERP 数据中台。
@@ -38,6 +38,43 @@ class PromptBuilder:
         self.business_dict = business_dict if business_dict is not None else DEFAULT_DICT
         self.synonyms = synonyms if synonyms is not None else DEFAULT_SYNONYMS
         self.few_shots = few_shots if few_shots is not None else DEFAULT_FEW_SHOTS
+
+    @classmethod
+    async def from_db(cls) -> PromptBuilder:
+        """v8 round 2 P2-#3：worker 启动时调，从 SystemConfig 加载 admin 配置。
+
+        加载策略：
+        - business_dict：合并 DEFAULT_DICT（基础术语）+ SystemConfig.business_dict（admin 编辑的覆盖/扩展）
+                        admin 配置优先；admin 删的 key 也保留 DEFAULT 兜底（防误删导致 LLM 行为退化）
+        - synonyms / few_shots：当前不持久化到 DB，沿用模块常量
+                                后续如需 admin 编辑可类比 business_dict 扩展
+
+        失败降级：DB 读失败 / 表不存在 / value 不是 dict 时回落 DEFAULT_DICT，记 warning。
+        """
+        import logging
+
+        from hub.models import SystemConfig
+
+        logger = logging.getLogger("hub.agent.prompt.builder")
+        merged_dict: dict[str, str] = dict(DEFAULT_DICT)  # 拷贝防 admin 误删基础术语
+        try:
+            rec = await SystemConfig.filter(key="business_dict").first()
+            if rec and isinstance(rec.value, dict):
+                # admin 配置覆盖 / 追加 DEFAULT；不允许 admin 删 key 让 LLM 失忆
+                merged_dict.update({
+                    str(k): str(v) for k, v in rec.value.items()
+                    if v is not None
+                })
+                logger.info(
+                    "PromptBuilder.from_db 加载 admin business_dict 覆盖 %d 条",
+                    len(rec.value),
+                )
+        except Exception:
+            logger.exception(
+                "PromptBuilder.from_db 读 SystemConfig.business_dict 失败，回落 DEFAULT_DICT",
+            )
+
+        return cls(business_dict=merged_dict)
 
     def build(self, *, memory: Memory | None = None,
               tools_schema: list[dict] | None = None) -> str:

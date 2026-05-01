@@ -1,21 +1,17 @@
 """Plan 6 Task 4：MemoryLoader 测试（8 case，用真 PG + redis）。"""
 from __future__ import annotations
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, patch
 from redis.asyncio import Redis
 
-from hub.agent.memory.session import SessionMemory
-from hub.agent.memory.persistent import (
-    UserMemoryService, CustomerMemoryService, ProductMemoryService,
-)
 from hub.agent.memory.loader import MemoryLoader, _estimate_tokens, _truncate_facts
-from hub.models.memory import (
-    UserMemory as UserMemoryModel,
-    CustomerMemory as CustomerMemoryModel,
-    ProductMemory as ProductMemoryModel,
+from hub.agent.memory.persistent import (
+    CustomerMemoryService,
+    ProductMemoryService,
+    UserMemoryService,
 )
-
+from hub.agent.memory.session import SessionMemory
 
 REDIS_URL = "redis://localhost:6380/0"
 TEST_CONV_PREFIX = "hub:agent:conv:test-loader-"
