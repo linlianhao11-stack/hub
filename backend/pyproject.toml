@@ -55,6 +55,9 @@ python_files = "test_*.py"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+markers = [
+    "eval: 真实 LLM eval 测试（CI 默认跳过；Task 19 单独跑 pytest -m eval）",
+]
 
 [tool.ruff]
 line-length = 100

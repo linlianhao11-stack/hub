@@ -4,6 +4,7 @@ agent 是非确定性系统；EvalRunner 用 mock LLM 跑 gold set 验证 tool �
 设计：mock LLM 按 case.mock_llm_responses 顺序回放，避免 CI 跑真 LLM 烧钱。
 """
 from __future__ import annotations
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,9 +76,14 @@ def _build_mock_llm_responses(case: dict) -> list[AgentLLMResponse]:
     for resp in case.get("mock_llm_responses", []):
         tool_calls: list[ToolCall] = []
         for i, tc in enumerate(resp.get("tool_calls") or []):
+            name = tc.get("name")
+            if not name:
+                raise ValueError(
+                    f"case {case['id']} 第 {len(out)+1} round 第 {i+1} tool_call 缺 name 字段"
+                )
             tool_calls.append(ToolCall(
                 id=f"call_{case['id']}_{len(out)}_{i}",
-                name=tc["name"],
+                name=name,
                 args=tc.get("args", {}),
             ))
         out.append(AgentLLMResponse(
@@ -94,7 +100,7 @@ def _build_mock_llm_responses(case: dict) -> list[AgentLLMResponse]:
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": str(tc.args),
+                            "arguments": json.dumps(tc.args, ensure_ascii=False),
                         },
                     }
                     for tc in tool_calls
@@ -111,7 +117,12 @@ class EvalRunner:
         self.agent = agent
 
     async def run(self, gold_set: list[dict]) -> EvalReport:
-        """跑全 gold set；返回 EvalReport。"""
+        """跑全 gold set；返回 EvalReport。
+
+        Plan 6 Task 16 第一版串行跑（mock 模式 ~10s 不是瓶颈）。
+        follow-up（Task 19 真 LLM）：加 max_concurrency 用 asyncio.Semaphore；
+        串行 30 × 10s = 5min，并发 5 路降到 ~1min。
+        """
         results: list[CaseResult] = []
         for case in gold_set:
             result = await self._run_one(case)
@@ -134,6 +145,14 @@ class EvalRunner:
         3. 从 registry.call 拦截历史 + result.text 提取 actual_tools / actual_text
         4. evaluate vs case.expected_*
         """
+        if "user_input" not in case:
+            return CaseResult(
+                case_id=case.get("id", "(no-id)"),
+                category=case.get("category", "unknown"),
+                passed=False,
+                reasons=["case 缺 user_input 字段"],
+            )
+
         actual_tools: list[str] = []
         actual_text: str | None = None
         reasons: list[str] = []
@@ -172,7 +191,12 @@ class EvalRunner:
                 conversation_id=f"eval-{case['id']}",
                 acting_as=999,
             )
-            actual_text = result.text or result.error
+            if result.kind == "error":
+                actual_text = result.error
+            elif result.kind in ("text", "clarification"):
+                actual_text = result.text
+            else:
+                actual_text = result.text or result.error  # fallback
         except Exception as e:
             reasons.append(f"agent.run 抛错: {e}")
             return CaseResult(
@@ -197,21 +221,26 @@ class EvalRunner:
         # 2. expected_clarification
         expected_clarification = case.get("expected_clarification", False)
         actual_is_clarif = result.kind == "clarification"
+        clarif_mismatch = False
         if expected_clarification and not actual_is_clarif:
             reasons.append("期望 clarification 但实际不是")
+            clarif_mismatch = True
         if not expected_clarification and actual_is_clarif:
             reasons.append("不应 clarification 但实际是")
+            clarif_mismatch = True
 
         # 3. expected_text_contains / expected_clarification_contains
-        text_to_check = actual_text or ""
-        contains_keys = (
-            case.get("expected_clarification_contains")
-            if expected_clarification
-            else case.get("expected_text_contains")
-        )
-        for keyword in contains_keys or []:
-            if keyword not in text_to_check:
-                reasons.append(f"输出不含期望关键词 '{keyword}'")
+        # clarification 类型不符时跳过 keyword 检查（避免冗余 reason）
+        if not clarif_mismatch:
+            text_to_check = actual_text or ""
+            contains_keys = (
+                case.get("expected_clarification_contains")
+                if expected_clarification
+                else case.get("expected_text_contains")
+            )
+            for keyword in contains_keys or []:
+                if keyword not in text_to_check:
+                    reasons.append(f"输出不含期望关键词 '{keyword}'")
 
         return CaseResult(
             case_id=case["id"],

@@ -6,6 +6,13 @@ from pathlib import Path
 import pytest
 from tortoise import Tortoise
 
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "eval: 真实 LLM eval 测试（CI 默认跳过；Task 19 单独跑 pytest -m eval）",
+    )
+
 # 让测试能 import backend/main.py（不在 hub/ 包内）
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(_BACKEND_ROOT) not in sys.path:

@@ -1,9 +1,16 @@
-"""Plan 6 Task 16：LLM Eval 框架 + gold set 集成 CI 阈值断言。"""
+"""Plan 6 Task 16：LLM Eval 框架 + gold set 集成测试。
+
+测试分两层：
+1. **本文件**：mock LLM + stub ChainAgent，验证 gold_set.yaml 内部一致性
+   （expected_tools 与 mock_llm_responses 自洽 / EvalRunner 结构 / helper 转换）
+2. **Task 19** (`tests/test_eval_real_llm.py`，pytest.mark.eval)：真 ChainAgent + 真 LLM，
+   断言 satisfaction_pct ≥ 80%（plan §3236 真实 CI 阈值）；CI 默认跳过 -m eval。
+"""
 from __future__ import annotations
+import json
 import pytest
 from pathlib import Path
 from collections import Counter
-from unittest.mock import MagicMock
 
 from hub.agent.eval import EvalRunner, EvalReport, load_gold_set
 from hub.agent.eval.runner import CaseResult, _build_mock_llm_responses
@@ -50,9 +57,8 @@ def test_gold_set_required_fields(gold_set):
 def test_gold_set_unique_ids(gold_set):
     """所有 case id 唯一。"""
     ids = [c["id"] for c in gold_set]
-    assert len(ids) == len(set(ids)), (
-        f"重复 id: {[i for i in ids if ids.count(i) > 1]}"
-    )
+    duplicates = [id_ for id_, cnt in Counter(ids).items() if cnt > 1]
+    assert len(ids) == len(set(ids)), f"重复 id: {duplicates}"
 
 
 def test_gold_set_mock_llm_responses_not_empty(gold_set):
@@ -206,7 +212,7 @@ class _StubAgent:
         """简化版主循环：与 ChainAgent.run 结构对齐，足以驱动 EvalRunner mock。"""
         history: list[dict] = [{"role": "user", "content": user_message}]
 
-        for _ in range(self.MAX_ROUNDS):
+        for round_idx in range(self.MAX_ROUNDS):
             llm_resp: AgentLLMResponse = await self.llm.chat(history)
 
             if llm_resp.tool_calls:
@@ -217,13 +223,13 @@ class _StubAgent:
                         hub_user_id=hub_user_id,
                         acting_as=acting_as,
                         conversation_id=conversation_id,
-                        round_idx=0,
+                        round_idx=round_idx,
                     )
                     history.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tc.name,
-                        "content": str(tool_result),
+                        "content": json.dumps(tool_result, ensure_ascii=False, default=str),
                     })
                 continue  # 下一 round
 
@@ -360,11 +366,15 @@ async def test_eval_runner_runs_gold_set_no_error(gold_set):
 
 
 @pytest.mark.asyncio
-async def test_eval_runner_meets_80pct_threshold(gold_set):
-    """CI 阈值断言：使用 stub agent 跑完整 gold set，满意度 ≥ 80%。
+async def test_gold_set_internal_consistency_via_stub(gold_set):
+    """v2 加固（review C2）：用 stub agent 验证 gold_set.yaml 内部一致性。
 
-    stub agent 忠实回放 mock_llm_responses → expected_tools/text 均满足。
-    80% 是 plan §3236 的 CI 阈值，低于此值阻止 merge。
+    重要：这是结构检查（确保 expected_tools / expected_clarification 与 mock_llm_responses
+    自洽），**不是**真实质量阈值。真实 ChainAgent + 真 LLM 的满意度阈值检测留 Task 19，
+    通过 pytest.mark.eval marker 隔离（CI 默认跳过 -m eval；Task 19 单独 `pytest -m eval` 跑）。
+
+    Plan §3236 字面要求"satisfaction ≥ 80%"——本 mock 路径恒 100%，
+    实质相当于"gold_set.yaml 没写错"的烟雾测试。
     """
     agent = _StubAgent()
     runner = EvalRunner(agent=agent)
@@ -373,5 +383,5 @@ async def test_eval_runner_meets_80pct_threshold(gold_set):
     # 输出失败 case 细节方便 CI 调试
     failed_cases = [(r.case_id, r.reasons) for r in report.case_results if not r.passed]
     assert report.satisfaction_pct >= 80.0, (
-        f"满意度 {report.satisfaction_pct}% < 80%，失败 case：{failed_cases}"
+        f"满意度 {report.satisfaction_pct}% < 80%（gold_set 内部不一致），失败 case：{failed_cases}"
     )
