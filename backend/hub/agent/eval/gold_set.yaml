@@ -1,0 +1,336 @@
+# backend/hub/agent/eval/gold_set.yaml
+# Plan 6 Task 16: 30 条 gold set 用例。每条标注用户输入 + 期望 tool 序列 + 期望文本（regex / 子串匹配）
+
+# ===== 基础查询（12 条）=====
+
+- id: query_product_inventory
+  category: query
+  user_input: "查讯飞x5 的库存"
+  expected_tools:
+    - search_products
+    - check_inventory
+  expected_clarification: false
+  expected_text_contains: ["库存"]
+  notes: "基础：先 search 拿 ID，再查库存"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - tool_calls: [{name: "check_inventory", args: {product_id: 1}}]
+    - text: "讯飞 X5 库存 49 台"
+
+- id: query_customer_balance
+  category: query
+  user_input: "阿里巴巴的回款情况"
+  expected_tools: [search_customers, get_customer_balance]
+  expected_clarification: false
+  expected_text_contains: ["阿里巴巴"]
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里巴巴"}}]
+    - tool_calls: [{name: "get_customer_balance", args: {customer_id: 9}}]
+    - text: "阿里巴巴当前应收 ¥125,000"
+
+- id: query_recent_orders
+  category: query
+  user_input: "查阿里最近 7 天的订单"
+  expected_tools: [search_customers, search_orders]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "search_orders", args: {customer_id: 9, since_days: 7}}]
+    - text: "近 7 天阿里下了 5 单"
+
+- id: query_product_detail_by_sku
+  category: query
+  user_input: "SKU50139 详情"
+  expected_tools: [search_products]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "SKU50139"}}]
+    - text: "讯飞 X5 Pro：售价 ¥3,999，库存 49 台"
+
+- id: query_customer_history_price
+  category: query
+  user_input: "阿里上次买讯飞x5的价格"
+  expected_tools: [search_customers, search_products, get_customer_history]
+  expected_clarification: false
+  expected_text_contains: ["上次", "¥"]
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - tool_calls: [{name: "get_customer_history", args: {customer_id: 9, product_id: 1}}]
+    - text: "阿里上次买讯飞x5 是 ¥2,499"
+
+- id: query_inventory_aging
+  category: query
+  user_input: "哪些商品压货了"
+  expected_tools: [get_inventory_aging]
+  expected_clarification: false
+  notes: "业务词典：压货 → inventory_aging"
+  mock_llm_responses:
+    - tool_calls: [{name: "get_inventory_aging", args: {threshold_days: 90}}]
+    - text: "找到 12 个超 90 天库龄商品"
+
+- id: analyze_top_customers
+  category: query
+  user_input: "上月客户销售 top 5"
+  expected_tools: [analyze_top_customers]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "analyze_top_customers", args: {period: "last_month", top_n: 5}}]
+    - text: "上月 top 5 客户：阿里 ¥350K..."
+
+- id: analyze_slow_moving
+  category: query
+  user_input: "找滞销品"
+  expected_tools: [analyze_slow_moving_products]
+  expected_clarification: false
+  notes: "业务词典：滞销 → slow_moving_products"
+  mock_llm_responses:
+    - tool_calls: [{name: "analyze_slow_moving_products", args: {threshold_days: 90}}]
+    - text: "滞销商品 8 个"
+
+- id: query_order_detail
+  category: query
+  user_input: "订单 ORD123 详情"
+  expected_tools: [get_order_detail]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "get_order_detail", args: {order_id: "ORD123"}}]
+    - text: "订单 ORD123：阿里下单 50 台讯飞x5"
+
+- id: query_inventory_simple
+  category: query
+  user_input: "讯飞 x5 还有多少"
+  expected_tools: [search_products, check_inventory]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞 x5"}}]
+    - tool_calls: [{name: "check_inventory", args: {product_id: 1}}]
+    - text: "库存 49"
+
+- id: query_customer_outstanding
+  category: query
+  user_input: "查客户应收"
+  expected_clarification: true
+  expected_clarification_contains: ["哪个客户"]
+  notes: "信息不全应反问"
+  mock_llm_responses:
+    - text: "请问查哪个客户的应收？"
+
+- id: query_product_simple_keyword
+  category: query
+  user_input: "查讯飞"
+  expected_tools: [search_products]
+  expected_clarification: false
+  notes: "短关键字"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞"}}]
+    - text: "找到讯飞 X5 / 讯飞 X3 / 讯飞 X2"
+
+
+# ===== 多步推理（6 条）=====
+
+- id: contract_with_history_price
+  category: multi_step
+  user_input: "给阿里写讯飞x5 50 台合同 按上次价"
+  expected_tools:
+    - search_customers
+    - search_products
+    - get_customer_history
+    - check_inventory
+    - generate_contract_draft
+  expected_clarification: false
+  expected_text_contains: ["合同"]
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - tool_calls: [{name: "get_customer_history", args: {customer_id: 9, product_id: 1}}]
+    - tool_calls: [{name: "check_inventory", args: {product_id: 1}}]
+    - tool_calls: [{name: "generate_contract_draft", args: {template_id: 1, customer_id: 9, items: [{product_id: 1, qty: 50, price: 2499}]}}]
+    - text: "合同已生成，已发到您钉钉"
+
+- id: contract_quote_only
+  category: multi_step
+  user_input: "给阿里报个讯飞x5 50 台的价"
+  expected_tools: [search_customers, search_products, generate_price_quote]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - tool_calls: [{name: "generate_price_quote", args: {customer_id: 9, items: [{product_id: 1, qty: 50}]}}]
+    - text: "报价单已生成"
+
+- id: stock_check_then_order
+  category: multi_step
+  user_input: "讯飞 x5 还有多少？阿里要订 50 台"
+  expected_tools: [search_products, check_inventory, search_customers]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞 x5"}}]
+    - tool_calls: [{name: "check_inventory", args: {product_id: 1}}]
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - text: "讯飞 x5 库存 49 台。阿里下单 50 台需补 1 台库存"
+
+- id: customer_balance_then_history
+  category: multi_step
+  user_input: "阿里现在欠多少？最近成交价多少？"
+  expected_tools: [search_customers, get_customer_balance, get_customer_history]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "get_customer_balance", args: {customer_id: 9}}]
+    - tool_calls: [{name: "get_customer_history", args: {customer_id: 9}}]
+    - text: "阿里应收 ¥125K，最近成交价 ¥2,499"
+
+- id: export_excel_top_customers
+  category: multi_step
+  user_input: "导出上月 top 10 客户的 Excel"
+  expected_tools: [analyze_top_customers, export_to_excel]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "analyze_top_customers", args: {period: "last_month", top_n: 10}}]
+    - tool_calls: [{name: "export_to_excel", args: {table_data: [], file_name: "上月top10客户.xlsx"}}]
+    - text: "Excel 已导出"
+
+- id: contract_with_clarification
+  category: multi_step
+  user_input: "给阿里写合同"
+  expected_clarification: true
+  expected_clarification_contains: ["商品", "数量"]
+  mock_llm_responses:
+    - text: "请问哪个商品？数量多少？是否按上次价？"
+
+
+# ===== 写操作 confirm 链路（5 条）=====
+
+- id: voucher_create_must_confirm
+  category: write
+  user_input: "把这周差旅做凭证"
+  expected_tools: [search_orders]
+  expected_clarification: false
+  expected_text_contains: ["确认", "是"]
+  notes: "写 tool 必须先 text 预览"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_orders", args: {type: "expense_reimburse", since_days: 7}}]
+    - text: "我准备创建 12 张凭证（差旅费）。回复'是'确认提交。"
+
+- id: price_adjust_must_confirm
+  category: write
+  user_input: "给阿里讯飞x5 调价 8 折"
+  expected_tools: [search_customers, search_products, get_customer_history]
+  expected_clarification: false
+  expected_text_contains: ["确认"]
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - tool_calls: [{name: "get_customer_history", args: {customer_id: 9, product_id: 1}}]
+    - text: "我准备给阿里调讯飞x5 价格到 ¥3199.20（8 折）。回复'是'确认。"
+
+- id: stock_adjustment_must_confirm
+  category: write
+  user_input: "讯飞x5 仓库 1 盘盈 5 台"
+  expected_tools: [search_products]
+  expected_clarification: false
+  expected_text_contains: ["确认", "盘盈"]
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - text: "我准备登记讯飞x5 仓库 1 盘盈 5 台。回复'是'确认。"
+
+- id: write_yes_after_preview
+  category: write
+  user_input: "是"
+  expected_clarification: false
+  notes: "用户回'是'后期望 LLM 调写 tool 带 (action_id, token)"
+  mock_llm_responses:
+    - tool_calls:
+        - name: "create_voucher_draft"
+          args:
+            voucher_data: {total_amount: 3200, summary: "差旅"}
+            rule_matched: "差旅"
+            confirmation_action_id: "abc123"
+            confirmation_token: "xyz456"
+    - text: "凭证草稿已生成"
+
+- id: write_yes_no_pending
+  category: write
+  user_input: "是"
+  expected_clarification: true
+  expected_clarification_contains: ["不太明白"]
+  notes: "用户随口'是'但无 pending → 反问"
+  mock_llm_responses:
+    - text: "我不太明白你确认的是什么？"
+
+
+# ===== 长尾说法（4 条）=====
+
+- id: business_dict_zhouzhuan
+  category: business_dict
+  user_input: "讯飞 x5 周转怎么样"
+  expected_tools: [search_products, search_orders, check_inventory]
+  expected_clarification: false
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞 x5"}}]
+    - tool_calls: [{name: "search_orders", args: {product_id: 1, since_days: 30}}]
+    - tool_calls: [{name: "check_inventory", args: {product_id: 1}}]
+    - text: "讯飞x5 月销量 30 台，库存 49 台，周转天数 ~49 天"
+
+- id: business_dict_huikuan
+  category: business_dict
+  user_input: "阿里现在有多少回款？"
+  expected_tools: [search_customers, get_customer_balance]
+  expected_clarification: false
+  notes: "回款 = 客户余额"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "get_customer_balance", args: {customer_id: 9}}]
+    - text: "阿里当前应收 ¥125,000"
+
+- id: business_dict_dingdan
+  category: business_dict
+  user_input: "阿里近一月下了几个销单"
+  expected_tools: [search_customers, search_orders]
+  expected_clarification: false
+  notes: "销单 = orders"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_customers", args: {query: "阿里"}}]
+    - tool_calls: [{name: "search_orders", args: {customer_id: 9, since_days: 30}}]
+    - text: "近一月阿里下了 12 单"
+
+- id: business_dict_chuhuo
+  category: business_dict
+  user_input: "查讯飞x5 出货量"
+  expected_tools: [search_products, search_orders]
+  expected_clarification: false
+  notes: "出货量 = 订单数"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "讯飞x5"}}]
+    - tool_calls: [{name: "search_orders", args: {product_id: 1, since_days: 30}}]
+    - text: "讯飞x5 月出货 30 台"
+
+
+# ===== 异常路径（3 条）=====
+
+- id: error_tool_failure_clarify
+  category: error
+  user_input: "查不存在的商品"
+  expected_clarification: false
+  expected_text_contains: ["没找到", "未匹配"]
+  notes: "tool 返 0 命中"
+  mock_llm_responses:
+    - tool_calls: [{name: "search_products", args: {query: "不存在的商品"}}]
+    - text: "没找到匹配的商品，请确认商品名。未匹配到任何结果。"
+
+- id: error_ambiguous_query
+  category: error
+  user_input: "查那个客户"
+  expected_clarification: true
+  expected_clarification_contains: ["哪个", "客户"]
+  mock_llm_responses:
+    - text: "请问哪个客户？"
+
+- id: error_unknown_intent
+  category: error
+  user_input: "今天天气怎么样"
+  expected_clarification: true
+  notes: "非业务问题"
+  mock_llm_responses:
+    - text: "我只能帮您查 ERP 业务数据，请描述具体业务问题？"
