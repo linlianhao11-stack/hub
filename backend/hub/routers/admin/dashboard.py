@@ -1,4 +1,4 @@
-"""admin 仪表盘路由：4 个健康卡 + 4 个今日数字 + 24h 桶。
+"""admin 仪表盘路由：4 个健康卡 + 4 个今日数字 + 24h 桶 + LLM 成本指标。
 
 权限：platform.tasks.read（与任务列表同权）
 
@@ -7,6 +7,7 @@
 - dingtalk_stream 状态根据 app.state.dingtalk_state.adapter 是否存在判定
 - erp_default 状态根据 app.state.session_auth 是否就绪判定（向导未完成时为 None）
 - 24h hourly 桶按"自然小时"返回 24 个 [{hour, total, success, failed}, ...]
+- Plan 6 Task 14：新增 llm_cost 子对象（今日调用 + Token + 成本 + 月度预算进度）
 """
 from __future__ import annotations
 
@@ -106,6 +107,9 @@ async def dashboard(request: Request):
             "failed": bucket_failed,
         })
 
+    # Plan 6 Task 14：LLM 成本指标
+    llm_cost = await _get_llm_cost_metrics()
+
     return {
         "health": health,
         "today": {
@@ -117,4 +121,69 @@ async def dashboard(request: Request):
             "avg_duration_ms": avg_duration_ms,
         },
         "hourly": hourly,
+        "llm_cost": llm_cost,
     }
+
+
+# ============================================================
+# Plan 6 Task 14：LLM 成本指标 helper 函数
+# ============================================================
+
+async def _get_llm_cost_metrics() -> dict:
+    """计算 LLM 成本指标（今日 + 本月 + 预算告警）。"""
+    from hub.models.conversation import ConversationLog
+
+    now = datetime.now(UTC)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # 今日数据
+    today_logs = await ConversationLog.filter(started_at__gte=today_start).all()
+    today_calls = len(today_logs)
+    today_tokens = sum(log.tokens_used or 0 for log in today_logs)
+    today_cost = sum(
+        float(log.tokens_cost_yuan) if log.tokens_cost_yuan is not None else 0.0
+        for log in today_logs
+    )
+
+    # 本月累计
+    month_logs = await ConversationLog.filter(started_at__gte=month_start).all()
+    month_cost = sum(
+        float(log.tokens_cost_yuan) if log.tokens_cost_yuan is not None else 0.0
+        for log in month_logs
+    )
+
+    # 月度预算（system_config 可调，默认 1000 元）
+    budget_yuan = await _get_month_budget()
+
+    budget_used_pct = (month_cost / budget_yuan * 100.0) if budget_yuan > 0 else 0.0
+    budget_alert = budget_used_pct >= 80.0
+
+    return {
+        "today_llm_calls": today_calls,
+        "today_total_tokens": today_tokens,
+        "today_cost_yuan": round(today_cost, 4),
+        "month_to_date_cost_yuan": round(month_cost, 4),
+        "month_budget_yuan": float(budget_yuan),
+        "budget_used_pct": round(budget_used_pct, 2),
+        "budget_alert": budget_alert,
+    }
+
+
+async def _get_month_budget() -> float:
+    """从 system_config 读月预算；默认 1000.0 元。"""
+    from hub.models import SystemConfig
+
+    try:
+        rec = await SystemConfig.filter(key="month_llm_budget_yuan").first()
+        if rec and rec.value is not None:
+            val = rec.value
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str):
+                return float(val)
+            if isinstance(val, dict) and "value" in val:
+                return float(val["value"])
+    except Exception:
+        pass
+    return 1000.0

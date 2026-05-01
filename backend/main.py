@@ -140,6 +140,7 @@ async def lifespan(app: FastAPI):
     app.state.dingtalk_connect_task = connect_task
 
     # 6. cron 调度器（Plan 5 Task 10）：每天 03:00 巡检 + 04:00 清理 payload
+    #    Plan 6 Task 14：09:10 月度 LLM 预算告警
     from hub.cron.jobs import run_daily_audit, run_payload_cleanup
     from hub.cron.scheduler import CronScheduler
     scheduler = CronScheduler()
@@ -151,6 +152,40 @@ async def lifespan(app: FastAPI):
     @scheduler.at_hour(4)
     async def _job_cleanup():
         await run_payload_cleanup()
+
+    # Plan 6 Task 14：每天 09:10 检查月度 LLM 预算，超 80% 发钉钉告警
+    # 注意：sender 依赖 ChannelApp 配置，若未配置则 cron 内部跳过并记 WARNING
+    @scheduler.at_hour(9)
+    async def _job_budget_alert():
+        from hub.cron.budget_alert import run_budget_alert
+        from hub.adapters.channel.dingtalk_sender import DingTalkSender
+        from hub.adapters.channel.dingtalk_stream import DingTalkStreamAdapter
+        from hub.crypto import decrypt_secret
+        from hub.models import ChannelApp
+
+        app_rec = await ChannelApp.filter(
+            channel_type="dingtalk", status="active",
+        ).first()
+        if app_rec is None:
+            logger.warning("budget_alert cron 跳过：没有 active 状态的 dingtalk ChannelApp")
+            return
+
+        try:
+            app_key = decrypt_secret(app_rec.encrypted_app_key, purpose="config_secrets")
+            app_secret = decrypt_secret(app_rec.encrypted_app_secret, purpose="config_secrets")
+            robot_id = app_rec.robot_id or ""
+        except Exception:
+            logger.exception("budget_alert cron 跳过：ChannelApp 解密失败")
+            return
+
+        budget_sender = DingTalkSender(
+            app_key=app_key, app_secret=app_secret, robot_code=robot_id,
+        )
+        try:
+            result = await run_budget_alert(sender=budget_sender)
+            logger.info(f"budget_alert cron 完成: {result}")
+        finally:
+            await budget_sender.aclose()
 
     scheduler.start()
     app.state.scheduler = scheduler
