@@ -203,14 +203,13 @@ class ChainAgent:
                                 "content": tool_result_content,
                                 "round_idx": round_idx,
                             })
-                            try:
-                                await self.session_memory.append(
-                                    conversation_id, role="tool",
-                                    content=tool_result_content,
-                                    tool_call_id=call.id,
-                                )
-                            except Exception:
-                                logger.exception("session.append tool 失败")
+                            # v8 staging review #4：tool 消息**不**持久化到 SessionMemory。
+                            # 原因：assistant.tool_calls 消息没法持久化（SessionMemory.append
+                            # signature 不支持 tool_calls 字段）。只持久化 tool 结果会让下一轮
+                            # 加载历史时出现 "tool 消息孤儿"——DeepSeek 协议直接拒（400）。
+                            # 跨轮上下文只保 user + assistant_final 文本，tool 调用链局限在
+                            # 单轮 in-memory history 内即可。下一轮 LLM 看不到上轮 tool 细节，
+                            # 但能看到 assistant 的总结，已足够支撑大多数对话。
                         except MissingConfirmationError as e:
                             await self.confirm_gate.add_pending(
                                 conversation_id, hub_user_id, call.name, call.args,
