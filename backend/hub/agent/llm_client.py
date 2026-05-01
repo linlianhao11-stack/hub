@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -15,6 +16,13 @@ from hub.agent.types import AgentLLMResponse, ToolCall
 from hub.capabilities.deepseek import LLMParseError, LLMServiceError
 
 logger = logging.getLogger("hub.agent.llm_client")
+
+# v8 staging review：DeepSeek 偶发 400 Bad Request（实测同请求重发就成功），
+# 加 1 次重试覆盖该抽风。429 限流 / 5xx 服务端错也走重试（标准做法）。
+# 401/403 不重试（auth 错误重试无意义）。
+_RETRYABLE_STATUS = {400, 408, 425, 429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 2
+_RETRY_BACKOFF_SECONDS = 1.5
 
 
 class AgentLLMClient:
@@ -60,23 +68,56 @@ class AgentLLMClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
-        try:
-            r = await self._client.post(
-                url, json=body,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
-        except httpx.RequestError as e:
-            raise LLMServiceError(f"网络错误: {e}") from e
+        last_error: Exception | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                r = await self._client.post(
+                    url, json=body,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+            except httpx.RequestError as e:
+                # 网络错误（连接超时 / DNS / TLS 等）→ retryable
+                last_error = LLMServiceError(f"网络错误: {e}")
+                if attempt + 1 < _MAX_ATTEMPTS:
+                    logger.warning(
+                        "LLM 网络错误，将在 %.1fs 后重试 (attempt %d/%d): %s",
+                        _RETRY_BACKOFF_SECONDS, attempt + 1, _MAX_ATTEMPTS, e,
+                    )
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+                raise last_error from e
 
-        if r.status_code >= 500:
-            raise LLMServiceError(f"LLM {r.status_code}")
-        if r.status_code >= 400:
-            raise LLMServiceError(f"LLM {r.status_code}: {r.text[:200]}")
+            if r.status_code in _RETRYABLE_STATUS:
+                # 偶发性服务端错（含 DeepSeek 偶发 400 / 限流 / 5xx）→ retry
+                # **不要**把 r.text 写进 last_error 默认 message——可能含敏感信息；
+                # 只记 status + 截断 body 到 logger（warn 级别）
+                body_preview = r.text[:300] if r.text else ""
+                last_error = LLMServiceError(f"LLM {r.status_code}")
+                if attempt + 1 < _MAX_ATTEMPTS:
+                    logger.warning(
+                        "LLM %d，将在 %.1fs 后重试 (attempt %d/%d) body=%r",
+                        r.status_code, _RETRY_BACKOFF_SECONDS,
+                        attempt + 1, _MAX_ATTEMPTS, body_preview,
+                    )
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+                # 重试用尽：抛错（仍不暴露 body 给上游）
+                logger.error(
+                    "LLM %d 重试用尽 body=%r", r.status_code, body_preview,
+                )
+                raise last_error
 
-        try:
-            return self._parse_response(r.json())
-        except (KeyError, ValueError, TypeError) as e:
-            raise LLMParseError(f"LLM 返回格式异常: {e}") from e
+            if r.status_code >= 400:
+                # 401/403/404 等定性错误：不重试，立即抛
+                raise LLMServiceError(f"LLM {r.status_code}: {r.text[:200]}")
+
+            try:
+                return self._parse_response(r.json())
+            except (KeyError, ValueError, TypeError) as e:
+                raise LLMParseError(f"LLM 返回格式异常: {e}") from e
+
+        # 防御兜底（理论上 for 循环里都会 return / raise，到这里说明逻辑漏洞）
+        raise last_error or LLMServiceError("LLM 重试逻辑异常")
 
     @staticmethod
     def _parse_response(resp: dict) -> AgentLLMResponse:

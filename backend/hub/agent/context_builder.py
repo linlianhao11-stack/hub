@@ -158,6 +158,10 @@ class ContextBuilder:
         tool 消息必须紧跟 assistant.tool_calls 消息。
         多 tool_calls round 时，原 [-2:] 切片可能截到孤儿 tool 消息。
         本方法从末尾反向扫，遇到 user 停止，保证完整 round 边界。
+
+        v3 加固（v8 staging review）：单 tool 消息 > 4000 token 时摘要化。
+        防 must_keep 因为前一轮某个 tool 返了 14K 数据就直接撞 budget——
+        老 round 已经摘要了，最近 round 也得摘要（保 keys + 数量，不保整 list）。
         """
         if not history:
             return []
@@ -170,6 +174,22 @@ class ContextBuilder:
             role = msg.get("role")
             if role == "user":
                 break
+
+        # 单条 tool 消息超 4000 token 摘要化（保 OpenAI 协议完整 + 减 token 占用）
+        for i, msg in enumerate(out):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if _estimate_tokens(str(content)) <= 4000:
+                continue
+            summary = ContextBuilder._summarize_dict(content)
+            tool_name = msg.get("name") or msg.get("tool_name", "?")
+            # 替换为摘要 + 提示 LLM 已截断（避免 LLM 假装看到全量数据）
+            new_content = (
+                f"[本 tool 返回过大已自动摘要：{tool_name}: {summary}。"
+                f"如需完整数据请重新调用 tool 并加 limit / 过滤参数缩小范围]"
+            )
+            out[i] = {**msg, "content": new_content}
         return out
 
     @staticmethod

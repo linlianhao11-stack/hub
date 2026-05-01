@@ -40,8 +40,12 @@ class ChainAgent:
     """
 
     MAX_ROUNDS = 5
-    MAX_PROMPT_TOKEN = 18_000
-    LLM_TIMEOUT = 30.0
+    # deepseek-v4-flash 上下文 128K，留充足余量 + 不影响 attention 质量；
+    # 32K 是 v8 review P3：18K 在用户首次试用时频繁撞上界，搭配 prompt 输出收紧后翻 ~80% 余量
+    # 单次成本变化：18K→32K 约 +78%（按 ¥0.001/K input 算 +¥0.014/call），可接受
+    MAX_PROMPT_TOKEN = 32_000
+    # 长 prompt 需要更长 TTFB；30s 在 18K 时刚好，32K 时偶尔擦边——给到 45s
+    LLM_TIMEOUT = 45.0
 
     def __init__(self, *,
                  llm: AgentLLMClient,
