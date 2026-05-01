@@ -1,7 +1,15 @@
 """启动时跑预设角色 + 权限码 + 业务词典种子（幂等）。"""
 from __future__ import annotations
 
-from hub.models import HubPermission, HubRole
+import logging
+
+from hub.models import HubPermission, HubRole, SystemConfig
+
+# v2 加固（review I1）：业务词典与 prompt/business_dict.py::DEFAULT_DICT 共享真相源
+# 避免 seed 写 DB 一份 / prompt 用模块常量一份导致 admin UI 看到的和 LLM 看到的发散
+from hub.agent.prompt.business_dict import DEFAULT_DICT as DEFAULT_BUSINESS_DICT_SEED
+
+logger = logging.getLogger("hub.seed")
 
 # 全部权限码（spec §7.4）
 PERMISSIONS = [
@@ -45,6 +53,7 @@ PERMISSIONS = [
 ]
 
 # === Plan 6 Task 17 新加 13 条权限码 ===
+# 注：description 在 plan §3256-3284 基础上扩展为完整中文一句话，便于 admin UI 直接显示
 PERMISSIONS.extend([
     ("usecase.query_customer.use", "usecase", "query_customer", "use",
      "客户查询", "允许搜索客户列表与查看客户详情"),
@@ -203,58 +212,15 @@ ROLES["bot_user_finance_lead"] = {
 }
 
 
-# === Plan 6 Task 17：业务词典默认 seed（写入 SystemConfig.business_dict 让 admin 后台可编辑）===
-DEFAULT_BUSINESS_DICT_SEED = {
-    "压货": "库龄高的商品（调 get_inventory_aging）",
-    "周转": "商品周转率（调 analyze_slow_moving_products）",
-    "回款": "客户应付未付的款项（调 get_customer_balance）",
-    "上次价格": "客户最近一次该商品成交价（调 get_customer_history limit=1）",
-    "上次价": "同 上次价格",
-    "之前的价": "同 上次价格",
-    "差旅": "差旅费用报销，对应凭证科目 借管理费用-差旅 / 贷库存现金",
-    "报销": "员工费用报销，对应凭证按费用类型匹配科目",
-    "套餐": "多 SKU 打包销售，每个 SKU 独立列在合同条款中",
-    "组合": "同 套餐",
-    "TOP": "排名前 N（调 analyze_top_customers / analyze_slow_moving_products）",
-    "排行": "同 TOP",
-    "滞销": "销量低 + 库龄长的商品（调 analyze_slow_moving_products）",
-    "畅销": "销量高的商品（与 滞销 相反）",
-    "出货": "订单出库（用 search_orders 看交付状态）",
-    "进货": "采购入库（暂未涵盖；提示用户去 ERP 操作）",
-    "对账": "客户余额对账单（调 get_customer_balance）",
-    "应收": "客户欠款总额（同 回款）",
-    "底价": "成本价或最低售价（业务概念，不直接查；让用户澄清）",
-    "挂牌价": "商品标准售价（调 search_products / get_product_detail）",
-    "议价": "客户协商价（调 get_customer_history 看历史）",
-    "调价": "调整客户专属定价（调 create_price_adjustment_request 提请审批）",
-    "盘点": "库存调整（调 create_stock_adjustment_request 提请审批）",
-    "盘盈": "实盘大于账面（正向调整）",
-    "盘亏": "实盘小于账面（负向调整）",
-    "凭证": "会计凭证（调 create_voucher_draft 提请审批）",
-    "做凭证": "生成凭证草稿（同 凭证）",
-    "做账": "同 做凭证",
-    "合同": "销售合同（调 generate_contract_draft 生成 docx）",
-    "报价": "客户报价单（调 generate_price_quote 生成 docx）",
-    "导出": "Excel 导出（调 export_to_excel）",
-    "上月": "上一个完整自然月",
-    "本月": "本月 1 日至今",
-    "上周": "上一个完整周（周一至周日）",
-    "本周": "本周一至今",
-    "近一周": "今天往前 7 天",
-    "近一月": "今天往前 30 天",
-    "近三月": "今天往前 90 天",
-    "今年": "本年 1 月 1 日至今",
-    "去年": "上一个完整自然年",
-}
-
-
 async def _seed_business_dict() -> None:
-    """业务词典 seed 写到 SystemConfig.business_dict（key 唯一）。
+    """业务词典 seed 写到 SystemConfig.business_dict。
 
     幂等：已存在则跳过（不覆盖管理员手动编辑过的内容）；不存在才写默认。
-    """
-    from hub.models import SystemConfig
 
+    follow-up（后续 task）：PromptBuilder 当前直接读 hub.agent.prompt.business_dict.DEFAULT_DICT
+    模块常量；待 PromptBuilder 加 from_db() 工厂方法读 SystemConfig.business_dict 后，
+    admin UI 编辑才能实际影响 LLM 行为。当前 seed 写入只是占位 + admin 可读。
+    """
     rec = await SystemConfig.filter(key="business_dict").first()
     if rec:
         return  # 已存在不覆盖
@@ -292,8 +258,7 @@ async def run_seed():
             if pcode not in existing_codes:
                 if pcode not in perm_objs:
                     # 防御：role 引用了未定义的 perm code（数据一致性）
-                    import logging
-                    logging.getLogger("hub.seed").warning(
+                    logger.warning(
                         "角色 %s 引用未定义权限码 %s，跳过", role_code, pcode,
                     )
                     continue

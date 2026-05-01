@@ -43,6 +43,8 @@ DEFAULT_DICT: dict[str, str] = {
     "合同": "销售合同（用 generate_contract_draft 生成 docx）",
     "写合同": "生成合同草稿（用 generate_contract_draft）",
     "报价": "客户报价单（用 generate_price_quote 生成 PDF/docx）",
+    "套餐": "多 SKU 打包销售，每个 SKU 独立列在合同条款中",
+    "组合": "同套餐（多 SKU 打包销售）",
     "下单": "新建销售订单（暂未支持，提示用户去 ERP 操作）",
 
     # ===== 时间/数据范围 =====

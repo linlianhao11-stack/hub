@@ -58,6 +58,8 @@ def test_finance_lead_has_approve_perms():
     assert "usecase.adjust_stock.approve" in lead_perms
     assert "usecase.create_voucher.approve" not in finance_perms
     assert "usecase.adjust_stock.approve" not in finance_perms
+    # v2 加固（review M2）：主管含会计员所有权限（与 sales_lead 对称）
+    assert finance_perms.issubset(lead_perms)
 
 
 def test_existing_roles_upgraded_with_plan6_perms():
@@ -85,6 +87,13 @@ def test_no_role_references_undefined_perm():
             assert pcode in perm_codes, (
                 f"角色 {role_code} 引用未定义权限 {pcode}"
             )
+
+
+def test_business_dict_seed_uses_prompt_truth_source():
+    """v2 加固（review I1）：seed 用 prompt/business_dict.py 同一 dict 对象避免分叉。"""
+    from hub.agent.prompt.business_dict import DEFAULT_DICT as PROMPT_DICT
+    # 同一对象引用（不是 copy）
+    assert DEFAULT_BUSINESS_DICT_SEED is PROMPT_DICT
 
 
 def test_business_dict_seed_count():
@@ -157,3 +166,23 @@ async def test_seed_business_dict_does_not_override_manual_edit():
 
     rec = await SystemConfig.filter(key="business_dict").first()
     assert rec.value == custom  # 没覆盖
+
+
+@pytest.mark.asyncio
+async def test_run_seed_after_manual_edit_does_not_revert():
+    """v2 加固（review M1）：首次 seed → admin 手动编辑 → 重启 seed 仍保留编辑。"""
+    # 1. 首次跑 seed 写默认
+    await _seed_business_dict()
+    rec = await SystemConfig.filter(key="business_dict").first()
+    assert "压货" in rec.value
+
+    # 2. 模拟 admin 手动改
+    rec.value = {"自定义术语": "管理员改的"}
+    await rec.save()
+
+    # 3. 重启 seed
+    await _seed_business_dict()
+
+    # 4. 应保留管理员改的版本
+    rec2 = await SystemConfig.filter(key="business_dict").first()
+    assert rec2.value == {"自定义术语": "管理员改的"}

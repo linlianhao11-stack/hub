@@ -141,6 +141,24 @@ async def test_set_writes_audit_log(admin_client):
 
 
 @pytest.mark.asyncio
+async def test_admin_can_update_business_dict(admin_client):
+    """v2 加固（review I2）：admin 通过 system_config UI 可编辑业务词典。"""
+    from hub.models import SystemConfig
+
+    custom = {"自定义术语": "管理员加的", "压货": "改了的描述"}
+    ac, _ = admin_client
+    resp = await ac.put(
+        "/hub/v1/admin/config/business_dict",
+        json={"value": custom},
+    )
+    assert resp.status_code == 200
+
+    # 验证写入
+    rec = await SystemConfig.filter(key="business_dict").first()
+    assert rec.value == custom
+
+
+@pytest.mark.asyncio
 async def test_admin_can_update_month_llm_budget(admin_client):
     """v2 加固（review I1）：admin 可通过 system_config UI 配置月预算。"""
     from hub.models import SystemConfig
