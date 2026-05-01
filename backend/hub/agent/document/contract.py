@@ -35,6 +35,80 @@ class TemplateRenderError(Exception):
     """模板渲染失败（占位符缺失 / 数据格式错 / file_storage_key 格式异常）。"""
 
 
+# 中文大写人民币转换（v8 staging review #8）
+_CN_DIGITS = "零壹贰叁肆伍陆柒捌玖"
+_CN_UNITS_4 = ["", "拾", "佰", "仟"]
+_CN_GROUPS = ["", "万", "亿", "兆"]
+
+
+def _yuan_to_chinese(amount) -> str:
+    """金额（元，可含 2 位小数 = 角分）转中文大写人民币写法。
+    例：
+        1234.56 → 壹仟贰佰叁拾肆元伍角陆分
+        80000   → 捌万元整
+        0       → 零元整
+        12.5    → 壹拾贰元伍角
+    """
+    try:
+        amt = float(amount)
+    except (TypeError, ValueError):
+        return ""
+
+    if amt < 0:
+        return "（负）" + _yuan_to_chinese(-amt)
+
+    yuan = int(amt)
+    fen_total = round((amt - yuan) * 100)
+    if fen_total >= 100:  # round 上溢
+        yuan += 1
+        fen_total = 0
+    jiao = fen_total // 10
+    fen = fen_total % 10
+
+    # 整数部分按每 4 位分组
+    if yuan == 0:
+        yuan_str = "零"
+    else:
+        groups = []
+        n = yuan
+        while n > 0:
+            groups.append(n % 10000)
+            n //= 10000
+        parts: list[str] = []
+        for gi in range(len(groups) - 1, -1, -1):
+            g = groups[gi]
+            if g == 0:
+                if parts and not parts[-1].endswith("零"):
+                    parts.append("零")
+                continue
+            seg = ""
+            zero_pending = False
+            for d_idx in range(3, -1, -1):
+                digit = (g // (10 ** d_idx)) % 10
+                if digit == 0:
+                    if seg and not seg.endswith("零"):
+                        zero_pending = True
+                else:
+                    if zero_pending:
+                        seg += "零"
+                        zero_pending = False
+                    seg += _CN_DIGITS[digit] + _CN_UNITS_4[d_idx]
+            parts.append(seg + _CN_GROUPS[gi])
+        yuan_str = "".join(parts).rstrip("零")
+
+    if jiao == 0 and fen == 0:
+        return f"{yuan_str}元整"
+
+    result = f"{yuan_str}元"
+    if jiao > 0:
+        result += _CN_DIGITS[jiao] + "角"
+    elif fen > 0:
+        result += "零"  # 元后无角有分要补"零"
+    if fen > 0:
+        result += _CN_DIGITS[fen] + "分"
+    return result
+
+
 class ContractRenderer:
     """合同模板渲染：从 ContractTemplate 加载 docx → 替换占位符 → 返 bytes。
 
@@ -140,6 +214,12 @@ class ContractRenderer:
         if not isinstance(extras, dict):
             extras = {}
 
+        # v8 review #8：自动算合计金额 + 中文大写（不依赖 LLM 传 total_amount_cn）
+        total_amount_num = sum(
+            float(i.get("subtotal") or float(i.get("price", 0)) * float(i.get("qty", 0)))
+            for i in items
+        )
+
         ctx: dict = {
             # 乙方（来自 ERP customer 详情）
             "customer_name": customer.get("name") or "",
@@ -154,15 +234,15 @@ class ContractRenderer:
             "today": date.today().isoformat(),
             "now": datetime.now(UTC).isoformat(),
             "items": items,
-            "total_amount": str(
-                sum(
-                    float(i.get("subtotal") or float(i.get("price", 0)) * float(i.get("qty", 0)))
-                    for i in items
-                )
-            ),
+            "total_amount": f"{total_amount_num:,.2f}".rstrip("0").rstrip(".") or "0",
+            "total_amount_cn": _yuan_to_chinese(total_amount_num),
             # extras 覆盖前面（甲方账套字段 / shipping / tax_rate 等都从这里来）
+            # 但 total_amount / total_amount_cn LLM 传也会被默认覆盖（不允许 LLM 改总额）
             **{k: str(v) if not isinstance(v, (list, dict)) else v for k, v in extras.items()},
         }
+        # extras 不允许覆盖系统计算的合计（防 LLM 自己写错金额）
+        ctx["total_amount"] = f"{total_amount_num:,.2f}".rstrip("0").rstrip(".") or "0"
+        ctx["total_amount_cn"] = _yuan_to_chinese(total_amount_num)
 
         # required 字段缺数据时注入空字符串而不是抛错
         # 模板里残留的 {{xxx}} 占位符会被替换为空，docx 主体仍可生成（客户/商品/总额都对）

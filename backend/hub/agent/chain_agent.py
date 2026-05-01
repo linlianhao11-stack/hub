@@ -39,7 +39,11 @@ class ChainAgent:
     - RE_CONFIRM 链路：user_just_confirmed=True → confirm_all_pending → confirm_hint
     """
 
-    MAX_ROUNDS = 5
+    # v8 staging review #9：5 轮在"商品搜索 + 合同生成"链路里太紧
+    # （LLM 经常 search_products 不命中后换词重试 2-3 次，加上 search_customers
+    # 和 generate_contract_draft 至少 5 次 tool 调用，最后 round 没机会输出预览）
+    # 提到 8 round 给写操作前的搜索探索留余量
+    MAX_ROUNDS = 8
     # deepseek-v4-flash 上下文 128K，留充足余量 + 不影响 attention 质量；
     # 32K 是 v8 review P3：18K 在用户首次试用时频繁撞上界，搭配 prompt 输出收紧后翻 ~80% 余量
     # 单次成本变化：18K→32K 约 +78%（按 ¥0.001/K input 算 +¥0.014/call），可接受

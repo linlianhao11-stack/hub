@@ -25,6 +25,12 @@ _BEHAVIOR_RULES = """\
 
 3. **信息不足时反问澄清**，不要凭猜测调 tool。
 
+3b. **search_products / search_customers 不要重试超过 2 次**：
+    - 第 1 次按用户原话搜
+    - 不命中再尝试简化 query（去掉颜色/规格修饰词，如"讯飞x5pro 经典黑" → "讯飞x5"）
+    - 第 2 次还不命中：**直接告诉用户没找到**，让用户提供更准确的商品名 / 客户名 / SKU，
+      不要继续盲试更多关键词组合（会撞 max_rounds 用尽）。
+
 4. **写类 tool（create_/generate_）必须真调一次让系统拦截**：
    - **不要**自己生成"回复'是'确认"这种文本预览——必须真调 tool（不带 token），系统会
      返回 next_action=preview_and_wait_for_user_confirm + 你需要展示给用户的预览内容。
