@@ -20,11 +20,139 @@ import re
 from datetime import UTC, date, datetime
 
 from docx import Document  # python-docx
+from docx.oxml.ns import qn
+from docx.shared import Cm
 from docx.table import _Row
 
 from hub.models.contract import ContractTemplate
 
 logger = logging.getLogger("hub.agent.document.contract")
+
+
+# v8 staging review #11：模板列宽自动调节（合同 + 报价共用算法，各自规则）
+# 凭证 / 调价 / 库存调整等暂未涉及 docx 渲染（落 ERP 表）；
+# 后续如有 docx 类型按这个 pattern 加新 columns_config 即可。
+SALES_CONTRACT_COLUMNS: list[dict] = [
+    {"key": "_idx",     "label": "序号",       "min": 0.7, "max": 1.0, "weight": 1},
+    {"key": "name",     "label": "产品名称",   "min": 2.5, "max": 6.0, "weight": 5},
+    {"key": "spec",     "label": "规格",       "min": 1.0, "max": 2.0, "weight": 1},
+    {"key": "color",    "label": "颜色",       "min": 1.0, "max": 2.0, "weight": 1},
+    {"key": "qty",      "label": "数量",       "min": 0.8, "max": 1.5, "weight": 1},
+    {"key": "price",    "label": "单价（元）", "min": 1.5, "max": 2.5, "weight": 2},
+    {"key": "subtotal", "label": "含税金额",   "min": 1.8, "max": 3.5, "weight": 2},
+    {"key": "remark",   "label": "备注",       "min": 1.5, "max": 3.0, "weight": 1},
+]
+
+# 报价单（5 列：序号 / 产品名称 / 数量 / 单价 / 小计）
+QUOTE_COLUMNS: list[dict] = [
+    {"key": "_idx",     "label": "序号",     "min": 0.7, "max": 1.0, "weight": 1},
+    {"key": "name",     "label": "产品名称", "min": 4.0, "max": 8.0, "weight": 5},
+    {"key": "qty",      "label": "数量",     "min": 1.0, "max": 1.8, "weight": 1},
+    {"key": "price",    "label": "单价",     "min": 2.0, "max": 3.5, "weight": 2},
+    {"key": "subtotal", "label": "小计",     "min": 2.0, "max": 3.5, "weight": 2},
+]
+
+# 模板类型 → columns_config 注册表（统一入口）
+_TEMPLATE_COLUMNS_REGISTRY: dict[str, list[dict]] = {
+    "sales": SALES_CONTRACT_COLUMNS,
+    "quote": QUOTE_COLUMNS,
+    # 凭证 / 调价 / 库存调整等如需 docx 化，加这里
+    # "voucher_doc": VOUCHER_COLUMNS,
+    # "price_adjust_doc": PRICE_ADJUST_COLUMNS,
+}
+
+
+def _estimate_text_width_cm(text, font_size_pt: int = 10) -> float:
+    """估算文本在 docx cell 里的实际显示宽度（cm）。
+
+    宋体 10pt 经验值：
+    - 中文字符（含全角符号）≈ 0.5 cm
+    - ASCII / 数字（半角）≈ 0.2 cm
+    """
+    s = str(text or "")
+    cn_count = sum(
+        1 for c in s
+        if "一" <= c <= "鿿"        # CJK Unified
+        or "　" <= c <= "〿"        # CJK Symbols
+        or "＀" <= c <= "￯"        # 全角符号
+    )
+    other_count = len(s) - cn_count
+    # 字号缩放：基于 10pt
+    scale = font_size_pt / 10.0
+    return (cn_count * 0.5 + other_count * 0.2) * scale
+
+
+def _calc_column_widths(
+    items: list[dict],
+    columns_config: list[dict],
+    total_cm: float = 14.5,
+    padding_cm: float = 0.4,
+) -> list[float]:
+    """根据 items 实际数据动态算每列宽度（cm）。
+
+    Args:
+        items: list of dict，每个 dict 含 columns_config 里 key 对应的字段
+        columns_config: [{key, label, min, max, weight}, ...]
+        total_cm: 表格总宽（A4 portrait 内容区 ≈ 16cm，留 1.5cm 边给 14.5cm）
+        padding_cm: 每列内容边距留白
+
+    Algorithm:
+      1. 每列 ideal_width = max(表头宽, 所有 items 该列内容宽) + padding，
+         clamp 到 [min_cm, max_cm]
+      2. 总宽 ≤ total_cm → 直接用
+      3. 总宽 > total_cm → 按 weight 反比缩（weight 大列优先保宽，
+         weight=1 列扣得多，weight=5 列扣得少），不低于 min
+    """
+    n = len(columns_config)
+    if n == 0:
+        return []
+
+    ideal: list[float] = []
+    for col in columns_config:
+        max_text = col["label"]  # 表头作为基线
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            v = str(it.get(col["key"], "") or "")
+            if len(v) > len(max_text):
+                max_text = v
+        w = _estimate_text_width_cm(max_text) + padding_cm
+        ideal.append(max(col["min"], min(col["max"], w)))
+
+    total = sum(ideal)
+    if total <= total_cm:
+        return ideal
+
+    # 超 total → 按 weight 反比缩（weight 大列保得多）
+    excess = total - total_cm
+    weights = [col["weight"] for col in columns_config]
+    inv_weights = [1.0 / w for w in weights]
+    sum_inv = sum(inv_weights) or 1.0
+
+    widths = list(ideal)
+    for i, col in enumerate(columns_config):
+        share = (inv_weights[i] / sum_inv) * excess
+        widths[i] = max(col["min"], widths[i] - share)
+
+    # min 卡住时再扫一遍从 weight 最小列扣
+    iter_count = 0
+    while sum(widths) > total_cm + 0.01 and iter_count < 8:
+        iter_count += 1
+        cur_excess = sum(widths) - total_cm
+        candidates = [
+            (i, col["weight"])
+            for i, col in enumerate(columns_config)
+            if widths[i] > col["min"] + 0.05
+        ]
+        if not candidates:
+            break  # 都到 min 了，认了
+        idx_to_shrink = min(candidates, key=lambda x: x[1])[0]
+        col = columns_config[idx_to_shrink]
+        room = widths[idx_to_shrink] - col["min"]
+        delta = min(cur_excess, room)
+        widths[idx_to_shrink] -= delta
+
+    return widths
 
 
 class TemplateNotFoundError(Exception):
@@ -157,8 +285,23 @@ class ContractRenderer:
         try:
             doc = Document(io.BytesIO(template_bytes))
             ctx = self._build_context(template, customer, items, extras or {})
+
+            # v8 staging review #11：根据模板类型 + items 实际内容动态算列宽
+            # （只对注册了 columns_config 的类型生效——sales/quote）
+            columns_config = _TEMPLATE_COLUMNS_REGISTRY.get(template.template_type)
+            column_widths = (
+                _calc_column_widths(items or [], columns_config)
+                if columns_config else None
+            )
+            if column_widths:
+                logger.info(
+                    "合同模板 %s (type=%s) 动态列宽 cm: %s",
+                    template.id, template.template_type,
+                    [round(w, 2) for w in column_widths],
+                )
+
             self._replace_paragraphs(doc, ctx)
-            self._replace_tables(doc, ctx)
+            self._replace_tables(doc, ctx, column_widths=column_widths)
             # 扫描渲染后仍含 {{xxx}} 的占位符（模板 typo 或数据缺字段）
             unknown_placeholders: set[str] = set()
             for para in doc.paragraphs:
@@ -290,7 +433,9 @@ class ContractRenderer:
                     para.add_run(new_text)
 
     @staticmethod
-    def _replace_tables(doc: Document, ctx: dict) -> None:
+    def _replace_tables(
+        doc: Document, ctx: dict, *, column_widths: list[float] | None = None,
+    ) -> None:
         """表格级 {{items_table}} 占位符 → 展开成多行；其余 cell 内占位符替换。
 
         merged cell 防重复处理：merged 后多 row 共享同一个 XML element（cell._tc），
@@ -312,6 +457,12 @@ class ContractRenderer:
                 if "{{items_table}}" in row_text:
                     items_template_trs.append((table, row, row._tr))
                     break  # 同一 table 只取第一个 items_table 行
+
+        # 第 1.5 阶段（v8 review #11）：动态调整 items_table 所在表格的列宽
+        # column_widths 从 render() 算好传进来；不为空时覆盖模板原列宽
+        if column_widths:
+            for table, _row, _tr in items_template_trs:
+                ContractRenderer._set_table_column_widths(table, column_widths)
 
         # 第 2 阶段：按记录展开
         items = ctx.get("items") or []
@@ -411,3 +562,28 @@ class ContractRenderer:
             p.runs[0].text = text
         else:
             p.add_run(text)
+
+    @staticmethod
+    def _set_table_column_widths(table, widths_cm: list[float]) -> None:
+        """覆盖表格列宽（v8 staging review #11）。
+
+        改 2 处：
+          1. <w:tblGrid>/<w:gridCol> ：表格列定义（所有 row 默认遵从）
+          2. 每行每 cell 的 width ：确保 Word 严格按新列宽渲染
+
+        merged cell 也兼容：python-docx 的 row.cells 对 merged cell 按 grid index
+        返回多次（每个被合并的 grid 位置都返回），按 ci 索引设 width 即可。
+        """
+        # 1. 修 tblGrid（表格列定义）
+        tblGrid = table._tbl.find(qn("w:tblGrid"))
+        if tblGrid is not None:
+            cols = tblGrid.findall(qn("w:gridCol"))
+            for i, col_el in enumerate(cols):
+                if i < len(widths_cm):
+                    # cm → twips（1 cm = 567 twips）
+                    col_el.set(qn("w:w"), str(int(widths_cm[i] * 567)))
+        # 2. 每行每 cell 设 width（保险措施，确保 Word 严格遵循）
+        for row in table.rows:
+            for ci, cell in enumerate(row.cells):
+                if ci < len(widths_cm):
+                    cell.width = Cm(widths_cm[ci])
