@@ -185,6 +185,10 @@ async def handle_inbound(
                 record["final_status"] = "failed_user"
                 return
 
+            # 标注解析器（落 task_log.intent_parser，admin UI 用来区分 agent vs rule fallback 路径）
+            # Plan 6 chain_agent 不再有"discrete intent"概念，confidence 留 null
+            record["intent_parser"] = "agent"
+
             # RE_CONFIRM 识别（Plan 6 §2161）：用户整条消息是确认词
             # → user_just_confirmed=True 让 ChainAgent 调 confirm_gate.confirm_all_pending
             user_just_confirmed = bool(RE_CONFIRM.match(content))
@@ -271,6 +275,10 @@ async def _fallback_to_rule_parser(
         await _send_text(sender, channel_userid, "AI 处理出了点问题，请稍后重试")
         record["final_status"] = "failed_system_final"
         return
+
+    # 标注解析器为 rule（覆盖之前的 "agent" 标签）+ 落置信度
+    record["intent_parser"] = "rule"
+    record["intent_confidence"] = getattr(intent, "confidence", None)
 
     # unknown / low_confidence → 友好兜底文案
     if intent.intent_type == "unknown" or getattr(intent, "confidence", 1.0) < 0.5:

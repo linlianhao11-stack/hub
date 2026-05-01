@@ -33,8 +33,8 @@
           <td class="app-td">{{ taskTypeLabel(t.task_type) }}</td>
           <td class="app-td std-num">{{ t.channel_userid }}</td>
           <td class="app-td"><AppBadge :variant="statusVariant(t.status)">{{ statusLabel(t.status) }}</AppBadge></td>
-          <td class="app-td text-muted">{{ t.intent_parser || '-' }}</td>
-          <td class="app-td text-right std-num">{{ t.intent_confidence != null ? t.intent_confidence.toFixed(2) : '-' }}</td>
+          <td class="app-td text-muted">{{ parserLabel(t.intent_parser) }}</td>
+          <td class="app-td text-right std-num">{{ confidenceLabel(t.intent_confidence) }}</td>
           <td class="app-td text-right std-num">{{ t.duration_ms ?? '-' }}</td>
           <td class="app-td text-muted">{{ fmtDateTime(t.created_at) }}</td>
           <td class="app-td text-right">
@@ -61,7 +61,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { listTasks } from '../../api/tasks'
 import { pickErrorDetail } from '../../api'
-import { fmtDateTime, statusLabel, statusVariant } from '../../utils/format'
+import { fmtDateTime, statusLabel, statusVariant, parserLabel, confidenceLabel } from '../../utils/format'
 import { usePagination } from '../../composables/usePagination'
 import AppCard from '../../components/ui/AppCard.vue'
 import AppTable from '../../components/common/AppTable.vue'
