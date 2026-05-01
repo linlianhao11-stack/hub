@@ -123,6 +123,30 @@ async def generate_contract_draft(
             conversation_id, e,
         )
 
+    # 1.6. enrich items：LLM 只传 product_id 时自动从 ERP 拉 name/spec/color
+    # （v8 staging review #7：商品行表格列空白原因之一）
+    enriched_items: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        enriched = dict(item)  # 拷贝避免改 LLM 传入对象
+        if not enriched.get("name") and enriched.get("product_id"):
+            try:
+                product = await erp.get_product(
+                    product_id=int(enriched["product_id"]),
+                    acting_as_user_id=acting_as_user_id,
+                )
+                enriched.setdefault("name", product.get("name") or "")
+                enriched.setdefault("spec", product.get("spec") or product.get("specification") or "")
+                enriched.setdefault("color", product.get("color") or "")
+                enriched.setdefault("unit", product.get("unit") or "")
+            except (ErpNotFoundError, ErpAdapterError) as e:
+                logger.warning(
+                    "get_product %s 失败（item.name 留空）conv=%s err=%s",
+                    enriched.get("product_id"), conversation_id, e,
+                )
+        enriched_items.append(enriched)
+
     # extras 类型加固（LLM 偶尔传 string 而不是 dict）
     safe_extras = extras if isinstance(extras, dict) else {}
     # 合并 seller_extras → 用户 extras 可覆盖（如指定不同账套时）
@@ -134,7 +158,7 @@ async def generate_contract_draft(
         docx_bytes = await renderer.render(
             template_id=template_id,
             customer=customer,
-            items=items,
+            items=enriched_items,
             extras=merged_extras,
         )
     except TemplateNotFoundError:

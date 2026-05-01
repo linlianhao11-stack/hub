@@ -13,12 +13,14 @@ ContractTemplate.placeholders 形如：
 from __future__ import annotations
 
 import base64
+import copy
 import io
 import logging
 import re
 from datetime import UTC, date, datetime
 
 from docx import Document  # python-docx
+from docx.table import _Row
 
 from hub.models.contract import ContractTemplate
 
@@ -215,37 +217,31 @@ class ContractRenderer:
         用 element id 去重。**不能用 id(cell)** —— Python GC 会复用对象 id，
         导致正常的不同 cell 也被错认为"已处理"（v8 staging review #6 实测踩坑）。
         """
-        # v3 加固（v8 staging review #6）：旧版 id() 去重 cell 受 Python GC 复用 id 影响
-        # 误伤正常 cell（实测 18 个 cell 仅 1 个被处理）。改成：
-        #   - {{items_table}} 用 _tc python 对象内存地址做"短期"去重（单循环内 GC 不复用）
-        #   - 其他占位符替换天然幂等（替换后原占位消失），重复处理无副作用
-        items_table_done: set[int] = set()
+        # v4 加固（v8 staging review #7）：items_table 真正按列展开成 N 行表格，
+        # 而不是把所有数据挤到第一个 cell。
+        # 模板规则：含 `{{items_table}}` 的整行视为"商品行模板"，期望 8 列：
+        #   序号 / 产品名称 / 规格 / 颜色 / 数量 / 单价 / 含税金额 / 备注
+        # 渲染流程：在该 row 前插入 N 行（每个 item 一行），最后删除占位 row。
+        # 兼容：cell 数 < 8 时按 cell 顺序填前 N 个字段，剩余字段忽略。
+
+        # 第 1 阶段：找到所有"items_table 模板行"，记录 (table, tr_element) 待展开
+        items_template_trs: list[tuple] = []
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " ".join(c.text for c in row.cells)
+                if "{{items_table}}" in row_text:
+                    items_template_trs.append((table, row, row._tr))
+                    break  # 同一 table 只取第一个 items_table 行
+
+        # 第 2 阶段：按记录展开
+        items = ctx.get("items") or []
+        for table, row, tr in items_template_trs:
+            ContractRenderer._expand_items_row(table, row, tr, items)
+
+        # 第 3 阶段：扫所有表格 cell 做普通占位符替换（替换幂等，无需去重）
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
-                    cell_text = cell.text
-                    if "{{items_table}}" in cell_text:
-                        # 同一 merged cell 多 row 迭代到都跳过（仅在该判断时去重，
-                        # 单循环内 _tc 引用稳定，id 不会被 GC 复用）
-                        tc_id = id(cell._tc)
-                        if tc_id in items_table_done:
-                            continue
-                        items_table_done.add(tc_id)
-                        items = ctx.get("items") or []
-                        for para in cell.paragraphs:
-                            for run in para.runs:
-                                run.text = ""
-                        for item in items:
-                            subtotal = item.get("subtotal") or (
-                                float(item.get("price", 0)) * float(item.get("qty", 0))
-                            )
-                            line = (
-                                f"{item.get('name', '')} × {item.get('qty', 0)} "
-                                f"@ {item.get('price', 0)} = {subtotal}"
-                            )
-                            cell.add_paragraph(line)
-                        continue
-                    # 非 items_table：直接处理（替换幂等，merged 重复无副作用）
                     for para in cell.paragraphs:
                         para_text = para.text
                         if "{{" not in para_text:
@@ -264,3 +260,74 @@ class ContractRenderer:
                                 para.runs[0].text = new_text
                             else:
                                 para.add_run(new_text)
+
+    @staticmethod
+    def _expand_items_row(table, template_row, template_tr, items: list[dict]) -> None:
+        """把 items_table 占位行展开成 N 行。
+
+        - 复制模板行的 XML element 作为新行（保留边框 / 字号等格式）
+        - 按列 0-7 填：序号 / 产品名称 / 规格 / 颜色 / 数量 / 单价 / 含税金额 / 备注
+        - 在原 tr 前插入新行，最后删除原 tr
+        """
+        parent = template_tr.getparent()
+        if parent is None:
+            return  # 模板行已脱离 doc，啥都不做
+
+        if not items:
+            # 无 items：清空占位行内容（保留行结构）
+            for cell in template_row.cells:
+                ContractRenderer._set_cell_text(cell, "")
+            return
+
+        idx = list(parent).index(template_tr)
+        # 8 列字段顺序（与模板对齐；cell 数少于 8 时按顺序填前 N 个）
+        for i, item in enumerate(items):
+            new_tr = copy.deepcopy(template_tr)
+            new_row = _Row(new_tr, table)
+            cells = new_row.cells
+
+            qty = item.get("qty") or 0
+            price = item.get("price") or 0
+            subtotal = item.get("subtotal")
+            if subtotal is None:
+                try:
+                    subtotal = float(price) * float(qty)
+                except (TypeError, ValueError):
+                    subtotal = ""
+
+            col_values = [
+                str(i + 1),                            # 序号
+                str(item.get("name") or ""),           # 产品名称
+                str(item.get("spec") or ""),           # 规格
+                str(item.get("color") or ""),          # 颜色
+                str(qty) if qty else "",               # 数量
+                str(price) if price else "",           # 单价
+                str(subtotal) if subtotal != "" else "",  # 含税金额
+                str(item.get("remark") or ""),         # 备注
+            ]
+            for col_i, value in enumerate(col_values):
+                if col_i >= len(cells):
+                    break
+                ContractRenderer._set_cell_text(cells[col_i], value)
+
+            parent.insert(idx + i, new_tr)
+
+        # 删除原占位行（在所有新行已插入后）
+        parent.remove(template_tr)
+
+    @staticmethod
+    def _set_cell_text(cell, text: str) -> None:
+        """清空 cell 所有 paragraph 的 run，把 text 写到第一个 paragraph 的第一个 run。
+        保留 cell 原有格式（边框 / 字号 / 对齐）。"""
+        # 清空所有 run text（不删 paragraph，保字号/对齐设置）
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.text = ""
+        if not cell.paragraphs:
+            cell.add_paragraph(text)
+            return
+        p = cell.paragraphs[0]
+        if p.runs:
+            p.runs[0].text = text
+        else:
+            p.add_run(text)
