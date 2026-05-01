@@ -40,12 +40,15 @@ class SessionMemory:
     def _refs_products_key(self, conversation_id: str) -> str:
         return f"{self.KEY_PREFIX}{conversation_id}:refs:products"
 
-    def _round_state_key(self, conversation_id: str) -> str:
-        """v8 staging review #13 (B 方案 state reducer)：
-        每 turn 末尾持久化一份"本轮已确认实体 + 价格 + 数量"摘要 JSON，
-        下一轮 ContextBuilder 加进 must_keep 让 LLM 看到上下文，
-        避免重复 search 拿 ID 等问题。"""
-        return f"{self.KEY_PREFIX}{conversation_id}:round_state"
+    def _round_state_key(self, conversation_id: str, hub_user_id: int) -> str:
+        """v8 staging review #13 (B 方案 state reducer) + #16 (per-user 隔离)：
+        每 turn 末尾持久化一份"本轮已确认实体 + 价格 + 数量"摘要 JSON。
+
+        v8 review #16：key 复合 (conversation_id, hub_user_id)。钉钉群聊里多人共享
+        同一个 conversation_id，如果只用 conversation_id 做 key，B 用户下一轮会
+        看到 A 用户上轮的客户/商品/价格，造成数据泄露 + "按之前要求"误用他人参数。
+        """
+        return f"{self.KEY_PREFIX}{conversation_id}:round_state:{hub_user_id}"
 
     async def append(self, conversation_id: str, *,
                      role: str, content: str,
@@ -108,31 +111,38 @@ class SessionMemory:
             product_ids=refs.product_ids,
         )
 
-    async def set_round_state(self, conversation_id: str, state: dict) -> None:
+    async def set_round_state(
+        self, conversation_id: str, hub_user_id: int, state: dict,
+    ) -> None:
         """v8 staging review #13：写本轮状态摘要（state reducer 模式）。
+
+        v8 review #16：key 加 hub_user_id 实现群聊场景下 per-user 隔离。
 
         state 结构示例：
           {
-            "customer": {"id": 7, "name": "北京翼蓝科技发展有限公司"},
-            "products": [
-              {"id": 5030, "name": "X5 Pro经典黑", "qty": 20, "price": 3900},
-              {"id": 5032, "name": "讯飞 AI 翻译耳机 AIH-2541", "qty": 6, "price": 2000},
-            ],
-            "intent": "生成合同",
-            "notes": "翻译耳机库存仅 1 台，用户同意按 6 台开单后续补货",
+            "customers_seen": [{"id": 7, "name": "北京翼蓝", "phone": "..."}],
+            "products_seen": [{"id": 5030, "name": "X5 Pro", "sku": "SKU50139"}],
+            "last_intent": {"tool": "generate_contract_draft",
+                            "args": {"customer_id": 7, "items": [...]}},
           }
         """
         if not state:
             return
-        key = self._round_state_key(conversation_id)
+        key = self._round_state_key(conversation_id, hub_user_id)
         async with self.redis.pipeline(transaction=False) as pipe:
             pipe.set(key, json.dumps(state, ensure_ascii=False))
             pipe.expire(key, self.TTL)
             await pipe.execute()
 
-    async def get_round_state(self, conversation_id: str) -> dict | None:
-        """读上轮状态摘要（下一轮 ContextBuilder 加载用）。"""
-        key = self._round_state_key(conversation_id)
+    async def get_round_state(
+        self, conversation_id: str, hub_user_id: int,
+    ) -> dict | None:
+        """读上轮状态摘要（下一轮 ContextBuilder 加载用）。
+
+        v8 review #16：用 (conversation_id, hub_user_id) 复合 key 读，
+        群聊里 B 用户只能读自己的 round_state，看不到 A 用户上轮的实体。
+        """
+        key = self._round_state_key(conversation_id, hub_user_id)
         raw = await self.redis.get(key)
         if not raw:
             return None
@@ -145,10 +155,17 @@ class SessionMemory:
         """显式清理（场景：管理员手动重置 / 测试）。
 
         Plan 6 Task 4 加：管理员重置 / 测试清理；不在 plan 文字 spec 范围但是合理实用方法。
+
+        v8 review #16：round_state 现在按 hub_user_id 拆 key，群聊场景下一个
+        conversation 可能有多个 round_state key——用 scan + 模式删除。
         """
+        # 固定 key（消息 / 实体引用）
         await self.redis.delete(
             self._msgs_key(conversation_id),
             self._refs_customers_key(conversation_id),
             self._refs_products_key(conversation_id),
-            self._round_state_key(conversation_id),
         )
+        # 模糊 key（per-user round_state）
+        pattern = f"{self.KEY_PREFIX}{conversation_id}:round_state:*"
+        async for key in self.redis.scan_iter(match=pattern):
+            await self.redis.delete(key)

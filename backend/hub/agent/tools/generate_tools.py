@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from datetime import date
 
@@ -22,6 +24,33 @@ from hub.agent.tools.registry import ToolRegistry
 from hub.agent.tools.types import ToolType
 from hub.models.contract import ContractDraft, ContractTemplate
 from hub.models.identity import ChannelUserBinding
+
+
+def _normalize_for_fingerprint(value):
+    """v8 review #17：用于 fingerprint 的稳定 normalize（dict 按 key 排序，list 保序）。"""
+    if isinstance(value, dict):
+        return {k: _normalize_for_fingerprint(value[k]) for k in sorted(value.keys())}
+    if isinstance(value, list):
+        return [_normalize_for_fingerprint(v) for v in value]
+    return value
+
+
+def _compute_contract_fingerprint(
+    *, template_id: int, customer_id: int, items: list, extras: dict | None,
+) -> str:
+    """v8 review #17：合同幂等 fingerprint，覆盖 items + extras。
+
+    用 sha256 摘要稳定 JSON 序列化结果，64 字符 hex（与 model 字段长度对齐）。
+    items / extras 的 dict 按 key 排序保稳定（同样输入永远同样 fingerprint）。
+    """
+    payload = {
+        "template_id": template_id,
+        "customer_id": customer_id,
+        "items": _normalize_for_fingerprint(items or []),
+        "extras": _normalize_for_fingerprint(extras or {}),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 logger = logging.getLogger("hub.agent.tools.generate_tools")
 
@@ -83,11 +112,14 @@ async def generate_contract_draft(
     Returns:
         {"draft_id", "file_sent", "file_name"}
 
-    幂等保护（v8 staging review #15）：
-    重试时按 (conversation_id, customer_id, template_id, hub_user_id, items) 查已有 draft，
-    命中则复用 ID 跳过 create 直接重发文件；不命中才创建新 draft。
-    极端 race（同 conv 并发 generate）可能漏拦——靠应用层 query 实现，
-    待加 DB 唯一索引（待 follow-up migration）后再彻底关闭这个 race window。
+    幂等保护（v8 staging review #15 → #17）：
+    用 fingerprint = sha256(template_id|customer_id|items|extras) 做幂等键。
+    - 入参完全相同（含 extras）→ fingerprint 一致 → 复用 draft 跳过 create，
+      worker 重试时只重发文件不重复入库
+    - 改了 items / extras 任一字段 → fingerprint 变 → 创建新 draft，
+      admin 审计 metadata 与实际 docx 内容始终一致
+    - 极端 race（同 conv 并发 generate 同 fingerprint）可能漏拦——
+      用 fingerprint 列加 partial index 加速查询，DB 唯一约束等 follow-up
     """
     # 1. 拉客户信息（v8 staging review #12：删宽容 fallback）
     # 旧逻辑：失败时用 "客户N" 假占位 → LLM 编错 customer_id 时合同上写"客户102"
@@ -209,33 +241,34 @@ async def generate_contract_draft(
         }
 
     # 3. 持久化 ContractDraft（metadata 审计用），幂等保护
-    # v8 staging review #15（P2-B）：worker 重试时如果 send_file 失败，
-    # 重新跑整段流程会创建第 2 条 ContractDraft → admin inbox 出现重复行。
-    # 修：先按 (conversation_id, customer_id, template_id, hub_user_id) + items 内容
-    # 查已有 draft，命中则复用，不命中才 create。
-    # 注：未加 DB 唯一索引（避免 schema migration），靠应用层 query 实现幂等；
-    # 极端 race（同 conv 并发 generate）可能漏拦，作为已知限制接受。
-    existing_drafts = await ContractDraft.filter(
-        conversation_id=conversation_id,
-        customer_id=customer_id,
+    # v8 review #15 → #17：用 fingerprint 替代多字段比对。
+    # fingerprint = sha256(template_id | customer_id | items 排序 | extras 排序)
+    # 改 extras 时 fingerprint 变 → 创建新 draft（admin 审计准确）；
+    # 重试相同入参 → fingerprint 一致 → 复用 draft（worker 重试不爆复制）。
+    fingerprint = _compute_contract_fingerprint(
         template_id=template_id,
+        customer_id=customer_id,
+        items=items,
+        extras=merged_extras,
+    )
+    draft = await ContractDraft.filter(
+        conversation_id=conversation_id,
         requester_hub_user_id=hub_user_id,
-    ).all()
-    draft = None
-    for d in existing_drafts:
-        if d.items == items:  # JSONField 整体比对
-            draft = d
-            logger.info(
-                "ContractDraft 幂等命中 复用 draft_id=%s conv=%s",
-                d.id, conversation_id,
-            )
-            break
-    if draft is None:
+        fingerprint=fingerprint,
+    ).first()
+    if draft is not None:
+        logger.info(
+            "ContractDraft 幂等命中（fingerprint）复用 draft_id=%s conv=%s",
+            draft.id, conversation_id,
+        )
+    else:
         draft = await ContractDraft.create(
             template_id=template_id,
             requester_hub_user_id=hub_user_id,
             customer_id=customer_id,
             items=items,
+            extras=merged_extras,  # v8 review #17：审计用，与 fingerprint 配套落库
+            fingerprint=fingerprint,
             rendered_file_storage_key=None,  # 第一版不存文件 bytes
             conversation_id=conversation_id,
         )

@@ -140,7 +140,9 @@ class ChainAgent:
         # 不用重新 search 拿 ID（避免数字幻觉、避免重复确认）
         prev_round_state: dict | None = None
         try:
-            prev_round_state = await self.session_memory.get_round_state(conversation_id)
+            prev_round_state = await self.session_memory.get_round_state(
+                conversation_id, hub_user_id,
+            )
         except Exception:
             logger.exception("session_memory.get_round_state 失败 conv=%s", conversation_id)
 
@@ -290,7 +292,9 @@ class ChainAgent:
                 try:
                     state = self._extract_round_state(history, user_message)
                     if state:
-                        await self.session_memory.set_round_state(conversation_id, state)
+                        await self.session_memory.set_round_state(
+                            conversation_id, hub_user_id, state,
+                        )
                 except Exception:
                     logger.exception("session.set_round_state 失败 conv=%s", conversation_id)
 

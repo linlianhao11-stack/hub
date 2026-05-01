@@ -253,8 +253,8 @@ async def test_generate_contract_draft_basic(mock_sender):
 
         # ContractDraft.create()
         mock_draft.create = AsyncMock(return_value=draft)
-        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
-        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
+        # v8 review #17：fingerprint 幂等查询 mock（默认 .first() 返 None 走 create 分支）
+        mock_draft.filter.return_value.first = AsyncMock(return_value=None)
 
         # ChannelUserBinding.filter().first()
         bqs = MagicMock()
@@ -306,6 +306,59 @@ async def test_generate_contract_draft_template_not_found(mock_sender):
     assert "999" in result["error"]
 
 
+# ===== v8 staging review #17: fingerprint 幂等覆盖 items + extras =====
+
+def test_compute_contract_fingerprint_stable():
+    """同输入 → 同 fingerprint（dict key 顺序不影响）。"""
+    from hub.agent.tools.generate_tools import _compute_contract_fingerprint
+
+    fp1 = _compute_contract_fingerprint(
+        template_id=1, customer_id=11,
+        items=[{"product_id": 5030, "qty": 10, "price": 4000}],
+        extras={"contract_no": "C-001", "payment_terms": "30 天"},
+    )
+    fp2 = _compute_contract_fingerprint(
+        template_id=1, customer_id=11,
+        # 同 items + extras 但 dict key 顺序倒过来
+        items=[{"price": 4000, "product_id": 5030, "qty": 10}],
+        extras={"payment_terms": "30 天", "contract_no": "C-001"},
+    )
+    assert fp1 == fp2
+    assert len(fp1) == 64  # sha256 hex
+
+
+def test_compute_contract_fingerprint_extras_change_creates_new():
+    """改 extras 任一字段 → fingerprint 变（不会复用旧 draft）。
+
+    v8 review #17 防的就是：用户改了合同号 / 付款条款 / 收货地址等，
+    新文件已渲染发出，但代码 bug 复用旧 draft DB 记录 → 审计失真。
+    """
+    from hub.agent.tools.generate_tools import _compute_contract_fingerprint
+
+    base = dict(
+        template_id=1, customer_id=11,
+        items=[{"product_id": 5030, "qty": 10, "price": 4000}],
+    )
+    fp_a = _compute_contract_fingerprint(**base, extras={"contract_no": "C-001"})
+    # 只改了合同号
+    fp_b = _compute_contract_fingerprint(**base, extras={"contract_no": "C-002"})
+    assert fp_a != fp_b
+
+    # 加了一个 payment_terms 字段
+    fp_c = _compute_contract_fingerprint(
+        **base, extras={"contract_no": "C-001", "payment_terms": "30 天"},
+    )
+    assert fp_a != fp_c
+
+    # 改了 items 数量
+    fp_d = _compute_contract_fingerprint(
+        template_id=1, customer_id=11,
+        items=[{"product_id": 5030, "qty": 20, "price": 4000}],  # 10 → 20
+        extras={"contract_no": "C-001"},
+    )
+    assert fp_a != fp_d
+
+
 async def test_generate_contract_draft_no_active_binding(mock_sender):
     """用户无 active 钉钉绑定 → 草稿仍持久化 + file_sent=False。"""
     from hub.agent.tools.generate_tools import generate_contract_draft
@@ -329,8 +382,8 @@ async def test_generate_contract_draft_no_active_binding(mock_sender):
         mock_contract_template.filter.return_value = tqs
 
         mock_draft.create = AsyncMock(return_value=draft)
-        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
-        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
+        # v8 review #17：fingerprint 幂等查询 mock（默认 .first() 返 None 走 create 分支）
+        mock_draft.filter.return_value.first = AsyncMock(return_value=None)
 
         bqs = MagicMock()
         bqs.first = AsyncMock(return_value=None)  # 没有 binding
@@ -384,8 +437,8 @@ async def test_generate_contract_draft_send_file_failure_propagates(mock_sender)
         mock_contract_template.filter.return_value = tqs
 
         mock_draft.create = AsyncMock(return_value=draft)
-        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
-        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
+        # v8 review #17：fingerprint 幂等查询 mock（默认 .first() 返 None 走 create 分支）
+        mock_draft.filter.return_value.first = AsyncMock(return_value=None)
 
         bqs = MagicMock()
         bqs.first = AsyncMock(return_value=binding)
@@ -444,8 +497,8 @@ async def test_generate_contract_draft_get_customer_failed_returns_error(mock_se
         tqs.first = AsyncMock(return_value=template)
         mock_contract_template.filter.return_value = tqs
         mock_draft.create = AsyncMock(return_value=draft)
-        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
-        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
+        # v8 review #17：fingerprint 幂等查询 mock（默认 .first() 返 None 走 create 分支）
+        mock_draft.filter.return_value.first = AsyncMock(return_value=None)
         bqs = MagicMock()
         bqs.first = AsyncMock(return_value=binding)
         mock_binding.filter.return_value = bqs

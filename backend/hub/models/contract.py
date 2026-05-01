@@ -42,6 +42,8 @@ class ContractDraft(Model):
     requester_hub_user_id = fields.IntField()  # 请求人 HubUser ID
     customer_id = fields.IntField()  # ERP customer_id
     items = fields.JSONField()  # 合同条款/行项目
+    extras = fields.JSONField(null=True)  # 渲染参数（合同号 / 付款条款 / 收货地址等），v8 review #17 加
+    fingerprint = fields.CharField(max_length=64, null=True)  # 幂等指纹（含 items + extras 哈希），v8 review #17 加
     rendered_file_storage_key = fields.CharField(max_length=500, null=True)  # 生成的 docx 文件 key
     status = fields.CharField(max_length=20, default="generated")  # generated/sent/superseded
     conversation_id = fields.CharField(max_length=200, null=True)  # 来源对话 ID

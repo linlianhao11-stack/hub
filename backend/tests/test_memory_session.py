@@ -120,3 +120,95 @@ async def test_clear_removes_all_keys(session, redis_client):
     assert history.messages == []
     assert history.customer_ids == set()
     assert history.product_ids == set()
+
+
+# ==================== v8 staging review #16: round_state per-user 隔离 ====================
+
+@pytest.mark.asyncio
+async def test_round_state_set_get_roundtrip(session):
+    """set_round_state 写入后，同 (conv, user) get 能取回。"""
+    cid = _conv_id("rs-roundtrip")
+    state = {
+        "customers_seen": [{"id": 7, "name": "翼蓝"}],
+        "products_seen": [{"id": 5030, "name": "X5 Pro"}],
+        "last_intent": {"tool": "generate_contract_draft"},
+    }
+    await session.set_round_state(cid, hub_user_id=1, state=state)
+    got = await session.get_round_state(cid, hub_user_id=1)
+    assert got == state
+
+
+@pytest.mark.asyncio
+async def test_round_state_per_user_isolation(session):
+    """**核心安全测试** v8 review #16：群聊场景同 conv_id 不同 hub_user_id 不互相注入。
+
+    模拟：A 用户（hub_user_id=10）和 B 用户（hub_user_id=20）在同一群聊
+    （同一 conversation_id）各自跟 agent 对话；
+    A 上轮做了"翼蓝合同 X5 Pro 3900"，B 上轮做了"得帆合同翻译耳机 2000"。
+    B 这一轮 get_round_state 必须**只**拿到 B 自己的状态，**不能**看到 A 的客户。
+    """
+    cid = _conv_id("rs-per-user")
+    state_a = {
+        "customers_seen": [{"id": 7, "name": "北京翼蓝科技发展有限公司"}],
+        "products_seen": [{"id": 5030, "name": "X5 Pro"}],
+        "last_intent": {"tool": "generate_contract_draft",
+                        "args": {"customer_id": 7, "items": [{"product_id": 5030}]}},
+    }
+    state_b = {
+        "customers_seen": [{"id": 11, "name": "广州市得帆计算机科技有限公司"}],
+        "products_seen": [{"id": 5032, "name": "讯飞 AI 翻译耳机"}],
+        "last_intent": {"tool": "generate_contract_draft",
+                        "args": {"customer_id": 11, "items": [{"product_id": 5032}]}},
+    }
+    await session.set_round_state(cid, hub_user_id=10, state=state_a)
+    await session.set_round_state(cid, hub_user_id=20, state=state_b)
+
+    # A 拿 A 的，B 拿 B 的
+    got_a = await session.get_round_state(cid, hub_user_id=10)
+    got_b = await session.get_round_state(cid, hub_user_id=20)
+    assert got_a == state_a
+    assert got_b == state_b
+
+    # **关键安全断言**：A 不能看到 B 的客户/商品
+    a_cust_ids = {c["id"] for c in got_a.get("customers_seen", [])}
+    a_prod_ids = {p["id"] for p in got_a.get("products_seen", [])}
+    assert 11 not in a_cust_ids, "A 用户不应看到 B 的客户 11（得帆）"
+    assert 5032 not in a_prod_ids, "A 用户不应看到 B 的商品 5032（翻译耳机）"
+
+    # 反向同理：B 不能看到 A 的
+    b_cust_ids = {c["id"] for c in got_b.get("customers_seen", [])}
+    b_prod_ids = {p["id"] for p in got_b.get("products_seen", [])}
+    assert 7 not in b_cust_ids, "B 用户不应看到 A 的客户 7（翼蓝）"
+    assert 5030 not in b_prod_ids, "B 用户不应看到 A 的商品 5030（X5 Pro）"
+
+    # 第三个用户 C（未写入）拿到 None
+    got_c = await session.get_round_state(cid, hub_user_id=99)
+    assert got_c is None
+
+
+@pytest.mark.asyncio
+async def test_round_state_clear_removes_all_users(session, redis_client):
+    """clear() 应该清掉同 conversation 下所有 user 的 round_state（scan 模式）。"""
+    cid = _conv_id("rs-clear")
+    await session.set_round_state(cid, 1, {"a": 1})
+    await session.set_round_state(cid, 2, {"b": 2})
+    await session.set_round_state(cid, 3, {"c": 3})
+
+    # 清前 3 个 key 都在
+    keys = await redis_client.keys(f"hub:agent:conv:{cid}:round_state:*")
+    assert len(keys) == 3
+
+    await session.clear(cid)
+
+    # 清后全空
+    keys = await redis_client.keys(f"hub:agent:conv:{cid}:round_state:*")
+    assert len(keys) == 0
+
+
+@pytest.mark.asyncio
+async def test_round_state_empty_state_skipped(session):
+    """空 state（None / {} ）不写入。"""
+    cid = _conv_id("rs-empty")
+    await session.set_round_state(cid, 1, {})
+    got = await session.get_round_state(cid, 1)
+    assert got is None
