@@ -211,24 +211,30 @@ class ContractRenderer:
     def _replace_tables(doc: Document, ctx: dict) -> None:
         """表格级 {{items_table}} 占位符 → 展开成多行；其余 cell 内占位符替换。
 
-        merged cell 防重复处理：python-docx 对 merged cell 会多次返回同一 cell 对象，
-        用 seen 集合按 id() 跳过已处理 cell。
+        merged cell 防重复处理：merged 后多 row 共享同一个 XML element（cell._tc），
+        用 element id 去重。**不能用 id(cell)** —— Python GC 会复用对象 id，
+        导致正常的不同 cell 也被错认为"已处理"（v8 staging review #6 实测踩坑）。
         """
-        seen: set[int] = set()
+        # v3 加固（v8 staging review #6）：旧版 id() 去重 cell 受 Python GC 复用 id 影响
+        # 误伤正常 cell（实测 18 个 cell 仅 1 个被处理）。改成：
+        #   - {{items_table}} 用 _tc python 对象内存地址做"短期"去重（单循环内 GC 不复用）
+        #   - 其他占位符替换天然幂等（替换后原占位消失），重复处理无副作用
+        items_table_done: set[int] = set()
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
-                    if id(cell) in seen:
-                        continue
-                    seen.add(id(cell))
                     cell_text = cell.text
                     if "{{items_table}}" in cell_text:
+                        # 同一 merged cell 多 row 迭代到都跳过（仅在该判断时去重，
+                        # 单循环内 _tc 引用稳定，id 不会被 GC 复用）
+                        tc_id = id(cell._tc)
+                        if tc_id in items_table_done:
+                            continue
+                        items_table_done.add(tc_id)
                         items = ctx.get("items") or []
-                        # 清掉占位内容
                         for para in cell.paragraphs:
                             for run in para.runs:
                                 run.text = ""
-                        # 简化版：把 items 拼成多行文本写进当前 cell
                         for item in items:
                             subtotal = item.get("subtotal") or (
                                 float(item.get("price", 0)) * float(item.get("qty", 0))
@@ -239,7 +245,7 @@ class ContractRenderer:
                             )
                             cell.add_paragraph(line)
                         continue
-                    # 非 items_table：做普通占位符替换
+                    # 非 items_table：直接处理（替换幂等，merged 重复无副作用）
                     for para in cell.paragraphs:
                         para_text = para.text
                         if "{{" not in para_text:
