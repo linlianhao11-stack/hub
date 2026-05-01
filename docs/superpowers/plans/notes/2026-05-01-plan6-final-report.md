@@ -404,7 +404,7 @@
 HUB 仓库 `feature/plan6-agent` → 38 个 commit（feat + polish 交替 + v8 review 修复 1 个）：
 
 ```
-<待补>  polish(hub): Plan 6 v8 review 修复（ruff 134→0 + PromptBuilder.from_db + uv.lock 加 .gitignore）
+81c16e8 polish(hub): Plan 6 v8 review 修复（ruff 134→0 + PromptBuilder.from_db + uv.lock 加 .gitignore）
 f653f2b docs(hub): Plan 6 端到端验证记录补 docker 健康检查（/loop 验证）
 6c5b8b2 docs(hub): Plan 6 总结报告（用户 review 用）
 d437cf3 docs(hub): Plan 6 端到端验证记录（Task 19）
