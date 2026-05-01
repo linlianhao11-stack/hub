@@ -1,6 +1,7 @@
 """Plan 6 Task 15：草稿催促 cron 测试（≥5 case）。"""
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -63,7 +64,8 @@ async def test_stale_voucher_with_binding_sends():
     assert call_args[0][0] == "DT_U1"
     msg = call_args[0][1]
     assert "凭证 1 张" in msg
-    assert "10 天" in msg
+    # M7: 改 regex 防文案变更 false-positive
+    assert re.search(r"\d+ 天", msg)
 
 
 # ============================================================
@@ -101,7 +103,8 @@ async def test_stale_drafts_without_binding_skipped():
 async def test_recent_drafts_not_reminded():
     """6 天前草稿（未超 7 天）不催促。"""
     sender = AsyncMock()
-    recent_time = datetime.now(UTC) - timedelta(days=6)
+    # M6: 改用 STALE_DAYS - 1，阈值变化时测试自动跟随
+    recent_time = datetime.now(UTC) - timedelta(days=STALE_DAYS - 1)
 
     user = await HubUser.create(display_name="请求人C")
     await VoucherDraft.create(
@@ -238,3 +241,121 @@ async def test_send_failure_counts_as_skipped():
     result = await run_draft_reminder(sender=sender)
     assert result["sent"] == 0
     assert result["skipped"] == 1
+
+
+# ============================================================
+# M3: wecom 绑定不算 dingtalk → skipped
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_user_with_only_wecom_binding_skipped():
+    """v2 加固（review M3）：用户绑定的是 wecom（无 dingtalk）→ skipped。"""
+    sender = AsyncMock()
+    old_time = datetime.now(UTC) - timedelta(days=10)
+
+    user = await HubUser.create(display_name="WecomOnly用户")
+    await VoucherDraft.create(
+        requester_hub_user_id=user.id,
+        voucher_data={"total_amount": "100"},
+        rule_matched="x",
+        confirmation_action_id="m3" + "x" * 30,
+        status="pending",
+        created_at=old_time,
+    )
+    # 只有 wecom binding，没有 dingtalk
+    await ChannelUserBinding.create(
+        hub_user=user,
+        channel_type="wecom",
+        channel_userid="WC_U1",
+        status="active",
+    )
+
+    result = await run_draft_reminder(sender=sender)
+    assert result["sent"] == 0
+    assert result["skipped"] == 1
+    sender.send_text.assert_not_called()
+
+
+# ============================================================
+# M4: revoked 钉钉绑定不算 active → skipped
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_user_with_revoked_binding_skipped():
+    """v2 加固（review M4）：用户钉钉绑定 status=revoked → skipped。"""
+    sender = AsyncMock()
+    old_time = datetime.now(UTC) - timedelta(days=10)
+
+    user = await HubUser.create(display_name="Revoked绑定用户")
+    await VoucherDraft.create(
+        requester_hub_user_id=user.id,
+        voucher_data={"total_amount": "100"},
+        rule_matched="x",
+        confirmation_action_id="m4" + "x" * 30,
+        status="pending",
+        created_at=old_time,
+    )
+    # 钉钉绑定 status=revoked，不是 active
+    await ChannelUserBinding.create(
+        hub_user=user,
+        channel_type="dingtalk",
+        channel_userid="DT_REV",
+        status="revoked",
+    )
+
+    result = await run_draft_reminder(sender=sender)
+    assert result["sent"] == 0
+    assert result["skipped"] == 1
+    sender.send_text.assert_not_called()
+
+
+# ============================================================
+# M5: 两个用户各自有 stale draft + binding → sent=2
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_multiple_users_each_get_own_message():
+    """v2 加固（review M5）：两个 user 各自有 stale draft + 各自 binding → sent=2。"""
+    sender = AsyncMock()
+    old_time = datetime.now(UTC) - timedelta(days=10)
+
+    user_a = await HubUser.create(display_name="userA")
+    user_b = await HubUser.create(display_name="userB")
+
+    await VoucherDraft.create(
+        requester_hub_user_id=user_a.id,
+        voucher_data={"total_amount": "100"},
+        rule_matched="x",
+        confirmation_action_id="m5a" + "x" * 29,
+        status="pending",
+        created_at=old_time,
+    )
+    await VoucherDraft.create(
+        requester_hub_user_id=user_b.id,
+        voucher_data={"total_amount": "200"},
+        rule_matched="x",
+        confirmation_action_id="m5b" + "x" * 29,
+        status="pending",
+        created_at=old_time,
+    )
+    await ChannelUserBinding.create(
+        hub_user=user_a,
+        channel_type="dingtalk",
+        channel_userid="DT_A",
+        status="active",
+    )
+    await ChannelUserBinding.create(
+        hub_user=user_b,
+        channel_type="dingtalk",
+        channel_userid="DT_B",
+        status="active",
+    )
+
+    result = await run_draft_reminder(sender=sender)
+    assert result["sent"] == 2
+    assert result["skipped"] == 0
+
+    # 两次 send_text 调用，channel_userid 不串
+    calls = sender.send_text.call_args_list
+    sent_to = {c[0][0] for c in calls}
+    assert sent_to == {"DT_A", "DT_B"}

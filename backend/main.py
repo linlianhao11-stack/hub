@@ -153,12 +153,12 @@ async def lifespan(app: FastAPI):
     async def _job_cleanup():
         await run_payload_cleanup()
 
-    # Plan 6 Task 14：每天 09:00 检查月度 LLM 预算，超 80% 发钉钉告警
-    # 注意：sender 依赖 ChannelApp 配置，若未配置则 cron 内部跳过并记 WARNING
-    @scheduler.at_hour(9)
-    async def _job_budget_alert():
+    async def _build_dingtalk_sender_for_cron(job_name: str):
+        """为 cron job 构造一个 DingTalkSender；无 active ChannelApp 时返 None。
+
+        M9 加固（review M9）：抽出共享逻辑减少 budget_alert / draft_reminder 重复代码。
+        """
         from hub.adapters.channel.dingtalk_sender import DingTalkSender
-        from hub.cron.budget_alert import run_budget_alert
         from hub.crypto import decrypt_secret
         from hub.models import ChannelApp
 
@@ -166,58 +166,48 @@ async def lifespan(app: FastAPI):
             channel_type="dingtalk", status="active",
         ).first()
         if app_rec is None:
-            logger.warning("budget_alert cron 跳过：没有 active 状态的 dingtalk ChannelApp")
-            return
-
+            logger.warning("%s cron 跳过：没有 active 状态的 dingtalk ChannelApp", job_name)
+            return None
         try:
             app_key = decrypt_secret(app_rec.encrypted_app_key, purpose="config_secrets")
             app_secret = decrypt_secret(app_rec.encrypted_app_secret, purpose="config_secrets")
             robot_id = app_rec.robot_id or ""
         except Exception:
-            logger.exception("budget_alert cron 跳过：ChannelApp 解密失败")
-            return
-
-        budget_sender = DingTalkSender(
+            logger.exception("%s cron 跳过：ChannelApp 解密失败", job_name)
+            return None
+        return DingTalkSender(
             app_key=app_key, app_secret=app_secret, robot_code=robot_id,
         )
+
+    # Plan 6 Task 14：每天 09:00 检查月度 LLM 预算，超 80% 发钉钉告警
+    # 注意：sender 依赖 ChannelApp 配置，若未配置则 cron 内部跳过并记 WARNING
+    @scheduler.at_hour(9)
+    async def _job_budget_alert():
+        from hub.cron.budget_alert import run_budget_alert
+
+        sender = await _build_dingtalk_sender_for_cron("budget_alert")
+        if sender is None:
+            return
         try:
-            result = await run_budget_alert(sender=budget_sender)
-            logger.info(f"budget_alert cron 完成: {result}")
+            result = await run_budget_alert(sender=sender)
+            logger.info("budget_alert cron 完成: %s", result)
         finally:
-            await budget_sender.aclose()
+            await sender.aclose()
 
     # Plan 6 Task 15：每天 09:00 检查超 7 天未审批的草稿，钉钉提醒请求人
     # 注意：sender 依赖 ChannelApp 配置，若未配置则跳过并记 WARNING
     @scheduler.at_hour(9)
     async def _job_draft_reminder():
-        from hub.adapters.channel.dingtalk_sender import DingTalkSender
         from hub.cron.draft_reminder import run_draft_reminder
-        from hub.crypto import decrypt_secret
-        from hub.models import ChannelApp
 
-        app_rec = await ChannelApp.filter(
-            channel_type="dingtalk", status="active",
-        ).first()
-        if app_rec is None:
-            logger.warning("draft_reminder cron 跳过：没有 active 状态的 dingtalk ChannelApp")
+        sender = await _build_dingtalk_sender_for_cron("draft_reminder")
+        if sender is None:
             return
-
         try:
-            app_key = decrypt_secret(app_rec.encrypted_app_key, purpose="config_secrets")
-            app_secret = decrypt_secret(app_rec.encrypted_app_secret, purpose="config_secrets")
-            robot_id = app_rec.robot_id or ""
-        except Exception:
-            logger.exception("draft_reminder cron 跳过：ChannelApp 解密失败")
-            return
-
-        reminder_sender = DingTalkSender(
-            app_key=app_key, app_secret=app_secret, robot_code=robot_id,
-        )
-        try:
-            result = await run_draft_reminder(sender=reminder_sender)
+            result = await run_draft_reminder(sender=sender)
             logger.info("draft_reminder cron 结果: %s", result)
         finally:
-            await reminder_sender.aclose()
+            await sender.aclose()
 
     scheduler.start()
     app.state.scheduler = scheduler

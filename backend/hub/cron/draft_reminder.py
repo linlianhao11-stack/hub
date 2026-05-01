@@ -1,6 +1,6 @@
 """Plan 6 Task 15：草稿催促 cron。
 
-每天 09:00 跑（与 budget_alert 同整点；scheduler 顺序注册，两个 job 都会触发）：
+每天 09:00 跑（与 budget_alert 同整点；scheduler 修复后两个 job 都会触发）：
 - 找超 7 天未审批的 voucher/price/stock 草稿（status="pending"）
 - 按 requester_hub_user_id 分组聚合 → 钉钉提醒请求人"你有 N 张草稿超 7 天未审"
 
@@ -31,7 +31,9 @@ STALE_DAYS = 7
 
 async def run_draft_reminder(*, sender: DingTalkSender) -> dict:
     """跑一次草稿催促。返回 {sent: int, skipped: int, by_user: dict}。"""
-    cutoff = datetime.now(UTC) - timedelta(days=STALE_DAYS)
+    # M1: datetime.now 提到循环外，避免循环内重复调用
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=STALE_DAYS)
 
     # 三类草稿合并成 (user_id, draft_type, count) 分组
     by_user: dict[int, dict] = {}
@@ -52,9 +54,13 @@ async def run_draft_reminder(*, sender: DingTalkSender) -> dict:
                     "oldest_age_days": 0,
                 }
             by_user[user_id][draft_type_name] += 1
-            age_days = (datetime.now(UTC) - draft.created_at).days
-            if age_days > by_user[user_id]["oldest_age_days"]:
-                by_user[user_id]["oldest_age_days"] = age_days
+            # M1: 复用循环外的 now
+            age_days = (now - draft.created_at).days
+            # M2: 用 max() 简化
+            by_user[user_id]["oldest_age_days"] = max(
+                by_user[user_id]["oldest_age_days"],
+                age_days,
+            )
 
     if not by_user:
         return {"sent": 0, "skipped": 0, "by_user": {}}
@@ -66,7 +72,16 @@ async def run_draft_reminder(*, sender: DingTalkSender) -> dict:
         channel_type="dingtalk",
         status="active",
     ).all()
-    binding_map = {b.hub_user_id: b.channel_userid for b in bindings}
+    # I1: 同 user 多绑定时选第一条 + warn，不再静默覆盖
+    binding_map: dict[int, str] = {}
+    for b in bindings:
+        if b.hub_user_id in binding_map:
+            logger.warning(
+                "用户 %s 有多条 active dingtalk binding（%s + %s），用第一条",
+                b.hub_user_id, binding_map[b.hub_user_id], b.channel_userid,
+            )
+            continue
+        binding_map[b.hub_user_id] = b.channel_userid
 
     sent_count = 0
     skipped_count = 0
@@ -106,6 +121,10 @@ async def run_draft_reminder(*, sender: DingTalkSender) -> dict:
 
 def _build_reminder_message(summary: dict) -> str:
     """组织催促文案（中文大白话）。"""
+    total = summary["voucher"] + summary["price"] + summary["stock"]
+    if total == 0:
+        # M8: 防御：调用方应已 early-return 不传空 summary；这里 fail-fast
+        raise ValueError("空 summary 不应进入文案生成")
     parts = []
     if summary["voucher"]:
         parts.append(f"凭证 {summary['voucher']} 张")
