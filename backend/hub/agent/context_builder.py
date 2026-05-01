@@ -162,6 +162,12 @@ class ContextBuilder:
         v3 加固（v8 staging review）：单 tool 消息 > 4000 token 时摘要化。
         防 must_keep 因为前一轮某个 tool 返了 14K 数据就直接撞 budget——
         老 round 已经摘要了，最近 round 也得摘要（保 keys + 数量，不保整 list）。
+
+        v4 加固（v8 staging review #3）：assistant 消息 > 3000 token 时也截断。
+        实际场景：用户连续聊了 30 条，前面几条是 markdown 表格 14K-token 巨响应，
+        累积在 SessionMemory 里——下一轮哪怕用户只输入"查最新订单"，recent_round
+        把整个上一轮 assistant 含进来 → 直接撞 32K budget。
+        截断到首 600 char + "[...截断]" 提示，让 LLM 知道有过去回复但不展开。
         """
         if not history:
             return []
@@ -175,21 +181,31 @@ class ContextBuilder:
             if role == "user":
                 break
 
-        # 单条 tool 消息超 4000 token 摘要化（保 OpenAI 协议完整 + 减 token 占用）
+        # 摘要 / 截断巨大消息（防 must_keep 撞 budget）
         for i, msg in enumerate(out):
-            if not isinstance(msg, dict) or msg.get("role") != "tool":
+            if not isinstance(msg, dict):
                 continue
-            content = msg.get("content", "")
-            if _estimate_tokens(str(content)) <= 4000:
-                continue
-            summary = ContextBuilder._summarize_dict(content)
-            tool_name = msg.get("name") or msg.get("tool_name", "?")
-            # 替换为摘要 + 提示 LLM 已截断（避免 LLM 假装看到全量数据）
-            new_content = (
-                f"[本 tool 返回过大已自动摘要：{tool_name}: {summary}。"
-                f"如需完整数据请重新调用 tool 并加 limit / 过滤参数缩小范围]"
-            )
-            out[i] = {**msg, "content": new_content}
+            role = msg.get("role")
+            content = msg.get("content", "") or ""
+            tokens = _estimate_tokens(str(content))
+
+            if role == "tool" and tokens > 4000:
+                # tool 结果用 summarize_dict 保留 keys + 数量
+                summary = ContextBuilder._summarize_dict(content)
+                tool_name = msg.get("name") or msg.get("tool_name", "?")
+                new_content = (
+                    f"[本 tool 返回过大已自动摘要：{tool_name}: {summary}。"
+                    f"如需完整数据请重新调用 tool 并加 limit / 过滤参数缩小范围]"
+                )
+                out[i] = {**msg, "content": new_content}
+            elif role == "assistant" and tokens > 3000:
+                # assistant 文本截断到首 600 char（保对话连贯性，不保细节）
+                content_str = content if isinstance(content, str) else str(content)
+                head = content_str[:600]
+                new_content = (
+                    f"{head}…[此回复较长已截断 {tokens} token → 600 字]"
+                )
+                out[i] = {**msg, "content": new_content}
         return out
 
     @staticmethod
