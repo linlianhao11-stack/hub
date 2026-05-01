@@ -262,16 +262,38 @@ async def generate_contract_draft(
             draft.id, conversation_id,
         )
     else:
-        draft = await ContractDraft.create(
-            template_id=template_id,
-            requester_hub_user_id=hub_user_id,
-            customer_id=customer_id,
-            items=items,
-            extras=merged_extras,  # v8 review #17：审计用，与 fingerprint 配套落库
-            fingerprint=fingerprint,
-            rendered_file_storage_key=None,  # 第一版不存文件 bytes
-            conversation_id=conversation_id,
-        )
+        # v8 review #18：DB 已加 partial UNIQUE index 防 race；
+        # create 抛 IntegrityError 时回查 first() 拿对端 race winner 的 draft 复用
+        from tortoise.exceptions import IntegrityError
+        try:
+            draft = await ContractDraft.create(
+                template_id=template_id,
+                requester_hub_user_id=hub_user_id,
+                customer_id=customer_id,
+                items=items,
+                extras=merged_extras,  # v8 review #17：审计用
+                fingerprint=fingerprint,
+                rendered_file_storage_key=None,  # 第一版不存文件 bytes
+                conversation_id=conversation_id,
+            )
+        except IntegrityError:
+            # 并发 race：另一个请求已经 create 成功 → 我们回查复用它的 draft
+            logger.warning(
+                "ContractDraft fingerprint 并发 race，回查复用 conv=%s fp=%s",
+                conversation_id, fingerprint[:16],
+            )
+            draft = await ContractDraft.filter(
+                conversation_id=conversation_id,
+                requester_hub_user_id=hub_user_id,
+                fingerprint=fingerprint,
+            ).first()
+            if draft is None:
+                # 极端：DB UNIQUE 拒绝但回查又没拿到（非常罕见，可能 DB 索引未生效）
+                logger.exception(
+                    "ContractDraft IntegrityError 但回查无果 conv=%s fp=%s",
+                    conversation_id, fingerprint[:16],
+                )
+                raise
 
     # 4. 发钉钉
     sender = current_sender()

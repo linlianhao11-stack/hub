@@ -82,8 +82,11 @@ class MemoryLoader:
         self.product = product
 
     async def load(self, *, hub_user_id: int, conversation_id: str) -> Memory:
-        """按 spec §3.3 组装：session 全量 + user 当前用户 + customers/products 仅 referenced。"""
-        session = await self.session.load(conversation_id)
+        """按 spec §3.3 组装：session 全量 + user 当前用户 + customers/products 仅 referenced。
+
+        v8 review #19：session.load 必传 hub_user_id（per-user 隔离）。
+        """
+        session = await self.session.load(conversation_id, hub_user_id)
         user = await self.user.load(hub_user_id)
 
         customer_map = await self.customer.load_referenced(session.customer_ids)

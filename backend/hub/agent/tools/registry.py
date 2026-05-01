@@ -260,10 +260,11 @@ class ToolRegistry:
             # 写类 tool 成功路径：claim 时已原子删除 confirmed + pending，无需任何 cleanup（持久终态）
 
             # ❼ 提取实体引用写回 session memory（review P2-#8）
+            # v8 review #19：refs 也按 hub_user_id 隔离防群聊串
             refs = self.entity_extractor.extract(result)
             if refs.has_any():
                 await self.session_memory.add_entity_refs(
-                    conversation_id,
+                    conversation_id, hub_user_id,
                     customer_ids=refs.customer_ids,
                     product_ids=refs.product_ids,
                 )

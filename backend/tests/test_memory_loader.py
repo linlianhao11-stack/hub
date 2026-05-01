@@ -81,7 +81,7 @@ async def test_load_with_user_facts_truncates_at_budget(loader):
 async def test_load_referenced_customers_only(loader, session_mem):
     """session 有 customer_id={1,2}，DB 有客户 1/2/3 → 只返 {1, 2}。"""
     cid = _conv_id("ref-customers")
-    await session_mem.add_entity_refs(cid, customer_ids={1, 2})
+    await session_mem.add_entity_refs(cid, 20001, customer_ids={1, 2})
 
     # 建立客户 1/2/3 的 memory
     svc = CustomerMemoryService()
@@ -98,7 +98,7 @@ async def test_load_referenced_customers_only(loader, session_mem):
 async def test_load_referenced_products_truncated_per_product(loader, session_mem):
     """每个 product 单独 truncate 到 200 token。"""
     cid = _conv_id("ref-products")
-    await session_mem.add_entity_refs(cid, product_ids={100, 101})
+    await session_mem.add_entity_refs(cid, 20002, product_ids={100, 101})
 
     svc = ProductMemoryService()
     # 每个商品插 50 条 fact（超过 200 token 预算）
@@ -120,7 +120,8 @@ async def test_load_session_history_preserved(loader, session_mem):
     """session 5 条消息 → memory.session.messages 长度 5。"""
     cid = _conv_id("session-history")
     for i in range(5):
-        await session_mem.append(cid, role="user" if i % 2 == 0 else "assistant",
+        await session_mem.append(cid, 20003,
+                                 role="user" if i % 2 == 0 else "assistant",
                                  content=f"消息{i}")
 
     memory = await loader.load(hub_user_id=20003, conversation_id=cid)

@@ -126,7 +126,7 @@ class ChainAgent:
         history: list[dict] = []
         # 初始化 history：从 session memory 加载已有对话
         try:
-            session_history = await self.session_memory.load(conversation_id)
+            session_history = await self.session_memory.load(conversation_id, hub_user_id)
             for m in session_history.messages:
                 msg: dict = {"role": m.role, "content": m.content}
                 if m.tool_call_id:
@@ -169,7 +169,8 @@ class ChainAgent:
             # 用户消息先 append session
             try:
                 await self.session_memory.append(
-                    conversation_id, role="user", content=user_message,
+                    conversation_id, hub_user_id,
+                    role="user", content=user_message,
                 )
             except Exception:
                 logger.exception("session_memory.append user 失败 conv=%s", conversation_id)
@@ -294,7 +295,8 @@ class ChainAgent:
                 final_text = llm_resp.text or "（无回复）"
                 try:
                     await self.session_memory.append(
-                        conversation_id, role="assistant", content=final_text,
+                        conversation_id, hub_user_id,
+                        role="assistant", content=final_text,
                     )
                 except Exception:
                     logger.exception("session.append assistant 失败")

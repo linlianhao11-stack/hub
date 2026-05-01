@@ -92,7 +92,7 @@
 |------|------|---------|
 | **17** | seed 升级 | 加 13 新权限码（usecase.query_customer / .query_inventory / .query_orders / .query_customer_balance / .query_inventory_aging / .analyze / .generate_quote / .export / .adjust_price.use|.approve / .adjust_stock.use|.approve / .create_voucher.approve）+ 2 lead 角色（bot_user_sales_lead / bot_user_finance_lead）+ 既有 3 角色升级 + business_dict seed（与 prompt/business_dict.py 共享真相源）|
 | **18** | ERP 跨仓库改动 | ERP-4 仓库：customer_price_rule 表 + 5 个 endpoint + inventory/aging endpoint + voucher.client_request_id 幂等键 + migration v059_plan6_erp + 顺手修 ERP main 分支 PEP 604 兼容 bug |
-| **19** | 端到端验证记录 | 全量 pytest（v8 staging review 多轮加测后 **650 case 全过** ~4:30）+ 验证记录文档（性能 / 成本预测 / follow-up 列表）|
+| **19** | 端到端验证记录 | 全量 pytest（v8 staging review 多轮加测后 **656 case 全过** ~4:30）+ 验证记录文档（性能 / 成本预测 / follow-up 列表）|
 
 ---
 
@@ -190,7 +190,7 @@
 ## 四、测试覆盖
 
 ### HUB 仓库
-- **650 case 全过**（pytest -q ~4:30，v8 staging review 多轮加固后口径）
+- **656 case 全过**（pytest -q ~4:30，v8 staging review 多轮加固后口径）
 - Plan 1-5 baseline 315 → +332 case
 - 关键 case：
   - **写门禁链路**：MissingConfirmation vs ClaimFailed 错误分流 / 并发 claim 只跑 1 次 tool.fn / token 一次性消费 / args 篡改防御 / 跨 action 复用拦截 / 多 pending action_id 隔离
@@ -380,7 +380,7 @@
 |------|------|
 | Spec §1-15 全覆盖 | ✅ |
 | 19 个 task 全实现 | ✅ |
-| HUB 650 单测全过（~270s，v8 staging review 加固）| ✅ |
+| HUB 656 单测全过（~200s，v8 staging review 加固后含 round_state per-user 隔离 + fingerprint 测试）| ✅ |
 | ERP 11 单测全过（隔离）| ✅ |
 | Frontend build 全过 | ✅ |
 | **ruff check . 全过（0 error）** | ✅ |
