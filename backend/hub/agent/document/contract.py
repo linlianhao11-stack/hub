@@ -574,10 +574,10 @@ class ContractRenderer:
         merged cell 也兼容：python-docx 的 row.cells 对 merged cell 按 grid index
         返回多次（每个被合并的 grid 位置都返回），按 ci 索引设 width 即可。
         """
-        # 1. 修 tblGrid（表格列定义）
-        tblGrid = table._tbl.find(qn("w:tblGrid"))
-        if tblGrid is not None:
-            cols = tblGrid.findall(qn("w:gridCol"))
+        # 1. 改 tblGrid（表格列定义）
+        tbl_grid = table._tbl.find(qn("w:tblGrid"))
+        if tbl_grid is not None:
+            cols = tbl_grid.findall(qn("w:gridCol"))
             for i, col_el in enumerate(cols):
                 if i < len(widths_cm):
                     # cm → twips（1 cm = 567 twips）

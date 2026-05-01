@@ -2,11 +2,21 @@
 
 **日期**：2026-05-01
 **分支**：`feature/plan6-agent`（HUB 仓库）+ `main`（ERP-4 仓库已合并）
-**状态**：**代码完成，待 staging 验收**（不要直接合并部署生产）
+**状态**：**🚧 staging 验收进行中，禁止合并 main**
 
-> 19 个 task 代码 + 单测 + 文档已落地；
-> **release gate（合并到 main + 部署生产前必过）**：真 docker e2e（6 个用户故事）+ 真 LLM eval（30 条 gold set 满意度 ≥ 80%），见 §八。
-> 单测 / build / ruff / static review 全部就绪可作为合并前的最低门槛 ✅。
+> ⛔ **release gate 尚未完成，feature/plan6-agent 当前不允许合并到 main**。
+> 代码层修复持续进行中（截至 v8 staging review #15 共 ~16 commit）；
+> 故事 1（合同 docx）已在 staging 验证可输出，但**故事 2-6（凭证/批量审批/调价/dashboard/决策链）和真 DeepSeek pytest -m eval 未跑**。
+> 单测 / ruff / build / static review 是**合并前的最低门槛**（已达成），
+> **不能替代** release gate 的实跑验收（覆盖 LLM tool-calling、文件发送、写草稿审批、ERP 幂等写入等运行时行为）。
+>
+> **合并 main 前必须完成的产物记录**（缺一不可）：
+> 1. 6/6 用户故事在 staging 跑通 + 截图 / 录屏存档
+> 2. `pytest -m eval` 30 条 gold set 满意度 ≥ 80% 的运行报告（含 token / cost 实测）
+> 3. ERP 端跨仓库依赖（GET /customers/{id} + GET /account-sets）已部署
+> 4. fresh DB seed → 故事 1 自动可复现（v8 review #14 加 _seed_default_contract_template 已支持）
+>
+> 任何一项缺失 → 退回 staging 继续跑，**不打 release tag、不部署生产**。
 
 ---
 

@@ -40,6 +40,13 @@ class SessionMemory:
     def _refs_products_key(self, conversation_id: str) -> str:
         return f"{self.KEY_PREFIX}{conversation_id}:refs:products"
 
+    def _round_state_key(self, conversation_id: str) -> str:
+        """v8 staging review #13 (B 方案 state reducer)：
+        每 turn 末尾持久化一份"本轮已确认实体 + 价格 + 数量"摘要 JSON，
+        下一轮 ContextBuilder 加进 must_keep 让 LLM 看到上下文，
+        避免重复 search 拿 ID 等问题。"""
+        return f"{self.KEY_PREFIX}{conversation_id}:round_state"
+
     async def append(self, conversation_id: str, *,
                      role: str, content: str,
                      tool_call_id: str | None = None) -> None:
@@ -101,6 +108,39 @@ class SessionMemory:
             product_ids=refs.product_ids,
         )
 
+    async def set_round_state(self, conversation_id: str, state: dict) -> None:
+        """v8 staging review #13：写本轮状态摘要（state reducer 模式）。
+
+        state 结构示例：
+          {
+            "customer": {"id": 7, "name": "北京翼蓝科技发展有限公司"},
+            "products": [
+              {"id": 5030, "name": "X5 Pro经典黑", "qty": 20, "price": 3900},
+              {"id": 5032, "name": "讯飞 AI 翻译耳机 AIH-2541", "qty": 6, "price": 2000},
+            ],
+            "intent": "生成合同",
+            "notes": "翻译耳机库存仅 1 台，用户同意按 6 台开单后续补货",
+          }
+        """
+        if not state:
+            return
+        key = self._round_state_key(conversation_id)
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.set(key, json.dumps(state, ensure_ascii=False))
+            pipe.expire(key, self.TTL)
+            await pipe.execute()
+
+    async def get_round_state(self, conversation_id: str) -> dict | None:
+        """读上轮状态摘要（下一轮 ContextBuilder 加载用）。"""
+        key = self._round_state_key(conversation_id)
+        raw = await self.redis.get(key)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw if isinstance(raw, str) else raw.decode())
+        except (json.JSONDecodeError, ValueError):
+            return None
+
     async def clear(self, conversation_id: str) -> None:
         """显式清理（场景：管理员手动重置 / 测试）。
 
@@ -110,4 +150,5 @@ class SessionMemory:
             self._msgs_key(conversation_id),
             self._refs_customers_key(conversation_id),
             self._refs_products_key(conversation_id),
+            self._round_state_key(conversation_id),
         )

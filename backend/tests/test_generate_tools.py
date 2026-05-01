@@ -253,6 +253,8 @@ async def test_generate_contract_draft_basic(mock_sender):
 
         # ContractDraft.create()
         mock_draft.create = AsyncMock(return_value=draft)
+        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
+        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
 
         # ChannelUserBinding.filter().first()
         bqs = MagicMock()
@@ -327,6 +329,8 @@ async def test_generate_contract_draft_no_active_binding(mock_sender):
         mock_contract_template.filter.return_value = tqs
 
         mock_draft.create = AsyncMock(return_value=draft)
+        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
+        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
 
         bqs = MagicMock()
         bqs.first = AsyncMock(return_value=None)  # 没有 binding
@@ -380,6 +384,8 @@ async def test_generate_contract_draft_send_file_failure_propagates(mock_sender)
         mock_contract_template.filter.return_value = tqs
 
         mock_draft.create = AsyncMock(return_value=draft)
+        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
+        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
 
         bqs = MagicMock()
         bqs.first = AsyncMock(return_value=binding)
@@ -438,6 +444,8 @@ async def test_generate_contract_draft_get_customer_failed_returns_error(mock_se
         tqs.first = AsyncMock(return_value=template)
         mock_contract_template.filter.return_value = tqs
         mock_draft.create = AsyncMock(return_value=draft)
+        # v8 review #15：幂等查询 mock（默认返空 list 走 create 分支）
+        mock_draft.filter.return_value.all = AsyncMock(return_value=[])
         bqs = MagicMock()
         bqs.first = AsyncMock(return_value=binding)
         mock_binding.filter.return_value = bqs

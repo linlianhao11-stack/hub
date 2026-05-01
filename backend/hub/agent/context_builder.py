@@ -64,6 +64,7 @@ class ContextBuilder:
                           conversation_history: list[dict],
                           latest_user_message: str | None,
                           confirm_state_hint: str | None = None,
+                          round_state: dict | None = None,
                           budget_token: int | None = None) -> list[dict]:
         """组装本 round 的 OpenAI messages（已裁剪到 budget 内）。
 
@@ -97,6 +98,15 @@ class ContextBuilder:
 
         if confirm_state_hint:
             must_keep.append(self._mk_section("confirm_hint", confirm_state_hint))
+
+        # v8 staging review #13：跨轮 entity state 摘要
+        # 上一轮 ChainAgent 写入 Redis 的 round_state（含 customers_seen / products_seen
+        # / last_intent），这一轮注入 must_keep 让 LLM 看到上轮已确认的 ID + 价格 + 数量，
+        # 避免"按之前要求做"时 LLM 重新搜 / 失忆。
+        if round_state:
+            state_text = self._format_round_state(round_state)
+            if state_text:
+                must_keep.append(self._mk_section("round_state", state_text))
 
         must_tokens = sum(s.tokens for s in must_keep)
         if must_tokens > budget:
@@ -266,7 +276,7 @@ class ContextBuilder:
                 messages.append({"role": "user", "content": str(s.content)})
             elif s.name == "recent_round" and isinstance(s.content, list):
                 messages.extend(s.content)
-            elif s.name in ("old_results_summary", "old_history_summary"):
+            elif s.name in ("old_results_summary", "old_history_summary", "round_state"):
                 if s.content:
                     messages.append({
                         "role": "system",
@@ -275,3 +285,72 @@ class ContextBuilder:
             else:
                 messages.append({"role": "system", "content": f"[{s.name}]\n{s.content}"})
         return messages
+
+    @staticmethod
+    def _format_round_state(state: dict) -> str:
+        """v8 staging review #13：把 round_state dict 格式化成 LLM 可读文本。
+
+        例：
+          [上一轮已确认实体]
+          客户: 北京翼蓝科技发展有限公司 (id=7)
+          已搜到的商品（请用这些 ID，不要重新搜也不要编造）:
+            - 科大讯飞智能办公本X5 Pro经典黑 (id=5030, sku=SKU50139)
+            - 讯飞 AI 翻译耳机 AIH-2541 (id=5032)
+          上轮已准备的写操作（用户已大致确认）:
+            tool=generate_contract_draft
+            customer_id=7, items=[(5030, qty=20, price=3900), (5032, qty=6, price=2000)]
+        """
+        if not isinstance(state, dict) or not state:
+            return ""
+
+        lines: list[str] = []
+        custs = state.get("customers_seen") or []
+        prods = state.get("products_seen") or []
+        intent = state.get("last_intent") or {}
+
+        if custs:
+            lines.append("客户（之前已搜到，请直接引用 id，不要重搜）:")
+            for c in custs:
+                if not isinstance(c, dict):
+                    continue
+                line = f"  - {c.get('name', '')} (id={c.get('id')}"
+                if c.get("phone"):
+                    line += f", phone={c['phone']}"
+                line += ")"
+                lines.append(line)
+
+        if prods:
+            lines.append("商品（之前已搜到，请直接引用 id，不要重搜也不要编造 ID）:")
+            for p in prods:
+                if not isinstance(p, dict):
+                    continue
+                line = f"  - {p.get('name', '')} (id={p.get('id')}"
+                if p.get("sku"):
+                    line += f", sku={p['sku']}"
+                if p.get("color"):
+                    line += f", color={p['color']}"
+                line += ")"
+                lines.append(line)
+
+        if intent and isinstance(intent, dict):
+            tool = intent.get("tool", "")
+            args = intent.get("args") or {}
+            if tool and args:
+                lines.append("上轮已发起的写操作意图（用户基本确认中）:")
+                lines.append(f"  tool: {tool}")
+                cid = args.get("customer_id")
+                if cid:
+                    lines.append(f"  customer_id: {cid}")
+                items = args.get("items") or []
+                if items and isinstance(items, list):
+                    lines.append("  items:")
+                    for it in items:
+                        if isinstance(it, dict):
+                            pid = it.get("product_id")
+                            qty = it.get("qty")
+                            price = it.get("price")
+                            lines.append(f"    - product_id={pid}, qty={qty}, price={price}")
+
+        if not lines:
+            return ""
+        return "\n".join(lines)

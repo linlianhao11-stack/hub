@@ -83,11 +83,11 @@ async def generate_contract_draft(
     Returns:
         {"draft_id", "file_sent", "file_name"}
 
-    已知运维限制（plan 6 第一版）：send_file 抛 DingTalkSendError 后
-    ContractDraft 已持久化 + 抛错让 worker 重试。worker 重试时会**重新执行整段
-    流程**导致创建第 2 条 ContractDraft —— 用户语义上"我请求 1 次"会得到"DB 多条"。
-    监控运维上需注意：失败重试场景下 ContractDraft 行数 != 用户请求次数。
-    完整幂等待 Plan 6 follow-up 加 (hub_user_id, conversation_id, template_id, ...) 唯一索引。
+    幂等保护（v8 staging review #15）：
+    重试时按 (conversation_id, customer_id, template_id, hub_user_id, items) 查已有 draft，
+    命中则复用 ID 跳过 create 直接重发文件；不命中才创建新 draft。
+    极端 race（同 conv 并发 generate）可能漏拦——靠应用层 query 实现，
+    待加 DB 唯一索引（待 follow-up migration）后再彻底关闭这个 race window。
     """
     # 1. 拉客户信息（v8 staging review #12：删宽容 fallback）
     # 旧逻辑：失败时用 "客户N" 假占位 → LLM 编错 customer_id 时合同上写"客户102"
@@ -208,19 +208,37 @@ async def generate_contract_draft(
             "error": f"合同模板渲染失败: {e}（可能是 items 数据缺字段）",
         }
 
-    # 3. 持久化 ContractDraft（metadata 审计用）
-    # 第一版：文件不持久化 bytes（待 Plan 11 admin 后台 + 文件存储真正落地后改）。
-    # 当前流程：渲染 → 直接 send_file 到钉钉 → 钉钉端有完整 docx；
-    # ContractDraft 仅记录 metadata（template_id, items, conversation_id）以便审计。
-    # 加密路径（DocumentStorage）已就绪，等加 ContractDraft.rendered_file_bytes BinaryField 后启用。
-    draft = await ContractDraft.create(
+    # 3. 持久化 ContractDraft（metadata 审计用），幂等保护
+    # v8 staging review #15（P2-B）：worker 重试时如果 send_file 失败，
+    # 重新跑整段流程会创建第 2 条 ContractDraft → admin inbox 出现重复行。
+    # 修：先按 (conversation_id, customer_id, template_id, hub_user_id) + items 内容
+    # 查已有 draft，命中则复用，不命中才 create。
+    # 注：未加 DB 唯一索引（避免 schema migration），靠应用层 query 实现幂等；
+    # 极端 race（同 conv 并发 generate）可能漏拦，作为已知限制接受。
+    existing_drafts = await ContractDraft.filter(
+        conversation_id=conversation_id,
+        customer_id=customer_id,
         template_id=template_id,
         requester_hub_user_id=hub_user_id,
-        customer_id=customer_id,
-        items=items,
-        rendered_file_storage_key=None,  # 第一版不存文件 bytes
-        conversation_id=conversation_id,
-    )
+    ).all()
+    draft = None
+    for d in existing_drafts:
+        if d.items == items:  # JSONField 整体比对
+            draft = d
+            logger.info(
+                "ContractDraft 幂等命中 复用 draft_id=%s conv=%s",
+                d.id, conversation_id,
+            )
+            break
+    if draft is None:
+        draft = await ContractDraft.create(
+            template_id=template_id,
+            requester_hub_user_id=hub_user_id,
+            customer_id=customer_id,
+            items=items,
+            rendered_file_storage_key=None,  # 第一版不存文件 bytes
+            conversation_id=conversation_id,
+        )
 
     # 4. 发钉钉
     sender = current_sender()

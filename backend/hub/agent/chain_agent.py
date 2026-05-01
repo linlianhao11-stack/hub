@@ -135,6 +135,15 @@ class ChainAgent:
         except Exception:
             logger.exception("session_memory.load 失败（用空 history 兜底）conv=%s", conversation_id)
 
+        # v8 staging review #13：加载上轮 round_state（state reducer 模式）
+        # 这是跨轮"已确认实体 + 上轮意图"摘要，注入 must_keep 让 LLM 看到，
+        # 不用重新 search 拿 ID（避免数字幻觉、避免重复确认）
+        prev_round_state: dict | None = None
+        try:
+            prev_round_state = await self.session_memory.get_round_state(conversation_id)
+        except Exception:
+            logger.exception("session_memory.get_round_state 失败 conv=%s", conversation_id)
+
         total_prompt_tokens = 0
         total_completion_tokens = 0
         final_status = "success"
@@ -157,6 +166,7 @@ class ChainAgent:
                         base_memory=memory,
                         tools_schema=tools_schema,
                         conversation_history=history,
+                        round_state=prev_round_state,
                         latest_user_message=user_message if round_idx == 0 else None,
                         confirm_state_hint=confirm_hint if round_idx == 0 else None,
                         budget_token=self.MAX_PROMPT_TOKEN,
@@ -273,6 +283,17 @@ class ChainAgent:
                     )
                 except Exception:
                     logger.exception("session.append assistant 失败")
+
+                # v8 review #13 (B 方案 state reducer)：
+                # 从本轮 in-memory history 抽 entity state 写入 Redis，
+                # 下一轮 ContextBuilder 加进 must_keep 让 LLM 看到上下文。
+                try:
+                    state = self._extract_round_state(history, user_message)
+                    if state:
+                        await self.session_memory.set_round_state(conversation_id, state)
+                except Exception:
+                    logger.exception("session.set_round_state 失败 conv=%s", conversation_id)
+
                 if llm_resp.is_clarification:
                     return AgentResult.clarification(final_text)
                 return AgentResult.text_result(final_text)
@@ -308,6 +329,92 @@ class ChainAgent:
             "成功后 HUB 会原子消费，不可再用。"
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_round_state(history: list[dict], user_message: str | None) -> dict:
+        """v8 staging review #13：从单轮 in-memory history 抽 entity state 摘要。
+
+        策略（不调 LLM，纯规则提取）：
+          - 扫 history 里的 tool 消息：
+            * search_customers result → customer.id/name/phone/...
+            * search_products result → products[].id/name/spec/color
+            * get_customer_history result → 历史成交价（last_price/last_qty）
+            * check_inventory result → 库存
+          - 扫最近的 assistant.tool_calls 看 generate_contract_draft / create_voucher_draft 的
+            args（含 customer_id / items[] 含 qty/price）→ 这是用户已确认的最终意图
+          - 输出紧凑 JSON 给下一轮 LLM 看
+
+        注：取最后一次出现作为"最新"（用户改了主意时新值覆盖老值）。
+        """
+        state: dict = {}
+        recent_user_msgs: list[str] = []
+        if user_message:
+            recent_user_msgs.append(user_message)
+
+        # 收集 customers / products
+        customers_seen: dict[int, dict] = {}  # id -> data
+        products_seen: dict[int, dict] = {}
+        # history_quotes 暂未实现（要回查 assistant.tool_calls 拿 customer_id+product_id），follow-up
+        last_pending_args: dict | None = None  # 最后一次 generate / create 写 tool 的参数
+
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "tool":
+                tool_name = msg.get("name") or msg.get("tool_name", "")
+                content = msg.get("content", "")
+                try:
+                    parsed = json.loads(content) if isinstance(content, str) else content
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                items = parsed.get("items") or []
+                if tool_name == "search_customers":
+                    for it in items[:5]:  # 最多 5 个
+                        if isinstance(it, dict) and it.get("id"):
+                            customers_seen[it["id"]] = {
+                                "id": it["id"],
+                                "name": it.get("name") or "",
+                                "phone": it.get("phone") or "",
+                            }
+                elif tool_name == "search_products":
+                    for it in items[:8]:
+                        if isinstance(it, dict) and it.get("id"):
+                            products_seen[it["id"]] = {
+                                "id": it["id"],
+                                "name": it.get("name") or "",
+                                "spec": it.get("spec") or "",
+                                "color": it.get("color") or "",
+                                "sku": it.get("sku") or "",
+                            }
+                elif tool_name == "get_customer_history":
+                    # 找 args（在前一个 assistant.tool_calls 里）
+                    pass  # 简化：暂不抽 history quote
+            elif role == "assistant":
+                # 看 tool_calls 里有没有 generate_contract_draft / create_voucher_draft
+                for tc in msg.get("tool_calls") or []:
+                    fn = (tc.get("function") or {})
+                    name = fn.get("name", "")
+                    if name in ("generate_contract_draft", "create_voucher_draft", "generate_price_quote"):
+                        try:
+                            args_raw = fn.get("arguments", "{}")
+                            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                            last_pending_args = {"tool": name, "args": args}
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+        # 装填 state
+        if customers_seen:
+            # 取最近一个（dict 保插入序）
+            state["customers_seen"] = list(customers_seen.values())
+        if products_seen:
+            state["products_seen"] = list(products_seen.values())
+        if last_pending_args:
+            state["last_intent"] = last_pending_args
+
+        return state
 
     @staticmethod
     async def _open_conversation_log(*, conversation_id: str, hub_user_id: int,

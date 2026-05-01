@@ -229,6 +229,48 @@ async def _seed_business_dict() -> None:
     )
 
 
+async def _seed_default_contract_template() -> None:
+    """v8 staging review #14（P1-B）：默认合同模板 seed（幂等）。
+
+    问题背景：v3-v5 合同模板曾通过 SQL hot update 直接注入 DB，没进 git，
+    fresh DB 上线时拿不到模板，故事 1 不可复现。
+    解决：模板 docx 作为 artifact 入库 `backend/hub/seeds/contract_template_sales_v1.docx`，
+    seed 时读文件 base64 后 get_or_create ContractTemplate（已存在不覆盖）。
+
+    管理员可在 admin 后台再上传新模板（不会冲突）。
+    """
+    import base64
+    from pathlib import Path
+
+    from hub.models.contract import ContractTemplate
+    from hub.routers.admin.contract_templates import _extract_placeholders
+
+    # 已有任何 sales 模板就不再 seed（防覆盖管理员上传的）
+    existing = await ContractTemplate.filter(template_type="sales").exists()
+    if existing:
+        return
+
+    seed_path = Path(__file__).parent / "seeds" / "contract_template_sales_v1.docx"
+    if not seed_path.exists():
+        logger.warning("默认合同模板 seed 文件不存在: %s", seed_path)
+        return
+
+    file_bytes = seed_path.read_bytes()
+    file_b64 = base64.b64encode(file_bytes).decode("ascii")
+    placeholders = _extract_placeholders(file_bytes)
+
+    await ContractTemplate.create(
+        name="标准销售合同",
+        template_type="sales",
+        file_storage_key=file_b64,
+        placeholders=placeholders,
+        description="HUB Plan 6 staging seed 默认合同模板（产品购销合同 v5 版式，5 行 8 列含合计/大写/备注）",
+        is_active=True,
+    )
+    logger.info("默认合同模板 seed 完成（%d bytes，%d 占位符）",
+                len(file_bytes), len(placeholders))
+
+
 async def run_seed():
     """启动时跑预设角色 + 权限码 + 业务词典种子（幂等）。"""
     # 1. 权限码
@@ -265,3 +307,6 @@ async def run_seed():
 
     # 3. v2 加固（Plan 6 Task 17）：业务词典默认 seed
     await _seed_business_dict()
+
+    # 4. v8 staging review #14：默认合同模板 seed（fresh DB 也能跑故事 1）
+    await _seed_default_contract_template()
