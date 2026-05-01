@@ -127,11 +127,28 @@ class ContractRenderer:
         items: list[dict],
         extras: dict,
     ) -> dict:
-        """组装占位符上下文。"""
+        """组装占位符上下文。
+
+        v2 staging review #5：placeholders 自动识别全部 required=True 太严苛——
+        模板里有 18 个占位符（甲方/乙方/订单/收货全套），LLM 不可能每个都传齐。
+        修：缺数据时**注入空字符串**而不是抛错，让 docx 渲染产物里
+        留白让用户后期手填，至少合同主体（客户/商品/总额）能正确生成。
+        """
+        # extras 类型加固（防 LLM 传 string 等错型）
+        if not isinstance(extras, dict):
+            extras = {}
+
         ctx: dict = {
-            "customer_name": customer.get("name", ""),
-            "customer_address": customer.get("address", ""),
-            "customer_id": str(customer.get("id", "")),
+            # 乙方（来自 ERP customer 详情）
+            "customer_name": customer.get("name") or "",
+            "customer_address": customer.get("address") or "",
+            "customer_id": str(customer.get("id") or ""),
+            "customer_phone": customer.get("phone") or "",
+            "customer_tax_id": customer.get("tax_id") or "",
+            "customer_bank_name": customer.get("bank_name") or "",
+            "customer_bank_account": customer.get("bank_account") or "",
+            "customer_contact_person": customer.get("contact_person") or "",
+            # 订单
             "today": date.today().isoformat(),
             "now": datetime.now(UTC).isoformat(),
             "items": items,
@@ -141,15 +158,30 @@ class ContractRenderer:
                     for i in items
                 )
             ),
+            # extras 覆盖前面（甲方账套字段 / shipping / tax_rate 等都从这里来）
             **{k: str(v) if not isinstance(v, (list, dict)) else v for k, v in extras.items()},
         }
-        # 校验 required placeholders
+
+        # required 字段缺数据时注入空字符串而不是抛错
+        # 模板里残留的 {{xxx}} 占位符会被替换为空，docx 主体仍可生成（客户/商品/总额都对）
+        # 后期 admin / 销售可在 docx 里手填空白字段
+        missing_required: list[str] = []
         for ph in (template.placeholders or []):
             if not isinstance(ph, dict):
                 continue
             name = ph.get("name")
-            if ph.get("required") and name and name not in ctx:
-                raise TemplateRenderError(f"必填占位符 {name} 缺数据")
+            if not name:
+                continue
+            if ph.get("required") and name not in ctx:
+                ctx[name] = ""  # 空串占位
+                missing_required.append(name)
+        if missing_required:
+            import logging
+            logging.getLogger(__name__).warning(
+                "合同模板 %s 渲染时缺数据字段 %s（已用空串兜底，docx 留白）",
+                template.id, missing_required,
+            )
+
         return ctx
 
     @staticmethod

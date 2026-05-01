@@ -166,6 +166,17 @@ class Erp4Adapter:
             f"/api/v1/customers/{customer_id}", acting_as_user_id,
         )
 
+    async def list_account_sets(self, *, acting_as_user_id: int | None) -> dict:
+        """ERP `/api/v1/account-sets`：列出所有账套（含 company_name / bank_name / bank_account 等
+        合同模板甲方所需字段）。"""
+        return await self._act_as_get("/api/v1/account-sets", acting_as_user_id)
+
+    async def get_account_set(self, set_id: int, *, acting_as_user_id: int | None) -> dict:
+        """ERP `/api/v1/account-sets/{id}`：单账套详情。"""
+        return await self._act_as_get(
+            f"/api/v1/account-sets/{set_id}", acting_as_user_id,
+        )
+
     async def get_product_customer_prices(
         self, product_id: int, customer_id: int, limit: int = 5,
         *, acting_as_user_id: int | None,

@@ -102,6 +102,32 @@ async def generate_contract_draft(
         )
         customer = {"id": customer_id, "name": f"客户{customer_id}", "address": ""}
 
+    # 1.5. 自动拉账套信息注入甲方（seller_xxx）— v2 staging review #5
+    # LLM 不知道账套字段（business_dict 没教），不强求 LLM 传 extras。
+    # 当前固定取 account_set_id=1（启领），后续按 channel_user_binding.default_account_set_id 走。
+    seller_extras: dict = {}
+    try:
+        account_set = await erp.get_account_set(
+            set_id=1, acting_as_user_id=acting_as_user_id,
+        )
+        seller_extras = {
+            "seller_name": account_set.get("company_name") or account_set.get("name") or "",
+            "seller_bank_name": account_set.get("bank_name") or "",
+            "seller_bank_account": account_set.get("bank_account") or "",
+            "seller_tax_id": account_set.get("tax_id") or "",
+            "seller_account_set_name": account_set.get("name") or "",
+        }
+    except (ErpNotFoundError, ErpAdapterError) as e:
+        logger.warning(
+            "get_account_set 1 失败（甲方字段留空）conv=%s err=%s",
+            conversation_id, e,
+        )
+
+    # extras 类型加固（LLM 偶尔传 string 而不是 dict）
+    safe_extras = extras if isinstance(extras, dict) else {}
+    # 合并 seller_extras → 用户 extras 可覆盖（如指定不同账套时）
+    merged_extras = {**seller_extras, **safe_extras}
+
     # 2. 渲染 docx（可能抛 TemplateNotFoundError / TemplateRenderError）
     renderer = ContractRenderer()
     try:
@@ -109,7 +135,7 @@ async def generate_contract_draft(
             template_id=template_id,
             customer=customer,
             items=items,
-            extras=extras or {},
+            extras=merged_extras,
         )
     except TemplateNotFoundError:
         logger.warning("合同模板 %s 不存在 conv=%s", template_id, conversation_id)

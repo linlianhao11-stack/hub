@@ -35,6 +35,14 @@ def mock_sender():
     erp = MagicMock()
     # I3: 改用精确 get_customer 而非 search_customers keyword 搜索
     erp.get_customer = AsyncMock(return_value={"id": 100, "name": "测试客户", "address": "上海市"})
+    # v2 staging review #5: generate_contract_draft 渲染前调 get_account_set 拉甲方
+    erp.get_account_set = AsyncMock(return_value={
+        "id": 1, "name": "广州启领信息科技有限公司",
+        "company_name": "广州启领信息科技有限公司",
+        "bank_name": "中国建设银行股份有限公司广州江湾路支行",
+        "bank_account": "44050146081300000741",
+        "tax_id": "",
+    })
     generate_tools.set_dependencies(sender=s, erp=erp)
     yield s
     generate_tools.set_dependencies(sender=None, erp=None)
@@ -400,6 +408,11 @@ async def test_generate_contract_draft_get_customer_fallback(mock_sender):
     # 覆盖 erp.get_customer 为抛 ErpNotFoundError
     erp = MagicMock()
     erp.get_customer = AsyncMock(side_effect=ErpNotFoundError("customer 100 not found"))
+    # v2 staging review #5: 加 get_account_set mock（generate_contract_draft 渲染前必调）
+    erp.get_account_set = AsyncMock(return_value={
+        "id": 1, "name": "测试启领", "company_name": "测试启领",
+        "bank_name": "测试银行", "bank_account": "001",
+    })
     generate_tools.set_dependencies(sender=generate_tools._dingtalk_sender, erp=erp)
 
     template = MagicMock()
