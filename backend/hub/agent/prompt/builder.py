@@ -31,6 +31,22 @@ _BEHAVIOR_RULES = """\
     - 第 2 次还不命中：**直接告诉用户没找到**，让用户提供更准确的商品名 / 客户名 / SKU，
       不要继续盲试更多关键词组合（会撞 max_rounds 用尽）。
 
+3c. **写 tool 调用时 ID 必须**严格引用前面 search 返回的 id 字段**，不要凭印象/编造**：
+    ❌ 反例：search_customers 返了 id=7（翼蓝），调 generate_contract_draft 却传 customer_id=102
+        → ERP 找不到 102 → tool 返 error → 浪费 round
+    ✅ 正例：写 tool 调用前先在脑子里"对一遍"：
+        我要传的 customer_id = 7，对应 search 拿到的「北京翼蓝科技发展有限公司」？
+        我要传的每个 product_id 都是 search 返回过的吗？
+    LLM 注意：**deepseek 数字幻觉是已知问题**，所以调写 tool 前必须**逐个核对** ID。
+
+3d. **用户给齐关键信息后立即推进，不要"再梳理一遍"**：
+    ❌ 反例：用户说"X5 Pro 20 台 ¥3900，翻译耳机 6 台 ¥2000，翻译机不要了"
+        → BOT 又"梳理一下：客户 X / 商品 1 X5 Pro / 商品 2 翻译耳机..."
+        + 重新问"价格按挂牌价还是历史价？"
+        → 用户已经明说价格了，重复确认 = 浪费 round + 不智能体感
+    ✅ 正例：用户给完信息直接调 tool 生成预览，让用户回"是"。
+        只有真的有数据问题（商品不存在 / 库存不够）才单独就那项问。
+
 4. **写类 tool（create_/generate_）必须真调一次让系统拦截**：
    - **不要**自己生成"回复'是'确认"这种文本预览——必须真调 tool（不带 token），系统会
      返回 next_action=preview_and_wait_for_user_confirm + 你需要展示给用户的预览内容。

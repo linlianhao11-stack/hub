@@ -89,7 +89,10 @@ async def generate_contract_draft(
     监控运维上需注意：失败重试场景下 ContractDraft 行数 != 用户请求次数。
     完整幂等待 Plan 6 follow-up 加 (hub_user_id, conversation_id, template_id, ...) 唯一索引。
     """
-    # 1. 拉客户信息（精确 get_customer 避免 keyword 搜索几乎必走 fallback 的问题）
+    # 1. 拉客户信息（v8 staging review #12：删宽容 fallback）
+    # 旧逻辑：失败时用 "客户N" 假占位 → LLM 编错 customer_id 时合同上写"客户102"
+    # 用户察觉前文件已发出，无法回滚。
+    # 新逻辑：客户找不到直接返 error 让 LLM 看到，重新调 search_customers 取对的 ID。
     erp = current_erp_adapter()
     try:
         customer = await erp.get_customer(
@@ -97,10 +100,18 @@ async def generate_contract_draft(
         )
     except (ErpNotFoundError, ErpAdapterError) as e:
         logger.warning(
-            "get_customer %s 失败（fallback 用 id 占位）conv=%s err=%s",
+            "get_customer %s 失败 → 返 error 让 agent 重调 conv=%s err=%s",
             customer_id, conversation_id, e,
         )
-        customer = {"id": customer_id, "name": f"客户{customer_id}", "address": ""}
+        return {
+            "draft_id": None,
+            "file_sent": False,
+            "error": (
+                f"客户 ID {customer_id} 在 ERP 不存在或查询失败。"
+                f"**请重新调 search_customers 拿到正确的客户 ID 后再调本 tool**，"
+                f"不要凭印象编造 ID。原始错误: {str(e)[:100]}"
+            ),
+        }
 
     # 1.5. 自动拉账套信息注入甲方（seller_xxx）— v2 staging review #5
     # LLM 不知道账套字段（business_dict 没教），不强求 LLM 传 extras。
@@ -123,29 +134,50 @@ async def generate_contract_draft(
             conversation_id, e,
         )
 
-    # 1.6. enrich items：LLM 只传 product_id 时自动从 ERP 拉 name/spec/color
-    # （v8 staging review #7：商品行表格列空白原因之一）
+    # 1.6. enrich items：LLM 没传 name 时自动从 ERP 拉 name/spec/color
+    # v8 staging review #12：商品 ID 不存在直接返 error，不再 fallback 留空
     enriched_items: list[dict] = []
     for item in items or []:
         if not isinstance(item, dict):
             continue
-        enriched = dict(item)  # 拷贝避免改 LLM 传入对象
-        if not enriched.get("name") and enriched.get("product_id"):
+        enriched = dict(item)
+        product_id = enriched.get("product_id")
+        if product_id:
             try:
                 product = await erp.get_product(
-                    product_id=int(enriched["product_id"]),
+                    product_id=int(product_id),
                     acting_as_user_id=acting_as_user_id,
                 )
-                enriched.setdefault("name", product.get("name") or "")
-                enriched.setdefault("spec", product.get("spec") or product.get("specification") or "")
-                enriched.setdefault("color", product.get("color") or "")
-                enriched.setdefault("unit", product.get("unit") or "")
+                # 用 ERP 真实数据覆盖（防 LLM 自己瞎编的 name 也填进去）
+                enriched["name"] = product.get("name") or enriched.get("name") or ""
+                if not enriched.get("spec"):
+                    enriched["spec"] = product.get("spec") or product.get("specification") or ""
+                if not enriched.get("color"):
+                    enriched["color"] = product.get("color") or ""
+                if not enriched.get("unit"):
+                    enriched["unit"] = product.get("unit") or ""
             except (ErpNotFoundError, ErpAdapterError) as e:
                 logger.warning(
-                    "get_product %s 失败（item.name 留空）conv=%s err=%s",
-                    enriched.get("product_id"), conversation_id, e,
+                    "get_product %s 失败 → 返 error 让 agent 重调 conv=%s err=%s",
+                    product_id, conversation_id, e,
                 )
+                return {
+                    "draft_id": None,
+                    "file_sent": False,
+                    "error": (
+                        f"商品 ID {product_id} 在 ERP 不存在或查询失败。"
+                        f"**请重新调 search_products 拿到正确的商品 ID 后再调本 tool**，"
+                        f"不要凭印象编造 ID。原始错误: {str(e)[:100]}"
+                    ),
+                }
         enriched_items.append(enriched)
+
+    # 1.7. customer.name 必须非空（防 ERP 返了客户但 name 字段是空的边界情况）
+    if not customer.get("name"):
+        return {
+            "draft_id": None, "file_sent": False,
+            "error": f"客户 ID {customer_id} 数据异常：name 字段为空。请联系管理员核对 ERP。",
+        }
 
     # extras 类型加固（LLM 偶尔传 string 而不是 dict）
     safe_extras = extras if isinstance(extras, dict) else {}

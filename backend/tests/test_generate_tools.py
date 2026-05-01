@@ -399,8 +399,9 @@ async def test_generate_contract_draft_send_file_failure_propagates(mock_sender)
     mock_draft.create.assert_awaited_once()
 
 
-async def test_generate_contract_draft_get_customer_fallback(mock_sender):
-    """I3：get_customer 失败时 fallback 到 id 占位，合同正常生成（不抛异常）。"""
+async def test_generate_contract_draft_get_customer_failed_returns_error(mock_sender):
+    """v8 review #12：get_customer 失败时不再 fallback 占位，返 error 让 LLM 重调
+    （旧行为是 fallback 到"客户N"占位继续生成 → 用户收到错的合同）。"""
     from hub.adapters.downstream.erp4 import ErpNotFoundError
     from hub.agent.tools import generate_tools
     from hub.agent.tools.generate_tools import generate_contract_draft
@@ -450,9 +451,11 @@ async def test_generate_contract_draft_get_customer_fallback(mock_sender):
             acting_as_user_id=1,
         )
 
-    # fallback 时合同仍能生成
-    assert result["file_sent"] is True
-    assert result["draft_id"] == 55
+    # 客户不存在 → 返 error 不生成合同（v8 review #12 改）
+    assert result["file_sent"] is False
+    assert result["draft_id"] is None
+    assert "ID 100" in result["error"]
+    assert "search_customers" in result["error"]
     # 恢复 mock_sender erp 注入
     generate_tools.set_dependencies(sender=generate_tools._dingtalk_sender, erp=None)
 
