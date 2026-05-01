@@ -311,22 +311,29 @@ class ChainAgent:
         如果产品需要"每 turn 一条 log"语义（区分多次对话回合），需要扩展 model 加 turn_idx
         或改 conversation_id 加上 turn 后缀。Plan 6 当前为简化设计，单条聚合表达。
         """
+        # 同 conv_id 多次 run（第 2 turn）会撞 UNIQUE，是预期路径——直接 get 已存在的，
+        # 而不是先 create 再 catch（避免 ERROR 日志噪声）
+        existing = await ConversationLog.filter(conversation_id=conversation_id).first()
+        if existing is not None:
+            return existing
         try:
-            log = await ConversationLog.create(
+            return await ConversationLog.create(
                 conversation_id=conversation_id,
                 hub_user_id=hub_user_id,
                 channel_userid=channel_userid,
                 started_at=started_at,
             )
-            return log
         except Exception:
-            # 已存在或其他写库错误：可观测性不阻塞业务
-            logger.exception("ConversationLog.create 失败 conv=%s", conversation_id)
+            # race（极小概率：两次 run 并发 create）或真异常都走这里——
+            # 先尝试取已存在记录；取不到再放弃（不阻塞业务，但记 exception 留痕）
             try:
-                existing = await ConversationLog.filter(conversation_id=conversation_id).first()
-                return existing  # 可能 None
+                race = await ConversationLog.filter(conversation_id=conversation_id).first()
+                if race is not None:
+                    return race
             except Exception:
-                return None
+                pass
+            logger.exception("ConversationLog.create 失败 conv=%s", conversation_id)
+            return None
 
     @staticmethod
     async def _close_conversation_log(log, final_status: str, *,
