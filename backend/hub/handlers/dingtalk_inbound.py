@@ -281,10 +281,12 @@ async def _fallback_to_rule_parser(
     record["intent_confidence"] = getattr(intent, "confidence", None)
 
     # unknown / low_confidence → 友好兜底文案
+    # Plan 6 起 LLM agent 是主路径，RuleParser 仅做 ChainAgent 异常时的兜底兜底；
+    # rule 也匹配不到的话，告诉用户稍后重试（不要让用户去模仿"查 SKU50139"这种过时格式）
     if intent.intent_type == "unknown" or getattr(intent, "confidence", 1.0) < 0.5:
         await _send_text(
             sender, channel_userid,
-            "AI 服务暂不可用，请用更明确的方式描述（例：查 SKU50139）",
+            "AI 处理出了点问题，请稍后再试一次。",
         )
         record["final_status"] = "failed_system_final"
         return
