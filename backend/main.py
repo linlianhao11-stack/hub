@@ -186,6 +186,39 @@ async def lifespan(app: FastAPI):
         finally:
             await budget_sender.aclose()
 
+    # Plan 6 Task 15：每天 09:00 检查超 7 天未审批的草稿，钉钉提醒请求人
+    # 注意：sender 依赖 ChannelApp 配置，若未配置则跳过并记 WARNING
+    @scheduler.at_hour(9)
+    async def _job_draft_reminder():
+        from hub.adapters.channel.dingtalk_sender import DingTalkSender
+        from hub.cron.draft_reminder import run_draft_reminder
+        from hub.crypto import decrypt_secret
+        from hub.models import ChannelApp
+
+        app_rec = await ChannelApp.filter(
+            channel_type="dingtalk", status="active",
+        ).first()
+        if app_rec is None:
+            logger.warning("draft_reminder cron 跳过：没有 active 状态的 dingtalk ChannelApp")
+            return
+
+        try:
+            app_key = decrypt_secret(app_rec.encrypted_app_key, purpose="config_secrets")
+            app_secret = decrypt_secret(app_rec.encrypted_app_secret, purpose="config_secrets")
+            robot_id = app_rec.robot_id or ""
+        except Exception:
+            logger.exception("draft_reminder cron 跳过：ChannelApp 解密失败")
+            return
+
+        reminder_sender = DingTalkSender(
+            app_key=app_key, app_secret=app_secret, robot_code=robot_id,
+        )
+        try:
+            result = await run_draft_reminder(sender=reminder_sender)
+            logger.info("draft_reminder cron 结果: %s", result)
+        finally:
+            await reminder_sender.aclose()
+
     scheduler.start()
     app.state.scheduler = scheduler
 
