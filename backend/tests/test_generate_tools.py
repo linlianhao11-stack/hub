@@ -359,6 +359,115 @@ def test_compute_contract_fingerprint_extras_change_creates_new():
     assert fp_a != fp_d
 
 
+# ===== v8 staging review #18: fingerprint UNIQUE index race 回查路径 =====
+
+async def test_generate_contract_draft_race_integrity_error_recovers(mock_sender):
+    """**核心 race 测试** v8 review #18：
+    并发场景下 ContractDraft.create 抛 IntegrityError（partial UNIQUE 拦截重复），
+    回查命中对端 race winner 的 draft → 复用 ID 跳过 create → file_sent=True。
+    """
+    from tortoise.exceptions import IntegrityError
+
+    from hub.agent.tools import generate_tools
+    from hub.agent.tools.generate_tools import generate_contract_draft
+
+    template = MagicMock()
+    template.id = 1
+    template.is_active = True
+    template.file_storage_key = _make_template_docx_b64()
+    template.placeholders = []
+
+    # 已存在的 draft（race winner 创建的，我们要"回查"找到它）
+    winner_draft = MagicMock()
+    winner_draft.id = 99
+    winner_draft.save = AsyncMock()
+
+    binding = MagicMock()
+    binding.channel_userid = "ding-u1"
+
+    with (
+        patch("hub.agent.document.contract.ContractTemplate") as mock_contract_template,
+        patch("hub.agent.tools.generate_tools.ContractDraft") as mock_draft,
+        patch("hub.agent.tools.generate_tools.ChannelUserBinding") as mock_binding,
+    ):
+        tqs = MagicMock()
+        tqs.first = AsyncMock(return_value=template)
+        mock_contract_template.filter.return_value = tqs
+
+        # 关键 mock 设计：
+        # 第 1 次 filter().first() → None（race 还没赢 → 进 create 分支）
+        # create() 抛 IntegrityError（partial UNIQUE 拦了我们的写）
+        # 第 2 次 filter().first() → winner_draft（回查命中对端已 create 成功的）
+        first_call_count = {"n": 0}
+        async def filter_first():
+            first_call_count["n"] += 1
+            return None if first_call_count["n"] == 1 else winner_draft
+        mock_draft.filter.return_value.first = filter_first
+        mock_draft.create = AsyncMock(side_effect=IntegrityError("partial UNIQUE 拦截"))
+
+        bqs = MagicMock()
+        bqs.first = AsyncMock(return_value=binding)
+        mock_binding.filter.return_value = bqs
+
+        result = await generate_contract_draft(
+            template_id=1,
+            customer_id=100,
+            items=SAMPLE_ITEMS,
+            hub_user_id=1,
+            conversation_id="conv-race",
+            acting_as_user_id=1,
+        )
+
+    # 关键断言：复用了 winner_draft.id 而不是 create 出来的 draft（被拦了）
+    assert result["draft_id"] == 99, "应复用 race winner 的 draft.id=99"
+    assert result["file_sent"] is True, "尽管 create 被拦，仍应继续走 send_file"
+    # filter 被调 2 次：第 1 次幂等查（None），第 2 次 IntegrityError 回查（winner）
+    assert first_call_count["n"] == 2
+    mock_draft.create.assert_awaited_once()  # create 调了 1 次（被拦）
+    mock_sender.send_file.assert_awaited_once()  # send_file 仍然执行
+    # 恢复
+    generate_tools.set_dependencies(sender=generate_tools._dingtalk_sender, erp=None)
+
+
+async def test_generate_contract_draft_race_integrity_error_no_winner_reraises(mock_sender):
+    """v8 review #18 边界：IntegrityError 但回查仍 None（极端 DB 索引失效），
+    应该把 IntegrityError 重新抛出，不静默吞。"""
+    from tortoise.exceptions import IntegrityError
+
+    from hub.agent.tools import generate_tools
+    from hub.agent.tools.generate_tools import generate_contract_draft
+
+    template = MagicMock()
+    template.id = 1
+    template.is_active = True
+    template.file_storage_key = _make_template_docx_b64()
+    template.placeholders = []
+
+    with (
+        patch("hub.agent.document.contract.ContractTemplate") as mock_contract_template,
+        patch("hub.agent.tools.generate_tools.ContractDraft") as mock_draft,
+    ):
+        tqs = MagicMock()
+        tqs.first = AsyncMock(return_value=template)
+        mock_contract_template.filter.return_value = tqs
+
+        # 两次 filter 都返 None（DB 异常 / 索引失效）
+        mock_draft.filter.return_value.first = AsyncMock(return_value=None)
+        mock_draft.create = AsyncMock(side_effect=IntegrityError("partial UNIQUE 拦截"))
+
+        with pytest.raises(IntegrityError):
+            await generate_contract_draft(
+                template_id=1,
+                customer_id=100,
+                items=SAMPLE_ITEMS,
+                hub_user_id=1,
+                conversation_id="conv-race-no-winner",
+                acting_as_user_id=1,
+            )
+
+    generate_tools.set_dependencies(sender=generate_tools._dingtalk_sender, erp=None)
+
+
 async def test_generate_contract_draft_no_active_binding(mock_sender):
     """用户无 active 钉钉绑定 → 草稿仍持久化 + file_sent=False。"""
     from hub.agent.tools.generate_tools import generate_contract_draft

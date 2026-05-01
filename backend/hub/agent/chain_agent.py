@@ -453,15 +453,14 @@ class ChainAgent:
                                      channel_userid: str, started_at: datetime):
         """打开/获取 ConversationLog。
 
-        语义（v2 文档化 review M-8）：conversation_id 是 UNIQUE，**一个 conversation 一条 log**。
-        多次调 run() 同一 conv_id 时第二次取已有记录、final_status / tokens_used / rounds_count
-        会被 finally 块覆盖（累计在内存 history 不同步落库）。
-        如果产品需要"每 turn 一条 log"语义（区分多次对话回合），需要扩展 model 加 turn_idx
-        或改 conversation_id 加上 turn 后缀。Plan 6 当前为简化设计，单条聚合表达。
+        语义：v8 review #20 起 (conversation_id, hub_user_id) 复合 unique
+        — 群聊场景同 conv_id 不同 user 各有独立 log（避免 admin 决策链 / 成本统计串）。
+        同 (conv_id, user) 多次 run 复用同一条 log（多 turn 累加 final_status / tokens_used）。
         """
-        # 同 conv_id 多次 run（第 2 turn）会撞 UNIQUE，是预期路径——直接 get 已存在的，
-        # 而不是先 create 再 catch（避免 ERROR 日志噪声）
-        existing = await ConversationLog.filter(conversation_id=conversation_id).first()
+        # 用 (conv_id, hub_user_id) 联合 filter 拿 existing，避免群聊串
+        existing = await ConversationLog.filter(
+            conversation_id=conversation_id, hub_user_id=hub_user_id,
+        ).first()
         if existing is not None:
             return existing
         try:
@@ -472,15 +471,20 @@ class ChainAgent:
                 started_at=started_at,
             )
         except Exception:
-            # race（极小概率：两次 run 并发 create）或真异常都走这里——
-            # 先尝试取已存在记录；取不到再放弃（不阻塞业务，但记 exception 留痕）
+            # race（同 user 并发 create）或真异常都走这里——
+            # 先用复合 key 回查；取不到再放弃（不阻塞业务，但记 exception 留痕）
             try:
-                race = await ConversationLog.filter(conversation_id=conversation_id).first()
+                race = await ConversationLog.filter(
+                    conversation_id=conversation_id, hub_user_id=hub_user_id,
+                ).first()
                 if race is not None:
                     return race
             except Exception:
                 pass
-            logger.exception("ConversationLog.create 失败 conv=%s", conversation_id)
+            logger.exception(
+                "ConversationLog.create 失败 conv=%s user=%s",
+                conversation_id, hub_user_id,
+            )
             return None
 
     @staticmethod

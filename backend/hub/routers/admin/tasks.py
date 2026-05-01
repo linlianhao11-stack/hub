@@ -154,8 +154,11 @@ async def get_task_detail(request: Request, task_id: str):
                 "ended_at": conv.ended_at.isoformat() if conv.ended_at else None,
             }
             # 拉对应 tool_calls，按 round_idx + called_at 升序
+            # v8 review #20：用 (conv, hub_user_id) 联合过滤防群聊里另一 user 的 tool 调用串入
+            # 兼容：旧数据 hub_user_id NULL，conv.hub_user_id 也 NULL → filter 仍命中同组
             tool_logs = await ToolCallLog.filter(
                 conversation_id=conv.conversation_id,
+                hub_user_id=conv.hub_user_id,
             ).order_by("round_idx", "called_at").all()
             for log in tool_logs:
                 tool_calls_list.append({

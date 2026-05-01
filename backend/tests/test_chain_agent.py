@@ -500,6 +500,46 @@ async def test_concurrent_calls_use_separate_conversation_ids():
 
 
 @pytest.mark.asyncio
+async def test_conversation_log_per_user_isolation():
+    """**核心安全测试** v8 review #20：群聊场景同 conv_id 不同 hub_user_id
+    创建独立 ConversationLog，admin 后台可 per-user 看会话决策链。
+
+    旧行为：单字段 unique 让 B 用户进群聊时复用 A 创建的 log → 串归因。
+    新行为：复合 unique (conversation_id, hub_user_id) 让两人各 1 条。
+    """
+    from hub.models.conversation import ConversationLog
+
+    # 模拟群聊：A 用户 (hub_user_id=10) 和 B 用户 (hub_user_id=20) 共享同一 conv_id
+    conv_id = _conv_id(f"groupchat-{uuid.uuid4().hex[:6]}")
+
+    agent_a = _make_agent(llm_chat_return=_text_response("A 的合同已生成"))
+    agent_b = _make_agent(llm_chat_return=_text_response("B 的合同已生成"))
+
+    await agent_a.run(
+        "给翼蓝做合同",
+        hub_user_id=10, conversation_id=conv_id,
+        acting_as=101, channel_userid="ding-A",
+    )
+    await agent_b.run(
+        "给得帆做合同",
+        hub_user_id=20, conversation_id=conv_id,
+        acting_as=102, channel_userid="ding-B",
+    )
+
+    # 关键：同 conv_id 应有 2 条独立 log（A 和 B 各 1 条）
+    logs = await ConversationLog.filter(conversation_id=conv_id).all()
+    assert len(logs) == 2, f"群聊同 conv 应每 user 1 条 log，实际 {len(logs)}"
+
+    by_user = {log.hub_user_id: log for log in logs}
+    assert 10 in by_user, "A 用户的 log 应存在"
+    assert 20 in by_user, "B 用户的 log 应存在"
+    assert by_user[10].id != by_user[20].id, "两条 log 必须是不同记录"
+    # channel_userid 各自存自己的（admin 查 task detail 用 channel_userid 过滤就能区分）
+    assert by_user[10].channel_userid == "ding-A"
+    assert by_user[20].channel_userid == "ding-B"
+
+
+@pytest.mark.asyncio
 async def test_records_tokens_used_correctly():
     """v2 加固（review I-3）：tokens_used 精确等于所有 round usage 累加。"""
     # mock LLM 第 1 round 返 (prompt=100, completion=20)，第 2 round 返 (prompt=50, completion=30)

@@ -14,10 +14,14 @@ class ConversationLog(Model):
     """Agent 单次对话日志。
 
     conversation_id 与 Redis session 同 ID，用于跨模块关联。
+
+    v8 review #20：unique 约束改成 (conversation_id, hub_user_id)。
+    钉钉群聊里多人共享同一个 conversation_id，旧的全局 unique 会让 B 用户复用
+    A 创建的 log → admin 会话历史 / task detail / 成本统计把多人混到一条。
     """
 
     id = fields.BigIntField(pk=True)
-    conversation_id = fields.CharField(max_length=200, unique=True)  # 对话唯一标识
+    conversation_id = fields.CharField(max_length=200)  # v8 review #20：取消单字段 unique，改 Meta 复合 unique
     hub_user_id = fields.IntField(null=True)  # 关联 HubUser（逻辑引用，非 FK 约束）
     channel_userid = fields.CharField(max_length=200)  # 钉钉/来源渠道用户 ID
     started_at = fields.DatetimeField()  # 对话开始时间
@@ -30,6 +34,8 @@ class ConversationLog(Model):
 
     class Meta:
         table = "conversation_log"
+        # v8 review #20：复合 unique 防群聊串日志
+        unique_together = (("conversation_id", "hub_user_id"),)
         indexes = [
             ("hub_user_id", "started_at"),  # idx_user_started
         ]
@@ -38,11 +44,13 @@ class ConversationLog(Model):
 class ToolCallLog(Model):
     """Agent 对话内单次 tool 调用日志。
 
-    conversation_id 为字符串，**不设 FK 约束**，以支持"conversation_id 不存在也能写入"的观测需求。
+    conversation_id + hub_user_id 联合定位（无 FK，支持孤儿记录场景）。
+    v8 review #20：加 hub_user_id 字段防群聊串归因。
     """
 
     id = fields.BigIntField(pk=True)
     conversation_id = fields.CharField(max_length=200)  # 逻辑关联 ConversationLog.conversation_id（无 FK）
+    hub_user_id = fields.IntField(null=True)  # v8 review #20：群聊里同 conv 不同用户的 tool 调用要分开归因
     round_idx = fields.IntField()  # 在第几个 round 调用
     tool_name = fields.CharField(max_length=100)  # 工具名称
     args_json = fields.JSONField(null=True)  # 调用参数
@@ -55,4 +63,5 @@ class ToolCallLog(Model):
         table = "tool_call_log"
         indexes = [
             ("conversation_id", "round_idx"),  # idx_conv
+            ("conversation_id", "hub_user_id"),  # v8 review #20：admin 查询联合定位
         ]

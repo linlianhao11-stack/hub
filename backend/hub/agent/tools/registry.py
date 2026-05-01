@@ -191,7 +191,7 @@ class ToolRegistry:
                 # v7 round 2 P1-#2：分两类失败 → ChainAgent 据此决定是否 add_pending
                 if not had_confirmation_fields:
                     # 第一次调写 tool，没传 confirmation 字段 → ChainAgent 应 add_pending + 让 LLM 出预览
-                    await self._log_blocked_call(conversation_id, round_idx, name, tool_args,
+                    await self._log_blocked_call(conversation_id, hub_user_id, round_idx, name, tool_args,
                                                   reason="missing_confirmation")
                     raise MissingConfirmationError(
                         f"写类 tool '{name}' 还未经用户确认。请用 text 把操作预览发给用户，"
@@ -201,7 +201,7 @@ class ToolRegistry:
                     # 传了 confirmation 字段但 claim 失败（错 token / 跨 action 复用 / 并发输家 / stale）
                     # → ChainAgent **不应**再 add_pending（避免重复 pending）；
                     #   只让 LLM 重新出预览让用户重新确认（claim 内部已对篡改场景做 restore）
-                    await self._log_blocked_call(conversation_id, round_idx, name, tool_args,
+                    await self._log_blocked_call(conversation_id, hub_user_id, round_idx, name, tool_args,
                                                   reason="claim_failed")
                     raise ClaimFailedError(
                         f"写类 tool '{name}' 的 confirmation_token/action_id 无效"
@@ -211,8 +211,8 @@ class ToolRegistry:
 
         # ❺ 调 tool（注入内部 context）+ 记 log + 失败 restore_action（confirmed + pending 一起还）
         async with log_tool_call(
-            conversation_id=conversation_id, round_idx=round_idx,
-            tool_name=name, args=tool_args,
+            conversation_id=conversation_id, hub_user_id=hub_user_id,
+            round_idx=round_idx, tool_name=name, args=tool_args,
         ) as ctx:
             inject_ctx = {
                 "acting_as_user_id": acting_as,
@@ -278,22 +278,26 @@ class ToolRegistry:
         except ValidationError as e:
             raise ToolArgsValidationError(str(e)) from e
 
-    async def _log_blocked_call(self, conversation_id, round_idx, name, args, *, reason):
+    async def _log_blocked_call(
+        self, conversation_id, hub_user_id, round_idx, name, args, *, reason,
+    ):
         """拦截掉的 tool call 也写一条 tool_call_log（error 字段标 reason）。
 
-        可观测性不阻塞业务：DB 写入失败仅记 logger.exception，不向上抛（review v11 round 2 I-1）。
+        v8 review #20：加 hub_user_id 防群聊串归因。
         """
         try:
             from hub.models.conversation import ToolCallLog
             from hub.observability.tool_logger import truncate_for_log
             await ToolCallLog.create(
-                conversation_id=conversation_id, round_idx=round_idx,
+                conversation_id=conversation_id,
+                hub_user_id=hub_user_id,
+                round_idx=round_idx,
                 tool_name=name, args_json=truncate_for_log(args, max_size_kb=10),
                 error=f"blocked: {reason}",
             )
         except Exception:
             logger.exception(
                 "_log_blocked_call 写入失败（不阻塞业务）"
-                " conv=%s tool=%s reason=%s",
-                conversation_id, name, reason,
+                " conv=%s user=%s tool=%s reason=%s",
+                conversation_id, hub_user_id, name, reason,
             )

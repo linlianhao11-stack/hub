@@ -28,15 +28,19 @@ async def log_tool_call(
     round_idx: int,
     tool_name: str,
     args: dict,
+    hub_user_id: int | None = None,
 ):
     """Context manager：进入时无操作，出口写一行 tool_call_log。
 
+    v8 review #20：hub_user_id 默认 None 兼容旧调用（无 user 上下文时如孤儿记录）；
+    ChainAgent / Registry 调用时必传，admin 查询用 (conv, user) 联合定位。
+
     用法：
-        async with log_tool_call(conversation_id=..., round_idx=..., tool_name=..., args=...) as ctx:
+        async with log_tool_call(
+            conversation_id=..., hub_user_id=..., round_idx=..., tool_name=..., args=...,
+        ) as ctx:
             result = await tool.fn(...)
             ctx.set_result(result)
-
-    注意：即使 tool 抛异常，也会写入一行带 error 字段的记录，然后重新抛出异常。
     """
     started = time.monotonic()
     ctx = _ToolCallContext()
@@ -50,13 +54,13 @@ async def log_tool_call(
         try:
             await ToolCallLog.create(
                 conversation_id=conversation_id,
+                hub_user_id=hub_user_id,
                 round_idx=round_idx,
                 tool_name=tool_name,
-                args_json=truncate_for_log(args, max_size_kb=10),  # M1: args 同样截断，防止超大 JSONB
+                args_json=truncate_for_log(args, max_size_kb=10),
                 result_json=ctx._result,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 error=ctx._error,
-                # called_at 由 ToolCallLog.called_at(auto_now_add=True) 自动填充，无需显式传入
             )
         except Exception:
             logger.exception("tool_call_log 写入失败（不阻塞业务）")

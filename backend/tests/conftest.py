@@ -68,6 +68,17 @@ async def setup_db():
         use_tz=True,
         timezone="Asia/Shanghai",
     )
+    # v8 staging review #20：模型新增字段 / 改约束的表，drop 后让 generate_schemas
+    # 用最新 schema 重建（safe=True 不会 ALTER 已存在表加新列，会导致 INDEX 引用
+    # 不存在的列报错）。
+    from tortoise import connections as _bootconns
+    _bootconn = _bootconns.get("default")
+    for _t in ("tool_call_log", "conversation_log", "contract_draft"):
+        try:
+            await _bootconn.execute_query(f'DROP TABLE IF EXISTS "{_t}" CASCADE')
+        except Exception:
+            pass
+
     await Tortoise.generate_schemas(safe=True)
 
     # generate_schemas(safe=True) 不会给已有表添加新的 unique_together 约束。
@@ -116,6 +127,46 @@ async def setup_db():
         'CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_adj_action_id_unique '
         'ON stock_adjustment_request (requester_hub_user_id, confirmation_action_id) '
         'WHERE confirmation_action_id IS NOT NULL',
+    ):
+        try:
+            await _conn.execute_query(_stmt)
+        except Exception:
+            pass
+
+    # v8 staging review #17/#18：ContractDraft 加 extras + fingerprint + partial UNIQUE
+    for _stmt in (
+        'ALTER TABLE contract_draft ADD COLUMN IF NOT EXISTS extras JSONB NULL',
+        'ALTER TABLE contract_draft ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64) NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_draft_fingerprint '
+        'ON contract_draft (conversation_id, requester_hub_user_id, fingerprint) '
+        'WHERE fingerprint IS NOT NULL',
+    ):
+        try:
+            await _conn.execute_query(_stmt)
+        except Exception:
+            pass
+
+    # v8 staging review #20：ConversationLog 复合 unique + ToolCallLog 加 hub_user_id
+    # 旧测试 DB 可能残留单字段 unique，必须先 drop 再加复合
+    try:
+        await _conn.execute_query(
+            'ALTER TABLE conversation_log '
+            'DROP CONSTRAINT IF EXISTS conversation_log_conversation_id_key'
+        )
+    except Exception:
+        pass
+    try:
+        await _conn.execute_query(
+            'ALTER TABLE conversation_log '
+            'ADD CONSTRAINT uniq_conv_log_per_user '
+            'UNIQUE (conversation_id, hub_user_id)'
+        )
+    except Exception:
+        pass
+    for _stmt in (
+        'ALTER TABLE tool_call_log ADD COLUMN IF NOT EXISTS hub_user_id INTEGER NULL',
+        'CREATE INDEX IF NOT EXISTS idx_tool_call_log_conv_user '
+        'ON tool_call_log (conversation_id, hub_user_id)',
     ):
         try:
             await _conn.execute_query(_stmt)
