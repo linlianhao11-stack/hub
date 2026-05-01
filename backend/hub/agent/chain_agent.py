@@ -143,6 +143,19 @@ class ChainAgent:
             prev_round_state = await self.session_memory.get_round_state(
                 conversation_id, hub_user_id,
             )
+            if prev_round_state:
+                logger.info(
+                    "round_state 已加载 conv=%s user=%s customers=%d products=%d intent=%s",
+                    conversation_id[:16], hub_user_id,
+                    len(prev_round_state.get("customers_seen") or []),
+                    len(prev_round_state.get("products_seen") or []),
+                    (prev_round_state.get("last_intent") or {}).get("tool", "-"),
+                )
+            else:
+                logger.info(
+                    "round_state 为空（首轮 / 上轮无 tool 调用 / 已过期）conv=%s",
+                    conversation_id[:16],
+                )
         except Exception:
             logger.exception("session_memory.get_round_state 失败 conv=%s", conversation_id)
 
@@ -294,6 +307,19 @@ class ChainAgent:
                     if state:
                         await self.session_memory.set_round_state(
                             conversation_id, hub_user_id, state,
+                        )
+                        logger.info(
+                            "round_state 已写入 conv=%s user=%s "
+                            "customers=%d products=%d intent=%s",
+                            conversation_id[:16], hub_user_id,
+                            len(state.get("customers_seen") or []),
+                            len(state.get("products_seen") or []),
+                            (state.get("last_intent") or {}).get("tool", "-"),
+                        )
+                    else:
+                        logger.info(
+                            "round_state 抽取为空（本轮无 search/generate）conv=%s",
+                            conversation_id[:16],
                         )
                 except Exception:
                     logger.exception("session.set_round_state 失败 conv=%s", conversation_id)
