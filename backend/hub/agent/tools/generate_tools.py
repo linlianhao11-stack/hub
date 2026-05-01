@@ -92,6 +92,12 @@ async def generate_contract_draft(
     template_id: int,
     customer_id: int,
     items: list[dict],
+    shipping_address: str | None = None,
+    shipping_contact: str | None = None,
+    shipping_phone: str | None = None,
+    contract_no: str | None = None,
+    payment_terms: str | None = None,
+    tax_rate: str | None = None,
     extras: dict | None = None,
     *,
     hub_user_id: int,
@@ -101,25 +107,26 @@ async def generate_contract_draft(
     """生成销售合同草稿 docx 并发到钉钉。
 
     Args:
-        template_id: ContractTemplate.id
-        customer_id: ERP 客户 ID
+        template_id: ContractTemplate.id（销售合同模板一般是 1）
+        customer_id: ERP 客户 ID（必须用 search_customers 真返过的 id）
         items: [{"product_id", "name", "qty", "price"}]
-        extras: 额外占位符字段（合同号 / 付款条款等）；
-               值类型应为 str/int/float/bool；嵌套 dict/list 可能让模板渲染丢失。
-               注意：extras 字段会出现在 LLM 看到的 schema 中（GENERATE 类不含
-               confirmation_action_id 等内部字段，但其他业务参数全部对 LLM 可见）。
+            product_id 必须用 search_products 真返过的 id；不要凭印象编造 ID
+        shipping_address: 收货地址（用户提供时务必传），如"广州市天河区华穗路406号"
+        shipping_contact: 收货人姓名，如"林炼豪"
+        shipping_phone: 收货人电话，如"13692977880"
+        contract_no: 合同编号（admin 后台审批时再补）
+        payment_terms: 付款方式，默认"乙方预付 100% 货款"
+        tax_rate: 增值税税率字符串，如"13%"，默认 13%
+        extras: **极少需要**传——上面 5 个常用字段已抽到顶层。仅当模板有自定义
+                占位符时才用这个 dict。**类型必须是 dict，不能是字符串**。
 
     Returns:
         {"draft_id", "file_sent", "file_name"}
 
-    幂等保护（v8 staging review #15 → #17）：
-    用 fingerprint = sha256(template_id|customer_id|items|extras) 做幂等键。
-    - 入参完全相同（含 extras）→ fingerprint 一致 → 复用 draft 跳过 create，
-      worker 重试时只重发文件不重复入库
-    - 改了 items / extras 任一字段 → fingerprint 变 → 创建新 draft，
-      admin 审计 metadata 与实际 docx 内容始终一致
-    - 极端 race（同 conv 并发 generate 同 fingerprint）可能漏拦——
-      用 fingerprint 列加 partial index 加速查询，DB 唯一约束等 follow-up
+    幂等保护（v8 staging review #15 → #17 → #18）：
+    fingerprint = sha256(template_id|customer_id|items|extras_normalized) +
+    (conversation_id, requester_hub_user_id, fingerprint) partial UNIQUE index +
+    IntegrityError 回查复用，确保并发场景也不重复创建 draft。
     """
     # 1. 拉客户信息（v8 staging review #12：删宽容 fallback）
     # 旧逻辑：失败时用 "客户N" 假占位 → LLM 编错 customer_id 时合同上写"客户102"
@@ -211,10 +218,33 @@ async def generate_contract_draft(
             "error": f"客户 ID {customer_id} 数据异常：name 字段为空。请联系管理员核对 ERP。",
         }
 
-    # extras 类型加固（LLM 偶尔传 string 而不是 dict）
+    # v8 staging review #21：把顶层参数 shipping/contract_no/payment_terms 优先注入 extras
+    # （LLM 直接传顶层字段而不需要构造 dict——schema 明确字段名 LLM 不会瞎猜）
+    top_level_extras: dict[str, str] = {}
+    if shipping_address:
+        top_level_extras["shipping_address"] = str(shipping_address)
+    if shipping_contact:
+        top_level_extras["shipping_contact"] = str(shipping_contact)
+    if shipping_phone:
+        top_level_extras["shipping_phone"] = str(shipping_phone)
+    if contract_no:
+        top_level_extras["contract_no"] = str(contract_no)
+    if payment_terms:
+        top_level_extras["payment_terms"] = str(payment_terms)
+    if tax_rate:
+        top_level_extras["tax_rate"] = str(tax_rate)
+
+    # extras 类型加固（LLM 偶尔传 string 而不是 dict——这种情况现在罕见，
+    # 因为常用字段已抽到顶层；剩下的兜底）
     safe_extras = extras if isinstance(extras, dict) else {}
-    # 合并 seller_extras → 用户 extras 可覆盖（如指定不同账套时）
-    merged_extras = {**seller_extras, **safe_extras}
+    if extras and not isinstance(extras, dict):
+        logger.warning(
+            "generate_contract_draft 收到非 dict extras（已忽略，请用顶层 shipping_xxx 等参数）"
+            " conv=%s type=%s value=%r",
+            conversation_id, type(extras).__name__, str(extras)[:100],
+        )
+    # 合并：seller_extras（甲方账套）→ top_level_extras（用户传的收货等）→ safe_extras（兜底）
+    merged_extras = {**seller_extras, **top_level_extras, **safe_extras}
 
     # 2. 渲染 docx（可能抛 TemplateNotFoundError / TemplateRenderError）
     renderer = ContractRenderer()

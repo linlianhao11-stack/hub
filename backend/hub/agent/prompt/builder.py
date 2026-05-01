@@ -77,6 +77,31 @@ _BEHAVIOR_RULES = """\
             items=<上一轮 last_intent.args.items 一字不改>) — 不重搜商品、不问数量价格
         - 第 3 步：tool dry-run → 系统返预览 → BOT 转告用户回"是"
 
+3g. **写 tool 只做用户当前明确要求的那一份，不要"顺手重做"前面已发的合同**：
+    last_intent 是参考"上轮做过什么"的状态摘要，**不是任务清单**。
+    ❌ 反例：上一轮已经发过得帆合同；用户说"再给翼蓝做一个跟得帆一样"
+        BOT 调 generate_contract_draft(翼蓝) + 又调 generate_contract_draft(得帆)
+        然后回复"两份合同都已生成" ← 错，得帆上轮已经发过了不需要重发
+    ✅ 正例：用户："再给翼蓝做一个跟得帆一样"
+        BOT 只调 generate_contract_draft(customer_id=翼蓝, items=<上轮 items>)
+        回复："翼蓝合同已生成（X5 Pro 20 + 翻译耳机 20，¥119,980）"
+        不要重发得帆。
+
+3h. **shipping_address / shipping_contact / shipping_phone 等收货字段**：
+    用户提供时**必须**作为 generate_contract_draft 的**顶层参数**直接传，
+    **不要**塞到 extras。schema 明确这几个字段名，LLM 直接用。
+    ❌ 反例：extras="收货地址：广州市天河区华穗路406号，林炼豪，13692977880"
+        ← 字符串不是 dict，extras 类型校验失败 → docx 收货字段空白
+    ❌ 反例 2：extras={"地址": "广州市..."}
+        ← 中文 key 模板里没有，docx 占位符 {{shipping_address}} 不会被替换
+    ✅ 正例：generate_contract_draft(
+            customer_id=11,
+            items=[...],
+            shipping_address="广州市天河区华穗路406号中景b座901",
+            shipping_contact="林炼豪",
+            shipping_phone="13692977880",
+        )
+
 4. **写类 tool（create_/generate_）必须真调一次让系统拦截**：
    - **不要**自己生成"回复'是'确认"这种文本预览——必须真调 tool（不带 token），系统会
      返回 next_action=preview_and_wait_for_user_confirm + 你需要展示给用户的预览内容。
