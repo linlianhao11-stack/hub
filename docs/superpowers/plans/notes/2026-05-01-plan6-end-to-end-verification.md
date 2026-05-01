@@ -131,7 +131,45 @@ ERP-4 仓库 Task 18 已合并到 main（commit c5dce51），HUB 端可调：
 7. **EvalRunner 真 LLM 集成测试**（pytest.mark.eval 标记已加）—— Task 19 follow-up 用真 LLM 跑 gold set 测真实满意度
 8. **scheduler 加分钟级精度**（Task 15 follow-up）—— 当前 at_hour 整点；budget_alert + draft_reminder 都 09:00 同时触发顺序执行
 
-## 9. Plan 6 验收 ✅
+## 9. 当前生产 docker 状态（2026-05-01 / `/loop` 验证）
+
+> 注：现跑的 hub stack 是 **C 阶段 main 分支版本**（uptime 25.5h），Plan 6 还未 deploy；这一节验证 main 分支基线 still healthy（Plan 6 deploy 留 follow-up 5）。
+
+```bash
+$ curl http://localhost:8091/hub/v1/health
+HTTP 200
+{
+  "status": "healthy",
+  "components": {
+    "postgres": "ok",
+    "redis": "ok",
+    "dingtalk_stream": "connected",
+    "erp_default": "ok"
+  },
+  "uptime_seconds": 91692,
+  "version": "0.1.0"
+}
+```
+
+**Docker 容器状态**：
+- `hub-hub-gateway-1` Up 25h（端口 8091）
+- `hub-hub-worker-1` Up 25h（worker stream）
+- `hub-hub-postgres-1` Up 25h healthy（内 5432）
+- `hub-hub-redis-1` Up 25h healthy（内 6379）
+- `erp-4-erp-1` Up 25h healthy（端口 8090，但 commit a0ac44c — Task 18 c5dce51 还没 build）
+- `hub-test-pg` `hub-test-redis` 测试 fixture（端口 5435 / 6380）
+
+**钉钉 Stream**：
+- 最近重连：2026-04-30 11:57:12
+- ticket: `ab486387-4448-11f1-85b6-8a62bdfdb80d`
+- 状态：connected（state OK）
+
+**结论**：
+- ✅ Plan 1-5 + ERP 集成 在 25 小时连续运行下 4 组件全绿
+- ⚠️ Plan 6 代码（feature/plan6-agent + ERP main c5dce51）还需运维侧 deploy + 真钉钉 + 真 ERP staging 走端到端 6 用户故事（Task 19 follow-up 5）
+- ⚠️ ERP 容器需重 build 才能用 Task 18 endpoint（customer-price-rules / inventory/aging / voucher.client_request_id）
+
+## 10. Plan 6 验收 ✅
 
 | 维度 | 完成 |
 |------|------|
