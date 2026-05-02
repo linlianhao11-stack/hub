@@ -35,6 +35,7 @@ dependencies = [
     # Plan 6 v9 GraphAgent：LangGraph 状态机 + LangChain Core 基础类型
     "langgraph>=0.2.0,<0.3",
     "langchain-core>=0.3.0,<0.4",
+    "fakeredis>=2.35.1",
 ]
 
 [project.optional-dependencies]

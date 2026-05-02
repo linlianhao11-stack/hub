@@ -1,9 +1,63 @@
 # hub/agent/tools/confirm_gate.py
+from __future__ import annotations
+
 import hashlib
 import json
 import uuid
+import warnings
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from redis.asyncio import Redis
+
+
+def uuid4_hex() -> str:
+    """生成 32 位 hex UUID（无连字符）。"""
+    return uuid.uuid4().hex
+
+
+# ====== 新增异常（Task 0.5 Plan 6 v9）======
+
+class CrossContextClaim(Exception):
+    """claim 时 (conversation_id, hub_user_id) 与 pending 创建时不一致。"""
+    pass
+
+
+class CrossContextIdempotency(Exception):
+    """idempotency_key 跨 context 命中，拒绝复用。"""
+    pass
+
+
+# ====== PendingAction dataclass（Task 0.5 Plan 6 v9）======
+
+@dataclass
+class PendingAction:
+    """pending 写动作的完整描述。
+
+    Task 0.5 新增字段（加在现有 ConfirmGate.add_pending 之上）：
+    - conversation_id, hub_user_id：隔离 key
+    - subgraph：触发该 pending 的 subgraph 名（如 "adjust_price"）
+    - summary：给用户看的多行摘要（多 pending 时枚举用）
+    - payload：完整执行载荷，含 tool_name + args
+    - created_at：排序用，按 UTC 时间戳
+    - ttl_seconds：默认 600 s
+    - token：confirm 后的 HMAC token
+    """
+    action_id: str
+    conversation_id: str
+    hub_user_id: int
+    subgraph: str
+    summary: str
+    payload: dict
+    created_at: datetime
+    ttl_seconds: int = 600
+    token: str | None = None
+
+    def is_expired(self) -> bool:
+        """按 created_at + ttl_seconds 检查是否过期。"""
+        from datetime import timedelta
+        delta = datetime.now(tz=timezone.utc) - self.created_at
+        return delta.total_seconds() > self.ttl_seconds
 
 
 class ConfirmGate:
@@ -91,10 +145,234 @@ class ConfirmGate:
         )
         return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
-    # ====== pending（被门禁拦截的写动作）======
+    # ====== Task 0.5 新增 Redis key：claimed audit log ======
+    CLAIMED_KEY = "hub:agent:claimed:"  # string key per action_id，TTL 24h
+
+    def _claimed_key(self, action_id: str) -> str:
+        return f"{self.CLAIMED_KEY}{action_id}"
+
+    def _idempotency_key(self, idempotency_key: str) -> str:
+        return f"hub:agent:idempotency:{idempotency_key}"
+
+    # ====== Task 0.5 新 API：create_pending / list_pending_for_context / get_pending_by_id / is_claimed / claim ======
+
+    async def create_pending(
+        self, *,
+        hub_user_id: int,
+        conversation_id: str,
+        subgraph: str,
+        summary: str,
+        payload: dict,
+        action_prefix: str = "act",
+        ttl_seconds: int = 600,
+        idempotency_key: str | None = None,
+        action_id: str | None = None,  # 测试 fixture 允许覆盖；生产路径用 None 自动生成
+    ) -> PendingAction:
+        """创建 PendingAction 并写入 Redis。
+
+        - action_id 生产路径：f"{action_prefix}-{uuid4().hex}"（32-hex）
+        - idempotency_key 同 (conv, user) 命中 → 复用；跨 context 命中 → raise CrossContextIdempotency
+        """
+        # idempotency 检查
+        if idempotency_key:
+            idem_key = self._idempotency_key(idempotency_key)
+            existing_raw = await self.redis.get(idem_key)
+            if existing_raw:
+                existing = json.loads(existing_raw)
+                if (existing["conversation_id"] == conversation_id
+                        and existing["hub_user_id"] == hub_user_id):
+                    # 同 context 命中 → 复用
+                    return PendingAction(
+                        action_id=existing["action_id"],
+                        conversation_id=existing["conversation_id"],
+                        hub_user_id=existing["hub_user_id"],
+                        subgraph=existing["subgraph"],
+                        summary=existing["summary"],
+                        payload=existing["payload"],
+                        created_at=datetime.fromisoformat(existing["created_at"]),
+                        ttl_seconds=existing.get("ttl_seconds", 600),
+                        token=existing.get("token"),
+                    )
+                else:
+                    raise CrossContextIdempotency(
+                        f"idempotency_key={idempotency_key!r} 已被不同 context 使用"
+                    )
+
+        # 自动生成 action_id（生产路径）；测试 fixture 传入覆盖
+        if action_id is None:
+            action_id = f"{action_prefix}-{uuid4_hex()}"
+        # 验证 action_id 格式（必须含 "-"，后面是 32-hex）
+        # 允许测试传短 id（如 "adj-1"）以便断言，不强制校验长度
+
+        now = datetime.now(tz=timezone.utc)
+        token = self.compute_token(
+            conversation_id, hub_user_id, action_id,
+            payload.get("tool_name", ""),
+            self.canonicalize(payload.get("args", {})),
+        )
+        record = {
+            "action_id": action_id,
+            "conversation_id": conversation_id,
+            "hub_user_id": hub_user_id,
+            "subgraph": subgraph,
+            "summary": summary,
+            "payload": payload,
+            "created_at": now.isoformat(),
+            "ttl_seconds": ttl_seconds,
+            "token": token,
+        }
+        pending_key = self._pending_key(conversation_id, hub_user_id)
+        await self.redis.hset(
+            pending_key, action_id,
+            json.dumps(record, ensure_ascii=False),
+        )
+        await self.redis.expire(pending_key, max(ttl_seconds, self.TTL))
+
+        if idempotency_key:
+            idem_key = self._idempotency_key(idempotency_key)
+            await self.redis.set(idem_key, json.dumps(record, ensure_ascii=False),
+                                 ex=ttl_seconds)
+
+        return PendingAction(
+            action_id=action_id,
+            conversation_id=conversation_id,
+            hub_user_id=hub_user_id,
+            subgraph=subgraph,
+            summary=summary,
+            payload=payload,
+            created_at=now,
+            ttl_seconds=ttl_seconds,
+            token=token,
+        )
+
+    async def list_pending_for_context(
+        self, *, conversation_id: str, hub_user_id: int
+    ) -> list[PendingAction]:
+        """返回该 (conv, user) 的所有 pending action，按 created_at asc 排序（同时刻用 action_id break tie）。"""
+        raw = await self.redis.hgetall(self._pending_key(conversation_id, hub_user_id))
+        items: list[PendingAction] = []
+        for aid_bytes, payload_bytes in (raw or {}).items():
+            aid = aid_bytes.decode() if isinstance(aid_bytes, bytes) else aid_bytes
+            data = json.loads(payload_bytes)
+            # 只有 create_pending 写入的记录才有 created_at 字段
+            if "created_at" not in data:
+                continue
+            items.append(PendingAction(
+                action_id=aid,
+                conversation_id=data.get("conversation_id", conversation_id),
+                hub_user_id=data.get("hub_user_id", hub_user_id),
+                subgraph=data.get("subgraph", ""),
+                summary=data.get("summary", ""),
+                payload=data.get("payload", {}),
+                created_at=datetime.fromisoformat(data["created_at"]),
+                ttl_seconds=data.get("ttl_seconds", 600),
+                token=data.get("token"),
+            ))
+        items.sort(key=lambda p: (p.created_at, p.action_id))
+        return items
+
+    async def get_pending_by_id(self, action_id: str) -> PendingAction | None:
+        """按 action_id 查 PendingAction（需要扫所有 key；测试/调试用）。
+
+        注意：生产路径应优先用 list_pending_for_context + 已知 (conv, user) 定向查。
+        """
+        # action_id 格式 "prefix-32hex"，不含 conv:user 信息，只能扫 hash
+        # 实际调用者应该传 conversation_id + hub_user_id 直接 HGET；此方法用于测试辅助
+        pattern = f"{self.PENDING_KEY}*"
+        async for key in self.redis.scan_iter(pattern):
+            raw = await self.redis.hget(key, action_id)
+            if raw:
+                data = json.loads(raw)
+                if "created_at" in data:
+                    return PendingAction(
+                        action_id=action_id,
+                        conversation_id=data.get("conversation_id", ""),
+                        hub_user_id=data.get("hub_user_id", 0),
+                        subgraph=data.get("subgraph", ""),
+                        summary=data.get("summary", ""),
+                        payload=data.get("payload", {}),
+                        created_at=datetime.fromisoformat(data["created_at"]),
+                        ttl_seconds=data.get("ttl_seconds", 600),
+                        token=data.get("token"),
+                    )
+        return None
+
+    async def is_claimed(self, action_id: str) -> bool:
+        """action 是否已被 claim（留 24h audit log）。"""
+        return bool(await self.redis.exists(self._claimed_key(action_id)))
+
+    async def claim(
+        self, *, action_id: str, token: str,
+        hub_user_id: int, conversation_id: str,
+    ) -> bool:
+        """消费一个 PendingAction token（单次；跨 context 抛 CrossContextClaim）。
+
+        流程：
+        1. HGET pending_key action_id → 校验存在性
+        2. 校验 conversation_id 和 hub_user_id 一致 → 不一致 raise CrossContextClaim
+        3. 校验 token 匹配
+        4. 原子 HDEL（单次消费）
+        5. 写 claimed audit log（TTL 24h）
+        """
+        pending_key = self._pending_key(conversation_id, hub_user_id)
+        raw = await self.redis.hget(pending_key, action_id)
+        if raw is None:
+            # 检查其他 context 是否有该 action_id（跨 context 检测）
+            other = await self.get_pending_by_id(action_id)
+            if other is not None:
+                raise CrossContextClaim(
+                    f"action_id={action_id!r} 属于 conv={other.conversation_id!r} "
+                    f"user={other.hub_user_id}，拒绝 conv={conversation_id!r} user={hub_user_id} 的 claim"
+                )
+            # 已被消费或不存在 → 检查 claimed log
+            if await self.is_claimed(action_id):
+                raise CrossContextClaim(f"action_id={action_id!r} 已被消费（单次 token）")
+            raise CrossContextClaim(f"action_id={action_id!r} 不存在（过期或已消费）")
+
+        data = json.loads(raw)
+        # 校验 context 一致性
+        stored_conv = data.get("conversation_id", conversation_id)
+        stored_user = data.get("hub_user_id", hub_user_id)
+        if stored_conv != conversation_id or stored_user != hub_user_id:
+            raise CrossContextClaim(
+                f"action_id={action_id!r} 属于 conv={stored_conv!r} user={stored_user}，"
+                f"拒绝 conv={conversation_id!r} user={hub_user_id} 的 claim"
+            )
+        # 校验 token
+        stored_token = data.get("token")
+        if stored_token != token:
+            raise CrossContextClaim(f"action_id={action_id!r} token 不匹配")
+
+        # 原子消费：HDEL
+        deleted = await self.redis.hdel(pending_key, action_id)
+        if not deleted:
+            # 并发情况下可能被另一个 claim 抢先删除
+            raise CrossContextClaim(f"action_id={action_id!r} 并发消费冲突")
+
+        # 写 claimed audit log，TTL 24h
+        await self.redis.set(
+            self._claimed_key(action_id),
+            json.dumps({"action_id": action_id, "conversation_id": conversation_id,
+                        "hub_user_id": hub_user_id}, ensure_ascii=False),
+            ex=86400,
+        )
+        return True
+
+    # ====== 旧 API（保留给 ChainAgent；Task 7.3 删 ChainAgent 时一起清理）======
+
     async def add_pending(self, conversation_id: str, hub_user_id: int,
                           tool_name: str, args: dict) -> str:
-        """ChainAgent 在 tool 被门禁拦截时调；返回 action_id。同 round 多个写都能存。"""
+        """[已废弃] ChainAgent 在 tool 被门禁拦截时调；返回 action_id。
+
+        .. deprecated::
+            请迁移到 create_pending()（Task 0.5 新 API）。
+            此方法将在 Task 7.3 删 ChainAgent 时一并移除。
+        """
+        warnings.warn(
+            "add_pending() 已废弃，请使用 create_pending()（Task 7.3 清理）",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         action_id = uuid.uuid4().hex  # v10 round 2 P2：32-hex 完整 (128 bit) 防长期碰撞
         normalized = self.canonicalize(args)
         await self.redis.hset(
@@ -111,7 +389,16 @@ class ConfirmGate:
 
     async def list_pending(self, conversation_id: str,
                            hub_user_id: int) -> list[dict]:
-        """返回该 user 的所有 pending action（用户回'是'时由 ChainAgent 调）。"""
+        """[已废弃] 返回该 user 的所有 pending action（用户回'是'时由 ChainAgent 调）。
+
+        .. deprecated::
+            请迁移到 list_pending_for_context()（Task 0.5 新 API）。
+        """
+        warnings.warn(
+            "list_pending() 已废弃，请使用 list_pending_for_context()（Task 7.3 清理）",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         raw = await self.redis.hgetall(self._pending_key(conversation_id, hub_user_id))
         out = []
         for action_id, payload in (raw or {}).items():
