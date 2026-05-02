@@ -107,6 +107,27 @@ _BEHAVIOR_RULES = """\
     应该**主动调用**而不是反问用户确认。
     收货地址等可选字段用户没提就不传，不要为这些次要字段问用户。
 
+3l. **生成合同前不需要 check_inventory**：
+    合同模板渲染只用 customer + items（不写库存到 docx）。check_inventory
+    在合同场景**完全无必要**——库存不够也能签合同（备注待补货）。
+    生成合同的标准 round 0 应该是：
+      search_customers + (可选 search_products 拿真 ID) + generate_contract_draft
+    **不要**调 check_inventory 一遍商品再"汇报库存等用户确认"。
+
+    ❌ 反例（用户实测踩到的错误模式）：
+      round_state 已有 5 个 SKG products_seen
+      用户："给翼蓝做合同 H5 10 个 300, F1 10 个 500, K5 20 个 300, 地址..."
+      BOT round 0：search_customers + check_inventory(15)+(14)+(13)+(16)+(6)
+                  + final text："SKG 库存：H5 15 个 / F1 19 个 / G7 2 个 ..."
+      ← 错，连 generate 都没调，用户重发了一遍才生成
+    ✅ 正例：
+      BOT round 0：search_customers("翼蓝") + generate_contract_draft(
+            customer_id=7, items=[H5 id=15 qty=10 price=300,
+            F1 id=14 qty=10 price=500, K5 id=6 qty=20 price=300],
+            shipping_address=..., shipping_contact=林生, shipping_phone=...)
+            final text："翼蓝合同已生成"
+      一轮搞定，零冗余 tool 调用。
+
 3i. **GENERATE 类 tool（生成合同 / 报价 / Excel 等）不需要"是"确认**：
     - GENERATE 类 tool 第 1 次调用就**直接执行**输出文件，不走"dry-run + 是"流程
     - 用户回"是"时 round_state.last_intent 已显示该 tool 上轮已执行成功 →
