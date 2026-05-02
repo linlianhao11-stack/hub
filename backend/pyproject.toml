@@ -32,6 +32,9 @@ dependencies = [
     # Plan 6 eval runner 加载 gold_set.yaml；当前由 dingtalk-stream / aerich 间接拉到，
     # 但这是 Plan 6 自身用的依赖——显式声明防上游断链
     "PyYAML>=6.0",
+    # Plan 6 v9 GraphAgent：LangGraph 状态机 + LangChain Core 基础类型
+    "langgraph>=0.2.0,<0.3",
+    "langchain-core>=0.3.0,<0.4",
 ]
 
 [project.optional-dependencies]
