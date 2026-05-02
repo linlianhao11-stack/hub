@@ -52,6 +52,7 @@ class PendingAction:
     created_at: datetime
     ttl_seconds: int = 600
     token: str | None = None
+    idempotency_key: str | None = None
 
     def is_expired(self) -> bool:
         """按 created_at + ttl_seconds 检查是否过期。"""
@@ -192,6 +193,7 @@ class ConfirmGate:
                         created_at=datetime.fromisoformat(existing["created_at"]),
                         ttl_seconds=existing.get("ttl_seconds", 600),
                         token=existing.get("token"),
+                        idempotency_key=existing.get("idempotency_key"),
                     )
                 else:
                     raise CrossContextIdempotency(
@@ -220,6 +222,7 @@ class ConfirmGate:
             "created_at": now.isoformat(),
             "ttl_seconds": ttl_seconds,
             "token": token,
+            "idempotency_key": idempotency_key,
         }
         pending_key = self._pending_key(conversation_id, hub_user_id)
         await self.redis.hset(
@@ -243,6 +246,7 @@ class ConfirmGate:
             created_at=now,
             ttl_seconds=ttl_seconds,
             token=token,
+            idempotency_key=idempotency_key,
         )
 
     async def list_pending_for_context(
@@ -267,6 +271,7 @@ class ConfirmGate:
                 created_at=datetime.fromisoformat(data["created_at"]),
                 ttl_seconds=data.get("ttl_seconds", 600),
                 token=data.get("token"),
+                idempotency_key=data.get("idempotency_key"),
             ))
         items.sort(key=lambda p: (p.created_at, p.action_id))
         return items
@@ -294,6 +299,7 @@ class ConfirmGate:
                         created_at=datetime.fromisoformat(data["created_at"]),
                         ttl_seconds=data.get("ttl_seconds", 600),
                         token=data.get("token"),
+                        idempotency_key=data.get("idempotency_key"),
                     )
         return None
 
