@@ -288,9 +288,20 @@ async def generate_contract_draft(
     ).first()
     if draft is not None:
         logger.info(
-            "ContractDraft 幂等命中（fingerprint）复用 draft_id=%s conv=%s",
-            draft.id, conversation_id,
+            "ContractDraft 幂等命中（fingerprint）复用 draft_id=%s status=%s conv=%s",
+            draft.id, draft.status, conversation_id,
         )
+        # v8 review #23：已成功发过钉钉的 draft 不重发文件
+        # 防 LLM 把用户的"是"理解成"再生成一次"，导致同一文件发到钉钉 2 次
+        # 仅 status="sent" 才跳过；status="generated"（render 成功但 send 失败）继续走 send 路径
+        if draft.status == "sent":
+            file_name = f"销售合同_{customer.get('name')}_{date.today().isoformat()}.docx"
+            return {
+                "draft_id": draft.id,
+                "file_sent": True,
+                "file_name": file_name,
+                "note": "该合同已生成并发送过钉钉，未重复发送（如需重发请联系管理员）",
+            }
     else:
         # v8 review #18：DB 已加 partial UNIQUE index 防 race；
         # create 抛 IntegrityError 时回查 first() 拿对端 race winner 的 draft 复用
