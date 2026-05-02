@@ -1,0 +1,14 @@
+# backend/tests/agent/fixtures/scenarios/story3_contract_oneround.yaml
+# Plan 6 v9 Task 4.8 — 故事 3 acceptance fixture
+# 完整真 LLM 跑要等 Phase 7 GraphAgent 顶层接入后 Task 8.1 yaml driver 跑
+name: 故事 3：单轮合同（信息一次到齐）
+turns:
+  - input: "给阿里做合同 X1 10 个 300，地址北京海淀，张三 13800000000"
+    expected_intent: contract
+    tool_caps:
+      search_customers: 1
+      search_products: 1
+      generate_contract_draft: 1
+      check_inventory: 0  # 物理不挂，必须 0
+    sent_files_min: 1
+    must_contain: ["合同已生成"]
