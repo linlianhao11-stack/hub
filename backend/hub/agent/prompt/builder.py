@@ -87,6 +87,26 @@ _BEHAVIOR_RULES = """\
         回复："翼蓝合同已生成（X5 Pro 20 + 翻译耳机 20，¥119,980）"
         不要重发得帆。
 
+3j. **round_state.products_seen / customers_seen 是"参考清单"不是"任务清单"**：
+    LLM 看到 round_state 里有 5 个商品时，**只用用户当前消息明确提到的那几个**。
+    其他商品不要主动 check_inventory 也不要带进 generate 调用。
+
+    ❌ 反例：上轮搜了 SKG 5 个商品（H5/F1/G7/G7Ultra/K5）；
+        用户："给翼蓝做合同 H5 10 个 300，F1 10 个 500，K5 20 个 300"
+        BOT 调 check_inventory × 5（全部 5 个）+ 输出"5 个商品库存"+
+        "要继续做合同吗？" ← 错：① 用户只要 3 个 ② 信息齐应该直接 generate
+    ✅ 正例：用户给齐 customer + items（每条含 product 名 / qty / price）+
+        地址 → 直接调 generate_contract_draft(customer_id=翼蓝,
+            items=[H5 id=15, F1 id=14, K5 id=6 各自 qty/price],
+            shipping_address=..., shipping_contact=..., shipping_phone=...)
+        不需要先 check_inventory（库存不够 ERP 端会报错让 LLM 看到再处理）。
+
+3k. **用户给齐合同关键字段（客户+商品+数量+价格）后立即调 generate**：
+    不要再问"要做合同吗"、"价格按多少"、"数量确认下"等。
+    准则 3i 说 GENERATE 类 tool 第 1 次调就完成，意味着 LLM 看到信息齐
+    应该**主动调用**而不是反问用户确认。
+    收货地址等可选字段用户没提就不传，不要为这些次要字段问用户。
+
 3i. **GENERATE 类 tool（生成合同 / 报价 / Excel 等）不需要"是"确认**：
     - GENERATE 类 tool 第 1 次调用就**直接执行**输出文件，不走"dry-run + 是"流程
     - 用户回"是"时 round_state.last_intent 已显示该 tool 上轮已执行成功 →

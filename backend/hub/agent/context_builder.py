@@ -309,7 +309,10 @@ class ContextBuilder:
         intent = state.get("last_intent") or {}
 
         if custs:
-            lines.append("客户（之前已搜到，请直接引用 id，不要重搜）:")
+            lines.append(
+                "上轮 search_customers 搜到的客户（仅当用户**当前消息提到**这个客户时"
+                "用其 id；用户没提到的不要凭印象套用）:"
+            )
             for c in custs:
                 if not isinstance(c, dict):
                     continue
@@ -320,7 +323,11 @@ class ContextBuilder:
                 lines.append(line)
 
         if prods:
-            lines.append("商品（之前已搜到，请直接引用 id，不要重搜也不要编造 ID）:")
+            lines.append(
+                "上轮 search_products 搜到的商品（**仅当用户当前消息提到这个商品**"
+                "时才用其 id；不要把下面所有商品都加进 generate/create tool 调用——"
+                "这是参考清单不是任务清单）:"
+            )
             for p in prods:
                 if not isinstance(p, dict):
                     continue
