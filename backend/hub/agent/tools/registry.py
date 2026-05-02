@@ -28,23 +28,61 @@ logger = logging.getLogger("hub.agent.tools.registry")
 class ToolRegistry:
     SCHEMA_CACHE_TTL = 300  # 5 min
 
-    def __init__(self, *, confirm_gate: ConfirmGate, session_memory: SessionMemory):
+    def __init__(self, *, confirm_gate: ConfirmGate | None = None,
+                 session_memory: SessionMemory | None = None):
         self._tools: dict[str, ToolDef] = {}
         self._user_schema_cache: dict[int, tuple[float, list[dict]]] = {}
         self.confirm_gate = confirm_gate
         self.session_memory = session_memory
         self.entity_extractor = EntityExtractor()
+        # Plan 6 §5.2：dict-schema 注册表（subgraph 过滤用）
+        # key: tool name, value: (schema_dict, subgraphs_set)
+        self._schema_registry: dict[str, tuple[dict, frozenset[str]]] = {}
 
-    def register(self, name: str, fn: Callable, *, perm: str, description: str,
-                 tool_type: ToolType):
-        """注册 tool；tool_type 必填。
+    def register(self, name_or_schema: str | dict, fn: Callable | None = None, *,
+                 perm: str = "", description: str = "",
+                 tool_type: ToolType | None = None,
+                 enforce_strict: bool = False):
+        """注册 tool。
+
+        两种调用模式：
+
+        （1）旧式函数注册（ChainAgent / 现有 tool 模块使用）：
+            register(name: str, fn: Callable, *, perm, description, tool_type)
+
+        （2）Plan 6 §5.2 新式 dict-schema 注册（subgraph 过滤 + strict 校验）：
+            register(schema: dict, *, enforce_strict=False)
+            schema 格式：
+              {
+                "type": "function",
+                "function": {"name": ..., "strict": True, "parameters": {...}},
+                "_subgraphs": ["query", "contract"],   # 可选，省略则不属于任何 subgraph
+              }
 
         v9 round 2 P1：写类 tool fn 必须在签名声明 confirmation_action_id 参数（fail fast）。
-        理由：ToolRegistry.call 在 claim_action 之后才注入这个参数；如果 fn 没声明，
-        调用时会 RuntimeError，但此时 claim 已原子删除 confirmed+pending，
-        且错误发生在 restore try/except 之前 → 用户的确认态被消费且无法 restore。
-        把检查放到 register() 时做，启动期就能发现，绝不进入运行期消费确认态的窗口。
         """
+        # ── 路径（2）：dict-schema 注册 ──────────────────────────────────────
+        if isinstance(name_or_schema, dict):
+            schema = name_or_schema
+            if enforce_strict:
+                self._validate_strict_schema(schema)
+            fn_def = schema.get("function", {})
+            tool_name = fn_def.get("name")
+            if not tool_name:
+                raise ValueError("schema['function']['name'] 不能为空")
+            subgraphs = frozenset(schema.get("_subgraphs") or [])
+            # 存储时剥离 _subgraphs（不暴露给 LLM）
+            clean_schema = {k: v for k, v in schema.items() if k != "_subgraphs"}
+            self._schema_registry[tool_name] = (clean_schema, subgraphs)
+            return
+
+        # ── 路径（1）：旧式函数注册 ──────────────────────────────────────────
+        name: str = name_or_schema  # type: ignore[assignment]
+        if fn is None:
+            raise TypeError("register(name, fn, ...) 模式下 fn 不能为 None")
+        if tool_type is None:
+            raise TypeError("register(name, fn, ...) 模式下 tool_type 不能为 None")
+
         sig = inspect.signature(fn)
         hints = get_type_hints(fn)
 
@@ -72,6 +110,53 @@ class ToolRegistry:
                 },
             },
         )
+
+    def get(self, name: str) -> ToolDef | dict | None:
+        """按名称查询已注册 tool。
+
+        优先从函数注册表（_tools）查；其次从 dict-schema 注册表（_schema_registry）查。
+        返回 ToolDef（函数注册）或 schema dict（dict 注册），不存在返回 None。
+        """
+        if name in self._tools:
+            return self._tools[name]
+        entry = self._schema_registry.get(name)
+        if entry is not None:
+            return entry[0]  # 返回 schema dict
+        return None
+
+    def schemas_for_subgraph(self, subgraph_name: str) -> list[dict]:
+        """Plan 6 §5.2：返回所有属于指定 subgraph 的 tool schema 列表。
+
+        只查 dict-schema 注册表（_schema_registry），函数注册表的 tool 没有 _subgraphs 概念。
+        schema 中没有 _subgraphs 字段（或字段为空）的 tool 不会被任何 subgraph 返回。
+        """
+        result = []
+        for schema, subgraphs in self._schema_registry.values():
+            if subgraph_name in subgraphs:
+                result.append(schema)
+        return result
+
+    @staticmethod
+    def _validate_strict_schema(schema: dict) -> None:
+        """enforce_strict=True 时校验 schema 符合 OpenAI strict 规范（spec §5.2）。
+
+        要求：
+        - schema['function']['strict'] == True
+        - schema['function']['parameters']['additionalProperties'] == False
+        任何一项不符合均抛 ValueError（message 含 'strict'）。
+        """
+        fn_def = schema.get("function", {})
+        if fn_def.get("strict") is not True:
+            raise ValueError(
+                "strict 校验失败：schema['function']['strict'] 必须为 True。"
+                "（enforce_strict=True 要求所有注册 schema 显式声明 strict=True）"
+            )
+        params = fn_def.get("parameters", {})
+        if params.get("additionalProperties") is not False:
+            raise ValueError(
+                "strict 校验失败：schema['function']['parameters']['additionalProperties'] "
+                "必须为 False。（OpenAI strict mode 要求 additionalProperties=False）"
+            )
 
     # 这些参数由 ToolRegistry 注入内部 context；不暴露给 LLM（schema 排除）
     # confirmation_action_id 双重身份（v8 round 2 P1）：
