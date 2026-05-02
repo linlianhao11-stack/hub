@@ -1,0 +1,16 @@
+# backend/tests/agent/fixtures/scenarios/story6b_cross_conversation_isolation.yaml
+# Plan 6 v9 Task 5.5 — 故事 6 变体：跨会话隔离
+# c1-private 创建的 pending 在 c2-group 看不到，但 c1 的 pending 仍存活
+name: 故事 6 变体：跨会话隔离
+turns:
+  - input: "把阿里的 X1 价格调到 280"
+    conversation_id: c1-private
+    hub_user_id: 1
+    expected_intent: adjust_price
+    creates_pending_action: true
+  - input: "确认"
+    conversation_id: c2-group  # 切到群聊
+    hub_user_id: 1
+    expected_intent: confirm
+    must_contain: ["没有待办"]
+    pending_state: {adj-1: still_pending}

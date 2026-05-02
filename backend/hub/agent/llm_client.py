@@ -305,11 +305,17 @@ class DeepSeekLLMClient:
                 if e.response.status_code == 400 and _is_strict_violation(e.response.text):
                     if tool_class == ToolClass.WRITE:
                         logger.error("strict 校验失败 write tool path → fail closed: %s", e.response.text)
+                        # Plan 6 v9 Task 5.7：fallback 触发时打 metric → 触发告警
+                        from hub import metrics
+                        metrics.incr("llm.fallback", tags={"tool_class": "write", "reason": "strict_violation"})
                         raise LLMFallbackError(f"strict schema 校验失败：{e.response.text}") from e
                 raise
         if last_exc is None:
             raise RuntimeError("retry 循环异常")
         if tool_class == ToolClass.WRITE:
+            # Plan 6 v9 Task 5.7：max_retries fallback 也打 metric
+            from hub import metrics
+            metrics.incr("llm.fallback", tags={"tool_class": "write", "reason": "max_retries_exhausted"})
             raise LLMFallbackError(f"达到 max_retries 仍失败：{last_exc}") from last_exc
         raise last_exc
 
