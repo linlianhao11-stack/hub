@@ -4,6 +4,8 @@
 依赖：
 - `set_erp_adapter(adapter)` 必须在 app startup 时调（main.py lifespan）
 - `register_all(registry)` 在 ChainAgent 初始化时调一次
+
+Plan 6 v9 Task 2.3：9 个读 tool strict schema + sentinel 归一化（spec §1.3 / §5.2）。
 """
 from __future__ import annotations
 
@@ -38,6 +40,223 @@ def current_erp_adapter() -> Erp4Adapter:
     return _erp_adapter
 
 
+# ===== Plan 6 v9 Task 2.3：strict tool schema（spec §1.3 / §5.2）=====
+
+SEARCH_PRODUCTS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "search_products",
+        "strict": True,
+        "description": "按关键字搜索商品（中英自动分词）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键字（商品名/SKU/规格等）",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query", "contract", "quote", "adjust_price", "adjust_stock"],
+}
+
+SEARCH_CUSTOMERS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "search_customers",
+        "strict": True,
+        "description": "按关键字搜索客户",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键字（客户名/联系方式等）",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query", "contract", "quote", "adjust_price"],
+}
+
+GET_PRODUCT_DETAIL_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "get_product_detail",
+        "strict": True,
+        "description": "商品详情（含库存明细）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["product_id"],
+            "properties": {
+                "product_id": {
+                    "type": "integer",
+                    "description": "ERP 商品 ID",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query"],
+}
+
+GET_CUSTOMER_HISTORY_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "get_customer_history",
+        "strict": True,
+        "description": "客户最近 N 次该商品成交价",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["product_id", "customer_id", "limit"],
+            "properties": {
+                "product_id": {
+                    "type": "integer",
+                    "description": "ERP 商品 ID",
+                },
+                "customer_id": {
+                    "type": "integer",
+                    "description": "ERP 客户 ID",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回最近多少笔（默认 5）；如无特别要求传 5",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query"],
+}
+
+CHECK_INVENTORY_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "check_inventory",
+        "strict": True,
+        "description": "商品库存简查",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["product_id"],
+            "properties": {
+                "product_id": {
+                    "type": "integer",
+                    "description": "ERP 商品 ID",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query", "adjust_stock"],
+}
+
+SEARCH_ORDERS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "search_orders",
+        "strict": True,
+        "description": "按条件搜订单",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["customer_id", "since_days"],
+            "properties": {
+                "customer_id": {
+                    "type": "integer",
+                    "description": "客户 ID（可选过滤）；如不限客户传 0（0 表示不过滤）",
+                },
+                "since_days": {
+                    "type": "integer",
+                    "description": "最近几天的订单（默认 30）；如无特别要求传 30",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query", "voucher"],
+}
+
+GET_ORDER_DETAIL_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "get_order_detail",
+        "strict": True,
+        "description": "订单详情",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["order_id"],
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ERP 订单 ID",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query", "voucher"],
+}
+
+GET_CUSTOMER_BALANCE_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "get_customer_balance",
+        "strict": True,
+        "description": "客户余额（应收/已付/未付）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["customer_id"],
+            "properties": {
+                "customer_id": {
+                    "type": "integer",
+                    "description": "ERP 客户 ID",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query"],
+}
+
+GET_INVENTORY_AGING_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "get_inventory_aging",
+        "strict": True,
+        "description": "库龄超 N 天的滞销商品",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["threshold_days"],
+            "properties": {
+                "threshold_days": {
+                    "type": "integer",
+                    "description": "库龄阈值（天，默认 90）；如无特别要求传 90",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query"],
+}
+
+# 所有读 tool schema 的聚合列表（供测试 / Task 2.5 导入）
+ALL_READ_SCHEMAS: list[dict] = [
+    SEARCH_PRODUCTS_SCHEMA,
+    SEARCH_CUSTOMERS_SCHEMA,
+    GET_PRODUCT_DETAIL_SCHEMA,
+    GET_CUSTOMER_HISTORY_SCHEMA,
+    CHECK_INVENTORY_SCHEMA,
+    SEARCH_ORDERS_SCHEMA,
+    GET_ORDER_DETAIL_SCHEMA,
+    GET_CUSTOMER_BALANCE_SCHEMA,
+    GET_INVENTORY_AGING_SCHEMA,
+]
+
+
 # === 9 个读 tool ===
 
 async def search_products(query: str, *, acting_as_user_id: int) -> dict:
@@ -46,6 +265,7 @@ async def search_products(query: str, *, acting_as_user_id: int) -> dict:
     Args:
         query: 关键字
     """
+    # sentinel 归一化（spec §1.3 v3.4）：query 为必填，不归一化
     return await current_erp_adapter().search_products(
         query=query, acting_as_user_id=acting_as_user_id,
     )
@@ -57,6 +277,7 @@ async def search_customers(query: str, *, acting_as_user_id: int) -> dict:
     Args:
         query: 关键字
     """
+    # sentinel 归一化（spec §1.3 v3.4）：query 为必填，不归一化
     return await current_erp_adapter().search_customers(
         query=query, acting_as_user_id=acting_as_user_id,
     )
@@ -118,9 +339,12 @@ async def search_orders(
     """搜订单（按客户 + 最近 N 天）。
 
     Args:
-        customer_id: 客户 ID（可选）
+        customer_id: 客户 ID（可选，strict schema 用 0 表示"不过滤"）
         since_days: 最近几天的订单（默认 30）
     """
+    # sentinel 归一化（spec §1.3 v3.4）：strict schema 要求 customer_id 为 required，
+    # LLM 传 0 表示"不指定客户" → 归一化成 None，不发给 ERP 查询作 ID 过滤条件
+    customer_id = customer_id or None
     since = datetime.now(UTC) - timedelta(days=since_days)
     return await current_erp_adapter().search_orders(
         customer_id=customer_id, since=since,
@@ -170,6 +394,10 @@ async def get_inventory_aging(
 def register_all(registry: ToolRegistry) -> None:
     """把 9 个 ERP 读 tool 全部注册到 registry。
 
+    双轨注册策略（Plan 6 v9 Task 2.3）：
+    1. 旧式函数注册（_tools 表）：供 registry.call() 权限校验 + 实际调用
+    2. dict-schema 注册（_schema_registry 表）：供 subgraph 过滤 / Task 2.5 enforce_strict
+
     perm 命名约定：`usecase.<verb>.<resource>`；READ 类不需声明 confirmation_action_id。
     聚合 tool（analyze_top_customers / analyze_slow_moving_products）在 Task 9 注册。
 
@@ -178,6 +406,7 @@ def register_all(registry: ToolRegistry) -> None:
        has_permission 会全返 False 导致 LLM 看不到这些 tool。集成顺序：
        Task 17 (seed) → Task 6 (ChainAgent 调 register_all) → 跑通。
     """
+    # ── 路径 1：旧式函数注册（供 registry.call() 走权限校验 + fn 调用）──
     registry.register(
         "search_products", search_products,
         perm="usecase.query_product.use",
@@ -232,3 +461,7 @@ def register_all(registry: ToolRegistry) -> None:
         tool_type=ToolType.READ,
         description="库龄超 N 天的滞销商品",
     )
+
+    # ── 路径 2：dict-schema 注册（供 subgraph 过滤 + Task 2.5 enforce_strict）──
+    for schema in ALL_READ_SCHEMAS:
+        registry.register(schema)

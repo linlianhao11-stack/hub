@@ -1,6 +1,8 @@
 # hub/agent/tools/analyze_tools.py
 """Plan 6 Task 9：聚合分析 tool（高级能力）。
 
+Plan 6 v9 Task 2.3：2 个分析 tool strict schema + sentinel 归一化（spec §1.3 / §5.2）。
+
 设计要点：
 - 内部组合多个读 tool（多次 erp.search_orders 拉数据 + HUB 端聚合）
 - **不直连 ERP DB**（坚持 HUB → ERP HTTP 边界）
@@ -24,6 +26,68 @@ MAX_ORDERS = 1000
 MAX_PERIOD_DAYS = 90
 PER_PAGE = 200
 DEFAULT_PERIOD = "last_month"
+
+
+# ===== Plan 6 v9 Task 2.3：strict tool schema（spec §1.3 / §5.2）=====
+
+ANALYZE_TOP_CUSTOMERS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "analyze_top_customers",
+        "strict": True,
+        "description": "分析近 N 天客户销售排行（top N 客户 + 总额/订单数/均单）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["period", "top_n"],
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "description": (
+                        "时间窗口（如 'last_week' / 'last_month' / '近 30 天'）；"
+                        "如无特别要求传 'last_month'"
+                    ),
+                },
+                "top_n": {
+                    "type": "integer",
+                    "description": "返回前 N 名（默认 10，最大 100）；如无特别要求传 10",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query"],
+}
+
+ANALYZE_SLOW_MOVING_PRODUCTS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "analyze_slow_moving_products",
+        "strict": True,
+        "description": "找库龄超 N 天的滞销商品（按库存价值倒序）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["threshold_days", "top_n"],
+            "properties": {
+                "threshold_days": {
+                    "type": "integer",
+                    "description": "库龄阈值（天，默认 90）；如无特别要求传 90",
+                },
+                "top_n": {
+                    "type": "integer",
+                    "description": "最多返多少（默认 50）；如无特别要求传 50",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["query"],
+}
+
+# 所有分析 tool schema 的聚合列表（供测试 / Task 2.5 导入）
+ALL_ANALYZE_SCHEMAS: list[dict] = [
+    ANALYZE_TOP_CUSTOMERS_SCHEMA,
+    ANALYZE_SLOW_MOVING_PRODUCTS_SCHEMA,
+]
 
 
 def _parse_period_days(period: str | None) -> int:
@@ -85,6 +149,8 @@ async def analyze_top_customers(
           "notes": str | None,
         }
     """
+    # sentinel 归一化（spec §1.3 v3.4）：period="" → 用默认值 DEFAULT_PERIOD
+    period = period or DEFAULT_PERIOD
     top_n = max(1, min(top_n, 100))
     raw_days = _parse_period_days(period)
     days = min(raw_days, MAX_PERIOD_DAYS)
@@ -227,10 +293,15 @@ async def analyze_slow_moving_products(
 def register_all(registry: ToolRegistry) -> None:
     """2 个 READ 类聚合 tool 注册（不需 confirmation_action_id）。
 
+    双轨注册策略（Plan 6 v9 Task 2.3）：
+    1. 旧式函数注册（_tools 表）：供 registry.call() 权限校验 + 实际调用
+    2. dict-schema 注册（_schema_registry 表）：供 subgraph 过滤 / Task 2.5 enforce_strict
+
     perm:
     - analyze_top_customers: usecase.analyze.use（与"客户销售分析"对应）
     - analyze_slow_moving_products: usecase.analyze.use
     """
+    # ── 路径 1：旧式函数注册 ──
     registry.register(
         "analyze_top_customers", analyze_top_customers,
         perm="usecase.analyze.use",
@@ -243,3 +314,7 @@ def register_all(registry: ToolRegistry) -> None:
         tool_type=ToolType.READ,
         description="找库龄超 N 天的滞销商品（按库存价值倒序）",
     )
+
+    # ── 路径 2：dict-schema 注册（供 subgraph 过滤 + Task 2.5 enforce_strict）──
+    for schema in ALL_ANALYZE_SCHEMAS:
+        registry.register(schema)
