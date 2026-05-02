@@ -12,6 +12,35 @@ def pytest_configure(config):
         "markers",
         "eval: 真实 LLM eval 测试（CI 默认跳过；Task 19 单独跑 pytest -m eval）",
     )
+    _load_dotenv_for_realllm_tests()
+
+
+def _load_dotenv_for_realllm_tests() -> None:
+    """Plan 6 v9 realllm 测试支持：从项目根 .env 加载 DEEPSEEK_API_KEY。
+
+    .env 已经在 .gitignore 里（包含 HUB_MASTER_KEY 等本地 secret）。
+    Plan 6 v9 跑真 LLM 测试需要 DEEPSEEK_API_KEY，统一从 .env 读，
+    不必每次 export。如果 env 里已显式 export，优先用 export 的值。
+    """
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return  # 已显式 export，优先
+    # 项目根 .env：backend/.. → 仓库根
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            # 只 setdefault，不覆盖已 export 的
+            if key and value:
+                os.environ.setdefault(key, value)
+    except OSError:
+        return  # 读不动就算，realllm 测试按 skipif 自动 SKIP
 
 # 让测试能 import backend/main.py（不在 hub/ 包内）
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
