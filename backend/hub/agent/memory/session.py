@@ -53,20 +53,63 @@ class SessionMemory:
         """v8 review #13 (state reducer) + #16/#19 (per-user 隔离)。"""
         return f"{self._user_prefix(conversation_id, hub_user_id)}:round_state"
 
-    async def append(self, conversation_id: str, hub_user_id: int, *,
-                     role: str, content: str,
-                     tool_call_id: str | None = None) -> None:
-        """追加一条消息到会话历史（per-user 隔离）。"""
-        msg = json.dumps({
-            "role": role,
-            "content": content,
-            "tool_call_id": tool_call_id,
-        }, ensure_ascii=False)
+    async def append(
+        self,
+        conversation_id: str,
+        hub_user_id: int,
+        *,
+        role: str | None = None,
+        content: str | None = None,
+        tool_call_id: str | None = None,
+        message: dict | None = None,
+    ) -> None:
+        """追加一条消息到会话历史（per-user 隔离）。
+
+        支持两种调用方式：
+        1. 传统：append(conv, user, role="user", content="...")
+        2. 字典：append(conv, user, message={"role": "user", "content": "...", ...})
+
+        DeepSeek 多轮陷阱：assistant 消息存进 Redis 前必须剥离 reasoning_content
+        （否则下一轮拼回 messages 数组送 DeepSeek 会 400）。
+        """
+        if message is not None:
+            # 字典模式
+            msg_dict = dict(message)  # 拷贝避免改外面
+        else:
+            # 旧 kwargs 模式
+            if role is None:
+                raise TypeError("append 需要传 message= 或 role=/content=")
+            msg_dict = {
+                "role": role,
+                "content": content or "",
+                "tool_call_id": tool_call_id,
+            }
+
+        # DeepSeek 多轮陷阱：剥离 assistant 的 reasoning_content
+        if msg_dict.get("role") == "assistant" and "reasoning_content" in msg_dict:
+            msg_dict = {k: v for k, v in msg_dict.items() if k != "reasoning_content"}
+
+        payload = json.dumps(msg_dict, ensure_ascii=False)
         key = self._msgs_key(conversation_id, hub_user_id)
         async with self.redis.pipeline(transaction=False) as pipe:
-            pipe.rpush(key, msg)
+            pipe.rpush(key, payload)
             pipe.expire(key, self.TTL)
             await pipe.execute()
+
+    async def get_messages(
+        self, conversation_id: str, hub_user_id: int,
+    ) -> list[dict]:
+        """读出消息列表（dict 形式，per-user 隔离）。
+
+        与 load() 不同，这里返回的是 raw dict（保留所有字段），
+        供 GraphAgent 直接拼回 DeepSeek API messages 数组。
+        """
+        key = self._msgs_key(conversation_id, hub_user_id)
+        raw_msgs = await self.redis.lrange(key, 0, -1)
+        return [
+            json.loads(m if isinstance(m, str) else m.decode())
+            for m in (raw_msgs or [])
+        ]
 
     async def add_entity_refs(self, conversation_id: str, hub_user_id: int, *,
                               customer_ids: Iterable[int] | None = None,
