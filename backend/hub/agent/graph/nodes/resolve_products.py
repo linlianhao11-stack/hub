@@ -43,17 +43,21 @@ async def resolve_products_node(
     llm: DeepSeekLLMClient,
     tool_executor: Callable[[str, dict], Awaitable[object]],
 ) -> ContractState:
+    # NOTE: 所有 state 列表/字典字段必须用整字段替换（field reassignment）而不是 in-place 修改，
+    # 否则 LangGraph 0.2.x 的 model_fields_set 判断会丢弃更新。
     if state.products and not state.candidate_products:
         return state
 
     if state.candidate_products:
         groups = list(state.candidate_products.items())
+        new_products = list(state.products)
         # 单组候选：照旧消费（"选 N" / 名字 / id=N 都允许）
         if len(groups) == 1:
             hint, candidates = groups[0]
             chosen = _try_consume_product_selection(state.user_message, candidates)
             if chosen:
-                state.products.append(chosen)
+                new_products.append(chosen)
+                state.products = new_products
                 state.missing_fields = [
                     m for m in state.missing_fields if m != f"product_choice:{hint}"
                 ]
@@ -65,15 +69,16 @@ async def resolve_products_node(
         msg = state.user_message or ""
         ids_in_msg = {int(x) for x in _re.findall(r"id\s*[=:：]?\s*(\d+)", msg, _re.IGNORECASE)}
         new_candidate_products: dict = {}
+        new_missing = list(state.missing_fields)
         for hint, candidates in groups:
             chosen = next((p for p in candidates if p.id in ids_in_msg), None)
             if chosen:
-                state.products.append(chosen)
-                state.missing_fields = [
-                    m_ for m_ in state.missing_fields if m_ != f"product_choice:{hint}"
-                ]
+                new_products.append(chosen)
+                new_missing = [m_ for m_ in new_missing if m_ != f"product_choice:{hint}"]
             else:
                 new_candidate_products[hint] = candidates
+        state.products = new_products
+        state.missing_fields = new_missing
         state.candidate_products = new_candidate_products
         return state
 
@@ -89,54 +94,65 @@ async def resolve_products_node(
         tool_class=ToolClass.READ,
     )
     if not resp.tool_calls:
-        state.errors.append("resolve_products_no_tool_call")
-        state.missing_fields.append("products")
+        state.errors = list(state.errors) + ["resolve_products_no_tool_call"]
+        state.missing_fields = list(state.missing_fields) + ["products"]
         return state
 
     hints = state.extracted_hints.get("product_hints") or []
+
+    new_products = list(state.products)
+    new_missing = list(state.missing_fields)
+    new_candidates = dict(state.candidate_products)
+
     if not hints:
         # 兜底：单次合并搜
         args = json.loads(resp.tool_calls[0]["function"]["arguments"])
         results = await tool_executor("search_products", args)
         if not results:
-            state.missing_fields.append("products")
+            state.missing_fields = new_missing + ["products"]
             return state
         if len(results) == 1:
             r = results[0]
-            state.products.append(ProductInfo(id=r["id"], name=r["name"],
-                                                sku=r.get("sku"), color=r.get("color"),
-                                                spec=r.get("spec"), list_price=r.get("list_price")))
+            new_products.append(ProductInfo(id=r["id"], name=r["name"],
+                                             sku=r.get("sku"), color=r.get("color"),
+                                             spec=r.get("spec"), list_price=r.get("list_price")))
+            state.products = new_products
         else:
-            state.candidate_products["__merged__"] = [
+            new_candidates["__merged__"] = [
                 ProductInfo(id=r["id"], name=r["name"], sku=r.get("sku"),
                               color=r.get("color"), spec=r.get("spec"))
                 for r in results
             ]
-            state.missing_fields.append("product_choice:__merged__")
+            state.candidate_products = new_candidates
+            state.missing_fields = new_missing + ["product_choice:__merged__"]
         return state
 
     # 每个 hint 单独搜
     for hint in hints:
         results = await tool_executor("search_products", {"query": hint})
         if len(results) == 0:
-            state.missing_fields.append(f"product_not_found:{hint}")
+            new_missing.append(f"product_not_found:{hint}")
             continue
         if len(results) == 1:
             r = results[0]
-            state.products.append(ProductInfo(
+            new_products.append(ProductInfo(
                 id=r["id"], name=r["name"], sku=r.get("sku"),
                 color=r.get("color"), spec=r.get("spec"),
                 list_price=r.get("list_price"),
             ))
             continue
-        state.candidate_products[hint] = [
+        new_candidates[hint] = [
             ProductInfo(id=r["id"], name=r["name"], sku=r.get("sku"),
                           color=r.get("color"), spec=r.get("spec"),
                           list_price=r.get("list_price"))
             for r in results
         ]
-        state.missing_fields.append(f"product_choice:{hint}")
+        new_missing.append(f"product_choice:{hint}")
+
+    state.products = new_products
+    state.candidate_products = new_candidates
+    state.missing_fields = new_missing
 
     if not state.products and not state.candidate_products:
-        state.missing_fields.append("products")
+        state.missing_fields = state.missing_fields + ["products"]
     return state

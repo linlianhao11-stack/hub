@@ -34,13 +34,14 @@ async def validate_inputs_node(state: ContractState, *, llm: DeepSeekLLMClient) 
         ],
         thinking=enable_thinking(),
         temperature=0.0,
-        max_tokens=300,
+        max_tokens=1500,
     )
     try:
         parsed = json.loads(resp.text)
+        # 整字段替换 — 避免 LangGraph model_fields_set 陷阱
         state.missing_fields = parsed.get("missing_fields", [])
         if parsed.get("warnings"):
-            state.errors.extend(parsed["warnings"])
+            state.errors = list(state.errors) + list(parsed["warnings"])
     except json.JSONDecodeError:
-        state.errors.append("validate_inputs_json_decode_failed")
+        state.errors = list(state.errors) + ["validate_inputs_json_decode_failed"]
     return state

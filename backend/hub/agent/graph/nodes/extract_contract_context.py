@@ -8,11 +8,20 @@ v1.8 P1-A+B：
 跨轮规则：
   - state.extracted_hints 已有值 + 本轮消息短（≤ 8 字）→ 跳过 LLM
   - 抽到的字段为 null 时**不**覆盖 state 已有值（保护跨轮信息）
+
+v1.14 状态更新规则（LangGraph model_fields_set 陷阱）：
+  - LangGraph 0.2.x 用 model_fields_set 判断哪些字段被更新，只传播被"赋值"的字段。
+  - 在 Pydantic 模型上对 dict 字段做 in-place 修改（state.extracted_hints["k"] = v）
+    或对嵌套模型做属性设置（state.shipping.address = ...）**不会**把字段加入 model_fields_set，
+    导致修改被 LangGraph 丢弃，下一节点看到的还是旧值。
+  - 修复方案：用 **整字段替换（field reassignment）** 代替原地修改：
+      state.extracted_hints = {**state.extracted_hints, "k": v}
+      state.shipping = ShippingInfo(address=..., ...)
 """
 from __future__ import annotations
 import json
 
-from hub.agent.graph.state import ContractState
+from hub.agent.graph.state import ContractState, ShippingInfo
 from hub.agent.llm_client import DeepSeekLLMClient, disable_thinking
 
 
@@ -107,7 +116,7 @@ async def extract_contract_context_node(state: ContractState, *, llm: DeepSeekLL
         ],
         thinking=disable_thinking(),
         temperature=0.0,
-        max_tokens=600,
+        max_tokens=1000,
     )
     try:
         parsed = json.loads(resp.text)
@@ -115,20 +124,21 @@ async def extract_contract_context_node(state: ContractState, *, llm: DeepSeekLL
         state.errors.append("extract_context_json_decode_failed")
         return state
 
-    # extracted_hints — 只在抽到非 null/empty 时写，避免覆盖跨轮已有值
+    # extracted_hints — 整字段替换（field reassignment），避免 LangGraph model_fields_set 陷阱
+    # 只在抽到非 null/empty 时合并，避免覆盖跨轮已有值
+    new_hints = dict(state.extracted_hints)
     if parsed.get("customer_name"):
-        state.extracted_hints["customer_name"] = parsed["customer_name"]
+        new_hints["customer_name"] = parsed["customer_name"]
     if parsed.get("product_hints"):
-        state.extracted_hints["product_hints"] = parsed["product_hints"]
+        new_hints["product_hints"] = parsed["product_hints"]
     if parsed.get("items_raw"):
-        state.extracted_hints["items_raw"] = parsed["items_raw"]
+        new_hints["items_raw"] = parsed["items_raw"]
+    state.extracted_hints = new_hints
 
-    # shipping — 同样的规则，只写抽到的非 null 字段
+    # shipping — 同样整字段替换（先读旧值，只覆盖有新值的字段）
     shipping = parsed.get("shipping") or {}
-    if shipping.get("address"):
-        state.shipping.address = shipping["address"]
-    if shipping.get("contact"):
-        state.shipping.contact = shipping["contact"]
-    if shipping.get("phone"):
-        state.shipping.phone = shipping["phone"]
+    new_address = shipping.get("address") or state.shipping.address
+    new_contact = shipping.get("contact") or state.shipping.contact
+    new_phone = shipping.get("phone") or state.shipping.phone
+    state.shipping = ShippingInfo(address=new_address, contact=new_contact, phone=new_phone)
     return state

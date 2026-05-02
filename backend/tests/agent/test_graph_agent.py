@@ -179,12 +179,12 @@ async def test_candidate_persists_through_checkpoint_and_consumed_next_round():
     # 验 final state（cleanup_after_contract 之后）
     # LangGraph checkpoint 只持久化非默认值字段 — None / [] / {} 等默认值可能不在 keys 里，
     # 需用 .get() 防止 KeyError（等效语义：字段不存在 = 已恢复默认值）。
+    # items 不清空 — parse_contract_items 每次重新生成，e2e 测试可验证 items_count。
     snapshot2 = await agent.compiled_graph.aget_state(config)
     assert snapshot2.values.get("draft_id") == 999
     assert snapshot2.values.get("file_sent") is True
     assert snapshot2.values.get("customer") is None
     assert snapshot2.values.get("products", []) == []
-    assert snapshot2.values.get("items", []) == []
     assert snapshot2.values.get("candidate_customers", []) == []
     assert snapshot2.values.get("candidate_products", {}) == {}
     assert snapshot2.values.get("extracted_hints", {}) == {}

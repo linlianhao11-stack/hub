@@ -48,7 +48,7 @@ async def extract_voucher_context_node(state: VoucherState, *, llm) -> VoucherSt
     try:
         parsed = json.loads(resp.text)
     except json.JSONDecodeError:
-        state.errors.append("extract_voucher_context_json_failed")
+        state.errors = list(state.errors) + ["extract_voucher_context_json_failed"]
         return state
     if parsed.get("order_id") is not None and state.order_id is None:
         state.order_id = int(parsed["order_id"])
@@ -61,24 +61,24 @@ async def preview_voucher_node(state: VoucherState, *, llm, gate, tool_executor)
     voucher_type = _resolve_voucher_type(state)
     if voucher_type is None:
         if "voucher_type" not in state.missing_fields:
-            state.missing_fields.append("voucher_type")
+            state.missing_fields = list(state.missing_fields) + ["voucher_type"]
         state.final_response = "请问要做出库凭证还是入库凭证？"
         return state
     state.voucher_type = voucher_type
 
     if state.order_id is None:
-        state.missing_fields.append("order_id")
+        state.missing_fields = list(state.missing_fields) + ["order_id"]
         state.final_response = "请提供订单号"
         return state
 
     order = await tool_executor("get_order_detail", {"order_id": state.order_id})
     if not order or order.get("status") != "approved":
-        state.errors.append(f"voucher_order_not_approved:{state.order_id}")
+        state.errors = list(state.errors) + [f"voucher_order_not_approved:{state.order_id}"]
         state.final_response = f"订单 {state.order_id} 未审批，不能出凭证"
         return state
     if order.get(f"{voucher_type}_voucher_count", 0) > 0:
         type_label = "出库" if voucher_type == "outbound" else "入库"
-        state.errors.append(f"voucher_already_exists:{state.order_id}:{voucher_type}")
+        state.errors = list(state.errors) + [f"voucher_already_exists:{state.order_id}:{voucher_type}"]
         state.final_response = f"订单 {state.order_id} 已有{type_label}凭证，不重复出"
         return state
 
@@ -122,7 +122,7 @@ async def preview_voucher_node(state: VoucherState, *, llm, gate, tool_executor)
         )
     except CrossContextIdempotency:
         # P1-B v1.3：跨 context 幂等命中必须 fail closed
-        state.errors.append(f"voucher_pending_in_other_context:{state.order_id}:{voucher_type}")
+        state.errors = list(state.errors) + [f"voucher_pending_in_other_context:{state.order_id}:{voucher_type}"]
         state.final_response = (
             f"订单 {state.order_id} 的{type_label}凭证已有凭证申请待确认/处理中，"
             f"请联系发起人或等待其完成。"
@@ -135,14 +135,14 @@ async def preview_voucher_node(state: VoucherState, *, llm, gate, tool_executor)
 
 async def commit_voucher_node(state: VoucherState, *, tool_executor) -> VoucherState:
     if not state.confirmed_payload:
-        state.errors.append("commit_voucher_no_payload")
+        state.errors = list(state.errors) + ["commit_voucher_no_payload"]
         state.final_response = "执行失败：没有找到确认的预览参数"
         return state
     args = state.confirmed_payload["args"]
     try:
         result = await tool_executor(state.confirmed_payload["tool_name"], args)
     except Exception as e:
-        state.errors.append(f"commit_voucher_failed:{e}")
+        state.errors = list(state.errors) + [f"commit_voucher_failed:{e}"]
         state.final_response = f"凭证提交失败：{e}"
         return state
     state.voucher_id = (result or {}).get("voucher_id")

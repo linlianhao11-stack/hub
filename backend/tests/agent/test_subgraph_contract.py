@@ -79,7 +79,8 @@ async def test_cleanup_after_contract_clears_complete_working_state():
 
     assert out.customer is None
     assert out.products == []
-    assert out.items == []
+    # items 保留（parse_contract_items 每次重新生成；保留供 e2e items_count 校验）
+    assert len(out.items) == 1  # 不被清空
     assert out.shipping.address is None
     assert out.shipping.contact is None
     assert out.shipping.phone is None

@@ -95,6 +95,26 @@ async def test_action_id_is_full_32_hex(gate):
 
 
 @pytest.mark.asyncio
+async def test_pick_product_bridges_products_to_product():
+    """v1.16 fix: resolve_products 写 state.products → pick_product 节点把 products[0] 写到 state.product。"""
+    from hub.agent.graph.subgraphs.adjust_price import pick_product_from_products_node
+    state = AdjustPriceState(user_message="x", hub_user_id=1, conversation_id="c1")
+    state.products = [ProductInfo(id=1, name="X1")]
+    out = await pick_product_from_products_node(state)
+    assert out.product is not None
+    assert out.product.id == 1
+
+
+@pytest.mark.asyncio
+async def test_adjust_price_subgraph_includes_pick_product_node():
+    """v1.16 fix: 子图必须有 pick_product 节点，否则 fetch_history 永远跳过。"""
+    from hub.agent.graph.subgraphs.adjust_price import build_adjust_price_subgraph
+    compiled = build_adjust_price_subgraph(llm=AsyncMock(), gate=AsyncMock(), tool_executor=AsyncMock())
+    nodes = set(compiled.get_graph().nodes)
+    assert "pick_product" in nodes
+
+
+@pytest.mark.asyncio
 async def test_commit_uses_confirmed_payload_not_state(gate):
     """commit 节点必须从 state.confirmed_payload 取参数，不能从 state.customer/product 取。"""
     from hub.agent.graph.subgraphs.adjust_price import commit_adjust_price_node

@@ -12,7 +12,7 @@ turns:
     tool_caps:
       check_inventory: 0     # 第二轮绝对不能再查 — 物理不挂
       search_customers: 1
-      search_products: 1     # 合并搜 H5/F1/K5
+      search_products: {min: 1, max: 5}  # 1次合并搜 或 每 hint 单独搜（H5/F1/K5=3次）均可
       generate_contract_draft: 1
     sent_files_min: 1
     items_count: 3

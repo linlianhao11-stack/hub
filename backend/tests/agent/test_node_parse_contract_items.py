@@ -121,6 +121,26 @@ async def test_parse_items_falls_back_to_llm_when_hint_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_parse_items_max_tokens_at_least_1500_for_multi_product():
+    """v1.16 fix: 3+ 产品的 contract parse 需要 ≥ 1500 max_tokens 才不被截断。"""
+    state = ContractState(user_message="H5 10 个 300, F1 10 个 500, K5 20 个 300",
+                            hub_user_id=1, conversation_id="c1")
+    state.products = [ProductInfo(id=1, name="H5"), ProductInfo(id=2, name="F1"), ProductInfo(id=3, name="K5")]
+    llm = AsyncMock()
+    llm.chat = AsyncMock(return_value=type("R", (), {
+        "text": json.dumps({"items": [
+            {"product_id": 1, "qty": 10, "price": 300},
+            {"product_id": 2, "qty": 10, "price": 500},
+            {"product_id": 3, "qty": 20, "price": 300},
+        ]}),
+        "finish_reason": "stop", "tool_calls": [],
+    })())
+    await parse_contract_items_node(state, llm=llm)
+    kw = llm.chat.await_args.kwargs
+    assert kw["max_tokens"] >= 1500, f"max_tokens {kw['max_tokens']} 太低，3+ 产品会截断"
+
+
+@pytest.mark.asyncio
 async def test_parse_items_fallback_uses_items_raw_not_user_message():
     """P1-B v1.10：跨轮 user_message='选 2' + items_raw 非空时
     fallback prompt 必须传 items_raw，不传 user_message（避免 LLM 看到"选 2"无法对齐）。"""

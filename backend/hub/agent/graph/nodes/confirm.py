@@ -43,7 +43,8 @@ async def confirm_node(state: AgentState, *, gate: ConfirmGate) -> AgentState:
         )
     except Exception as e:
         state.final_response = f"该确认已失效或属于他人：{e}"
-        state.errors.append(f"confirm_claim_failed:{e}")
+        # 整字段替换 — 避免 LangGraph model_fields_set 陷阱
+        state.errors = list(state.errors) + [f"confirm_claim_failed:{e}"]
         return state
 
     state.errors = []

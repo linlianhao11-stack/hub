@@ -58,13 +58,16 @@ async def extract_adjust_price_context_node(state: AdjustPriceState, *, llm) -> 
     try:
         parsed = json.loads(resp.text)
     except (json.JSONDecodeError, TypeError):
-        state.errors.append("extract_adjust_price_context_json_failed")
+        state.errors = list(state.errors) + ["extract_adjust_price_context_json_failed"]
         return state
 
+    # 整字段替换（field reassignment）— 避免 LangGraph model_fields_set 陷阱
+    new_hints = dict(state.extracted_hints)
     if parsed.get("customer_name"):
-        state.extracted_hints["customer_name"] = parsed["customer_name"]
+        new_hints["customer_name"] = parsed["customer_name"]
     if parsed.get("product_hints"):
-        state.extracted_hints["product_hints"] = parsed["product_hints"]
+        new_hints["product_hints"] = parsed["product_hints"]
+    state.extracted_hints = new_hints
     if parsed.get("new_price") is not None:
         state.new_price = Decimal(str(parsed["new_price"]))
     return state
@@ -88,7 +91,7 @@ async def fetch_history_node(state: AdjustPriceState, *, tool_executor) -> Adjus
         if prices:
             state.old_price = prices[0]
     except Exception as e:
-        state.errors.append(f"fetch_history_failed:{e}")
+        state.errors = list(state.errors) + [f"fetch_history_failed:{e}"]
     return state
 
 
@@ -145,17 +148,28 @@ async def preview_adjust_price_node(
 async def commit_adjust_price_node(state: AdjustPriceState, *, tool_executor) -> AdjustPriceState:
     """从 state.confirmed_payload 执行 — 不依赖当前 state.customer/product。"""
     if not state.confirmed_payload:
-        state.errors.append("commit_adjust_price_no_payload")
+        state.errors = list(state.errors) + ["commit_adjust_price_no_payload"]
         state.final_response = "执行失败：没有找到确认的预览参数"
         return state
     args = state.confirmed_payload["args"]
     try:
         await tool_executor(state.confirmed_payload["tool_name"], args)
     except Exception as e:
-        state.errors.append(f"commit_adjust_price_failed:{e}")
+        state.errors = list(state.errors) + [f"commit_adjust_price_failed:{e}"]
         state.final_response = f"调价提交失败：{e}"
         return state
     state.final_response = "调价已申请，等待审核"
+    return state
+
+
+async def pick_product_from_products_node(state: AdjustPriceState) -> AdjustPriceState:
+    """从 resolve_products 写到 state.products 的列表里取第一个写入 state.product。
+
+    AdjustPriceState 用单值 product (调价针对单个产品)；resolve_products 复用
+    AgentState.products 列表 — 这个节点是 state machine 桥接。
+    """
+    if state.products and not state.product:
+        state.product = state.products[0]
     return state
 
 
@@ -186,6 +200,9 @@ def build_adjust_price_subgraph(*, llm, gate: ConfirmGate, tool_executor):
     async def _resolve_products(s: AdjustPriceState) -> AdjustPriceState:
         return await resolve_products_node(s, llm=llm, tool_executor=tool_executor)
 
+    async def _pick_product(s: AdjustPriceState) -> AdjustPriceState:
+        return await pick_product_from_products_node(s)
+
     async def _fetch_history(s: AdjustPriceState) -> AdjustPriceState:
         return await fetch_history_node(s, tool_executor=tool_executor)
 
@@ -200,6 +217,7 @@ def build_adjust_price_subgraph(*, llm, gate: ConfirmGate, tool_executor):
     g.add_node("extract_context", _extract_context)
     g.add_node("resolve_customer", _resolve_customer)
     g.add_node("resolve_products", _resolve_products)
+    g.add_node("pick_product", _pick_product)
     g.add_node("fetch_history", _fetch_history)
     g.add_node("preview", _preview)
     g.add_node("commit", _commit)
@@ -214,7 +232,8 @@ def build_adjust_price_subgraph(*, llm, gate: ConfirmGate, tool_executor):
     # preview 路径
     g.add_edge("extract_context", "resolve_customer")
     g.add_edge("resolve_customer", "resolve_products")
-    g.add_edge("resolve_products", "fetch_history")
+    g.add_edge("resolve_products", "pick_product")
+    g.add_edge("pick_product", "fetch_history")
     g.add_edge("fetch_history", "preview")
     g.add_edge("preview", END)
 

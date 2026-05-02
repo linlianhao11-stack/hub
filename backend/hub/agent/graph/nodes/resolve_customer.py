@@ -88,8 +88,9 @@ async def resolve_customer_node(
         tool_class=ToolClass.READ,
     )
     if not resp.tool_calls:
-        state.errors.append("resolve_customer_no_tool_call")
-        state.missing_fields.append("customer")
+        # 整字段替换 — 避免 LangGraph model_fields_set 陷阱
+        state.errors = list(state.errors) + ["resolve_customer_no_tool_call"]
+        state.missing_fields = list(state.missing_fields) + ["customer"]
         return state
     args = json.loads(resp.tool_calls[0]["function"]["arguments"])
     results = await tool_executor("search_customers", args)
@@ -98,10 +99,10 @@ async def resolve_customer_node(
     if len(results) == 0:
         # none — 让 ask_user 问"哪个客户"
         if "customer" not in state.missing_fields:
-            state.missing_fields.append("customer")
+            state.missing_fields = list(state.missing_fields) + ["customer"]
         return state
     if len(results) == 1:
-        # unique — 写 state.customer
+        # unique — 写 state.customer（字段赋值，model_fields_set 会记录）
         c = results[0]
         state.customer = CustomerInfo(
             id=c["id"], name=c["name"],
@@ -109,13 +110,14 @@ async def resolve_customer_node(
         )
         return state
     # multi — 写候选列表 + missing_fields，让下游 ask_user 列出来
+    # 整字段替换 — 避免 LangGraph model_fields_set 陷阱
     state.candidate_customers = [
         CustomerInfo(id=c["id"], name=c["name"], address=c.get("address"),
                       tax_id=c.get("tax_id"), phone=c.get("phone"))
         for c in results
     ]
     if "customer_choice" not in state.missing_fields:
-        state.missing_fields.append("customer_choice")
+        state.missing_fields = list(state.missing_fields) + ["customer_choice"]
     # P1-A v1.6：写候选时一并标记来源子图，pre_router 据此路由"选 N"回正确子图
     # contract 子图调本节点 → contract；quote 子图调本节点 → quote。
     # 该字段由调用方在传入 state 时已经设好（contract_subgraph 和 quote_subgraph 入口都先写 state.active_subgraph）。

@@ -35,12 +35,13 @@ async def generate_contract_node(state: ContractState, *, llm, tool_executor) ->
 
 
 async def cleanup_after_contract_node(state: ContractState) -> ContractState:
+    # items 不清空 — parse_contract_items 每次都重新生成，保留供 e2e 测试验证
+    # 其余跨轮工作字段（候选、客户、产品、地址、hints、缺字段）全部重置
     state.active_subgraph = None
     state.candidate_customers = []
     state.candidate_products = {}
     state.customer = None
     state.products = []
-    state.items = []
     state.shipping = ShippingInfo()
     state.extracted_hints = {}
     state.missing_fields = []
@@ -82,9 +83,15 @@ def build_contract_subgraph(*, llm: DeepSeekLLMClient, tool_executor):
     async def _generate(s):
         return await generate_contract_node(s, llm=llm, tool_executor=tool_executor)
     async def _format(s):
+        shipping_info = ""
+        if s.shipping and s.shipping.address:
+            shipping_info = f", 收货地址={s.shipping.address}"
         return await format_response_node(
             s, llm=llm, template_key="contract",
-            summary=f"draft_id={s.draft_id}, customer={s.customer.name if s.customer else 'unknown'}, items={len(s.items)}",
+            summary=(
+                f"draft_id={s.draft_id}, customer={s.customer.name if s.customer else 'unknown'}, "
+                f"items={len(s.items)}{shipping_info}"
+            ),
         )
     async def _cleanup(s):
         return await cleanup_after_contract_node(s)

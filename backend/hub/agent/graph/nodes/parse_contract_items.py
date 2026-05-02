@@ -36,14 +36,15 @@ PARSE_ITEMS_PROMPT = """你是合同 items 对齐器。读用户消息 + 已解�
 
 
 async def parse_contract_items_node(state: ContractState, *, llm: DeepSeekLLMClient) -> ContractState:
+    # NOTE: 所有 state 列表字段必须用整字段替换（field reassignment），避免 LangGraph model_fields_set 陷阱。
     if state.candidate_products:
         return state
     if not state.products:
         if "products" not in state.missing_fields:
-            state.missing_fields.append("products")
+            state.missing_fields = list(state.missing_fields) + ["products"]
         return state
 
-    products_for_prompt = [{"id": p.id, "name": p.name, "sku": p.sku} for p in state.products]
+    products_for_prompt = [{"id": p.id, "name": p.name, "sku": p.sku, "list_price": str(p.list_price) if p.list_price is not None else None} for p in state.products]
 
     items_raw = (state.extracted_hints or {}).get("items_raw")
     if items_raw:
@@ -56,8 +57,12 @@ async def parse_contract_items_node(state: ContractState, *, llm: DeepSeekLLMCli
                 None,
             )
             if matched:
+                # price=null 且产品有 list_price → 用 list_price 作为兜底（报价场景）
+                price = raw.get("price")
+                if price is None and matched.list_price is not None:
+                    price = float(matched.list_price)
                 parsed["items"].append({
-                    "product_id": matched.id, "qty": raw.get("qty"), "price": raw.get("price"),
+                    "product_id": matched.id, "qty": raw.get("qty"), "price": price,
                 })
         if len(parsed["items"]) != len(items_raw):
             parsed = None
@@ -77,32 +82,36 @@ async def parse_contract_items_node(state: ContractState, *, llm: DeepSeekLLMCli
             ],
             thinking=enable_thinking(),
             temperature=0.0,
-            max_tokens=600,
+            max_tokens=4000,
         )
         try:
             parsed = json.loads(resp.text)
         except json.JSONDecodeError:
-            state.errors.append("parse_items_json_decode_failed")
+            state.errors = list(state.errors) + ["parse_items_json_decode_failed"]
             return state
 
     name_by_id = {p.id: p.name for p in state.products}
     valid_items: list[ContractItem] = []
+    new_missing = list(state.missing_fields)
+    new_errors = list(state.errors)
     for raw in parsed.get("items", []):
         pid = raw.get("product_id")
         qty = raw.get("qty")
         price = raw.get("price")
         name = name_by_id.get(pid, str(pid))
         if qty is None or qty <= 0:
-            state.missing_fields.append(f"item_qty:{name}")
+            new_missing.append(f"item_qty:{name}")
             continue
         if price is None or price <= 0:
-            state.missing_fields.append(f"item_price:{name}")
+            new_missing.append(f"item_price:{name}")
             continue
         if pid not in name_by_id:
-            state.errors.append(f"parse_items_unknown_product_id:{pid}")
+            new_errors.append(f"parse_items_unknown_product_id:{pid}")
             continue
         valid_items.append(ContractItem(
             product_id=pid, name=name, qty=int(qty), price=Decimal(str(price)),
         ))
     state.items = valid_items
+    state.missing_fields = new_missing
+    state.errors = new_errors
     return state

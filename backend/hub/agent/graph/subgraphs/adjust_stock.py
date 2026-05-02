@@ -45,15 +45,18 @@ async def extract_adjust_stock_context_node(state: AdjustStockState, *, llm) -> 
     try:
         parsed = json.loads(resp.text)
     except (json.JSONDecodeError, TypeError):
-        state.errors.append("extract_adjust_stock_context_json_failed")
+        state.errors = list(state.errors) + ["extract_adjust_stock_context_json_failed"]
         return state
 
+    # 整字段替换（field reassignment）— 避免 LangGraph model_fields_set 陷阱
+    new_hints = dict(state.extracted_hints)
     if parsed.get("product_hints"):
-        state.extracted_hints["product_hints"] = parsed["product_hints"]
+        new_hints["product_hints"] = parsed["product_hints"]
+    if parsed.get("absolute_qty") is not None:
+        new_hints["absolute_qty"] = int(parsed["absolute_qty"])
+    state.extracted_hints = new_hints
     if parsed.get("delta_qty") is not None:
         state.delta_qty = int(parsed["delta_qty"])
-    if parsed.get("absolute_qty") is not None:
-        state.extracted_hints["absolute_qty"] = int(parsed["absolute_qty"])
     if parsed.get("reason"):
         state.reason = parsed["reason"]
     return state
@@ -74,13 +77,16 @@ async def fetch_inventory_node(state: AdjustStockState, *, tool_executor) -> Adj
         elif isinstance(result, dict):
             current_qty = result.get("qty")
         if current_qty is not None:
-            state.extracted_hints["current_qty"] = int(current_qty)
+            # 整字段替换 — 避免 LangGraph model_fields_set 陷阱
+            new_hints = dict(state.extracted_hints)
+            new_hints["current_qty"] = int(current_qty)
+            state.extracted_hints = new_hints
             # 用户说的是 absolute_qty → 算 delta
-            absolute_qty = state.extracted_hints.get("absolute_qty")
+            absolute_qty = new_hints.get("absolute_qty")
             if absolute_qty is not None and state.delta_qty is None:
                 state.delta_qty = int(absolute_qty) - int(current_qty)
     except Exception as e:
-        state.errors.append(f"fetch_inventory_failed:{e}")
+        state.errors = list(state.errors) + [f"fetch_inventory_failed:{e}"]
     return state
 
 
@@ -143,14 +149,14 @@ async def commit_adjust_stock_node(
 ) -> AdjustStockState:
     """从 state.confirmed_payload 执行 — 不依赖当前 state.product/delta_qty。"""
     if not state.confirmed_payload:
-        state.errors.append("commit_adjust_stock_no_payload")
+        state.errors = list(state.errors) + ["commit_adjust_stock_no_payload"]
         state.final_response = "执行失败：没有找到确认的预览参数"
         return state
     args = state.confirmed_payload["args"]
     try:
         await tool_executor(state.confirmed_payload["tool_name"], args)
     except Exception as e:
-        state.errors.append(f"commit_adjust_stock_failed:{e}")
+        state.errors = list(state.errors) + [f"commit_adjust_stock_failed:{e}"]
         state.final_response = f"库存调整提交失败：{e}"
         return state
     state.final_response = "库存调整已申请，等待审核"
