@@ -1,0 +1,13 @@
+# backend/tests/agent/fixtures/scenarios/story2_query.yaml
+# Plan 6 v9 Task 3.2 — 故事 2 acceptance fixture
+# 完整真 LLM 跑要等 Phase 7 GraphAgent 顶层接入后 Task 8.1 yaml driver 跑
+name: 故事 2：单轮查询 SKG 库存
+turns:
+  - input: "查 SKG 有哪些产品有库存"
+    expected_intent: query
+    tool_caps:
+      check_inventory: 1
+      generate_contract_draft: 0
+      create_price_adjustment_request: 0
+    must_contain: ["|"]  # Markdown 表格
+    forbid: ["是否需要做合同"]
