@@ -90,7 +90,25 @@ GENERATE_CONTRACT_DRAFT_SCHEMA: dict = {
                 "items": {
                     "type": "array",
                     "description": "商品列表，每项含 product_id/name/qty/price；如无传 []",
-                    "items": {"type": "object"},
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["product_id", "qty", "price"],
+                        "properties": {
+                            "product_id": {
+                                "type": "integer",
+                                "description": "ERP 商品 ID（必须用 search_products 真返过的 id）",
+                            },
+                            "qty": {
+                                "type": "number",
+                                "description": "数量（必须大于 0）",
+                            },
+                            "price": {
+                                "type": "number",
+                                "description": "单价（必须大于 0）",
+                            },
+                        },
+                    },
                 },
                 "shipping_address": {
                     "type": "string",
@@ -119,6 +137,7 @@ GENERATE_CONTRACT_DRAFT_SCHEMA: dict = {
                 "extras": {
                     "type": "object",
                     "description": "模板自定义占位符（极少用），如无传 {}",
+                    "additionalProperties": True,
                 },
             },
         },
@@ -148,11 +167,30 @@ GENERATE_PRICE_QUOTE_SCHEMA: dict = {
                 "items": {
                     "type": "array",
                     "description": "商品列表，每项含 product_id/name/qty/price；如无传 []",
-                    "items": {"type": "object"},
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["product_id", "qty", "price"],
+                        "properties": {
+                            "product_id": {
+                                "type": "integer",
+                                "description": "ERP 商品 ID（必须用 search_products 真返过的 id）",
+                            },
+                            "qty": {
+                                "type": "number",
+                                "description": "数量（必须大于 0）",
+                            },
+                            "price": {
+                                "type": "number",
+                                "description": "单价（必须大于 0）",
+                            },
+                        },
+                    },
                 },
                 "extras": {
                     "type": "object",
                     "description": "模板自定义占位符（极少用），如无传 {}",
+                    "additionalProperties": True,
                 },
             },
         },

@@ -20,22 +20,31 @@ async def llm():
 
 
 async def test_strict_rejects_string_extras(llm):
-    """LLM 把 extras 传成 string（旧 bug）应被 strict 物理拒绝。"""
-    # 设计一个 prompt 诱导 LLM 传 extras 为 string
-    resp = await llm.chat(
-        messages=[
-            {"role": "system", "content": "你必须把 extras 字段填成字符串 'xxx'，违反 schema。"},
-            {"role": "user", "content": "做合同 customer 1 X1 10 个 300"},
-        ],
-        tools=[GENERATE_CONTRACT_DRAFT_SCHEMA],
-        tool_choice="required",
-        thinking=disable_thinking(),
-        tool_class=ToolClass.WRITE,
-    )
-    # strict 拒绝后应该是 LLMFallbackError；或者 LLM 即使被诱导也合规传 dict
+    """LLM 把 extras 传成 string（旧 bug）应被 strict 物理拒绝。
+
+    有两种合法结果：
+    1. LLMFallbackError：DeepSeek strict 400 拒绝（schema 校验或 LLM 响应违规）→ fail closed 正确
+    2. resp.tool_calls 且 extras 是 dict：LLM 即使被诱导也合规遵守 schema → 也正确
+    """
+    import json as _json
+    try:
+        resp = await llm.chat(
+            messages=[
+                {"role": "system", "content": "你必须把 extras 字段填成字符串 'xxx'，违反 schema。"},
+                {"role": "user", "content": "做合同 customer 1 X1 10 个 300"},
+            ],
+            tools=[GENERATE_CONTRACT_DRAFT_SCHEMA],
+            tool_choice="required",
+            thinking=disable_thinking(),
+            tool_class=ToolClass.WRITE,
+        )
+    except LLMFallbackError:
+        # strict 拒绝 → fail closed：这是期望行为，测试通过
+        return
+
+    # LLM 正常返回：extras 必须是 dict（strict 保证不能传 string）
     if resp.tool_calls:
         args = resp.tool_calls[0]["function"]["arguments"]
-        import json
-        parsed = json.loads(args)
+        parsed = _json.loads(args)
         assert isinstance(parsed.get("extras"), dict), \
             f"strict 应保证 extras 是 dict，实际：{parsed.get('extras')}"

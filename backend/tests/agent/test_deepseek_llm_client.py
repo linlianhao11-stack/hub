@@ -4,6 +4,7 @@ from hub.agent.llm_client import (
     DeepSeekLLMClient,
     disable_thinking,
     LLMFallbackError,
+    _is_strict_violation,
 )
 
 
@@ -105,4 +106,64 @@ async def test_fallback_protocol_write_tool_fails_closed():
                                                                           "properties": {},
                                                                           "required": [],
                                                                           "additionalProperties": False}}}],
+            )
+
+
+# ===== _is_strict_violation 单测（spec §1.3 v3.4）=====
+
+def test_is_strict_violation_strict_keyword():
+    """含 'strict' 子串 → True。"""
+    assert _is_strict_violation("is not allowed by strict mode") is True
+
+
+def test_is_strict_violation_no_properties():
+    """DeepSeek 真实错误文本：'An object with no properties is not allowed.' → True。"""
+    assert _is_strict_violation("An object with no properties is not allowed.") is True
+
+
+def test_is_strict_violation_schema_validation_failed():
+    """'tool schema validation failed: foo' → True。"""
+    assert _is_strict_violation("tool schema validation failed: foo bar") is True
+
+
+def test_is_strict_violation_additional_properties():
+    """'additionalProperties not allowed' → True（大小写不敏感）。"""
+    assert _is_strict_violation("additionalProperties not allowed in strict schema") is True
+
+
+def test_is_strict_violation_unrelated_error():
+    """普通 500 内部错误 → False，不误判为 strict 违规。"""
+    assert _is_strict_violation("internal server error") is False
+
+
+def test_is_strict_violation_none_input():
+    """None 输入 → False（防 NoneType 崩溃）。"""
+    assert _is_strict_violation(None) is False
+
+
+def test_is_strict_violation_empty_string():
+    """空字符串 → False。"""
+    assert _is_strict_violation("") is False
+
+
+@pytest.mark.asyncio
+async def test_no_properties_error_triggers_llm_fallback_for_write_tool():
+    """DeepSeek 真实 400 消息 'An object with no properties is not allowed.'
+    → WRITE tool 路径应触发 LLMFallbackError（不是 raw httpx.HTTPStatusError）。
+    """
+    from hub.agent.llm_client import ToolClass
+    client = DeepSeekLLMClient(api_key="x", model="m")
+
+    async def raise_400_no_properties(*a, **kw):
+        from httpx import Response, Request, HTTPStatusError
+        resp = Response(400, request=Request("POST", "u"),
+                        json={"error": {"message": "An object with no properties is not allowed."}})
+        raise HTTPStatusError("400", request=resp.request, response=resp)
+
+    with patch.object(client._http, "post", side_effect=raise_400_no_properties):
+        with pytest.raises(LLMFallbackError):
+            await client.chat(
+                messages=[{"role": "user", "content": "x"}],
+                tool_class=ToolClass.WRITE,
+                tools=[],
             )

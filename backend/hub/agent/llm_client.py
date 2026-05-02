@@ -188,6 +188,26 @@ class LLMFallbackError(Exception):
 # 见 Task 0.5：在 hub/agent/tools/confirm_gate.py 唯一定义。
 
 
+def _is_strict_violation(response_text: str | None) -> bool:
+    """检测 DeepSeek strict mode 拒绝（spec §1.3 v3.4）。
+
+    DeepSeek beta 实际 400 文本可能是：
+    - "..is not allowed by strict.." (含 strict)
+    - "An object with no properties is not allowed." (schema 形状违规)
+    - "Tool schema validation failed: ..." (其他变体)
+    - "additionalProperties ..." (schema 属性违规)
+    """
+    if not response_text:
+        return False
+    text = response_text.lower()
+    return any(marker in text for marker in (
+        "strict",
+        "no properties is not allowed",
+        "schema validation failed",
+        "additionalproperties",
+    ))
+
+
 def disable_thinking() -> dict:
     """所有非 thinking 节点必须传这个（DeepSeek thinking 默认 enabled，spec §1.5）。"""
     return {"type": "disabled"}
@@ -282,7 +302,7 @@ class DeepSeekLLMClient:
                     await asyncio.sleep(wait)
                     continue
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 400 and "strict" in (e.response.text or "").lower():
+                if e.response.status_code == 400 and _is_strict_violation(e.response.text):
                     if tool_class == ToolClass.WRITE:
                         logger.error("strict 校验失败 write tool path → fail closed: %s", e.response.text)
                         raise LLMFallbackError(f"strict schema 校验失败：{e.response.text}") from e

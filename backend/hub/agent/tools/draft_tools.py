@@ -51,6 +51,7 @@ CREATE_VOUCHER_DRAFT_SCHEMA: dict = {
                 "voucher_data": {
                     "type": "object",
                     "description": "凭证内容，必须含 entries / total_amount / summary",
+                    "additionalProperties": True,
                 },
                 "rule_matched": {
                     "type": "string",
