@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import httpx
@@ -151,3 +153,191 @@ class AgentLLMClient:
             usage_completion_tokens=int(usage.get("completion_tokens") or 0),
             raw_message=msg,
         )
+
+
+# ====================================================================
+# === DeepSeekLLMClient (Plan 6 v9 GraphAgent — Task 0.4) ===
+# ====================================================================
+"""DeepSeekLLMClient — beta endpoint + prefix + strict + thinking + cache + 600s + 指数退避 + 5 finish_reason + 按 tool 类型 fallback。
+
+Spec ref：§1.1 / §1.2 / §1.5 / §1.6 / §1.7 / §1.8 / §1.10 / §12.1
+
+注意：保留作为 GraphAgent 的 LLM 适配层，**不**改用 langchain.ChatOpenAI 默认封装。
+LangChain 默认不暴露 prefix / strict / thinking / cache usage / finish_reason 语义。
+"""
+
+DEEPSEEK_BETA_URL = "https://api.deepseek.com/beta"
+DEEPSEEK_MAIN_URL = "https://api.deepseek.com"
+
+# 退避序列 — 高负载下避免快速重试加剧 429 / insufficient_system_resource
+DEFAULT_BACKOFF_SECONDS = (1.5, 5, 15, 60)
+DEFAULT_TIMEOUT_SECONDS = 600  # DeepSeek 动态速率，10 分钟 keep-alive
+
+
+class ToolClass(str, Enum):
+    """tool 类型分级 — fallback 协议按这个分（spec §12.1）。"""
+    READ = "read"      # search_*/get_*/check_*/analyze_* — 幂等查询
+    WRITE = "write"    # generate_*/adjust_*/create_*/_request — 有副作用
+
+
+class LLMFallbackError(Exception):
+    """写 tool 路径上 strict / beta 失败时 fail closed（spec §12.1）。"""
+
+
+# 注意：CrossContextClaim 属于 ConfirmGate 安全边界，**不**在 llm_client 定义。
+# 见 Task 0.5：在 hub/agent/tools/confirm_gate.py 唯一定义。
+
+
+def disable_thinking() -> dict:
+    """所有非 thinking 节点必须传这个（DeepSeek thinking 默认 enabled，spec §1.5）。"""
+    return {"type": "disabled"}
+
+
+def enable_thinking() -> dict:
+    return {"type": "enabled"}
+
+
+@dataclass
+class LLMResponse:
+    text: str
+    finish_reason: str
+    tool_calls: list[dict]
+    cache_hit_rate: float
+    usage: dict
+    raw: dict
+
+
+class DeepSeekLLMClient:
+    """Plan 6 GraphAgent 用的 LLM client。"""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = "deepseek-v4-flash",
+        base_url: str = DEEPSEEK_BETA_URL,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        max_retries: int = 4,
+        backoff_seconds: tuple[float, ...] = DEFAULT_BACKOFF_SECONDS,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.backoff_seconds = backoff_seconds
+        self._http = httpx.AsyncClient(timeout=timeout_seconds)
+
+    async def aclose(self):
+        await self._http.aclose()
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict = "auto",
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        stop: list[str] | None = None,
+        thinking: dict | None = None,
+        tool_class: ToolClass | None = None,
+        prefix_assistant: str | None = None,
+    ) -> LLMResponse:
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": list(messages),
+            "temperature": temperature,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = tool_choice
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        if stop:
+            body["stop"] = stop
+        body["thinking"] = thinking if thinking is not None else disable_thinking()
+        if prefix_assistant is not None:
+            body["messages"] = [
+                *body["messages"],
+                {"role": "assistant", "content": prefix_assistant, "prefix": True},
+            ]
+        return await self._call_with_retry(body=body, tool_class=tool_class)
+
+    async def _call_with_retry(
+        self, *, body: dict, tool_class: ToolClass | None,
+    ) -> LLMResponse:
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                return await self._call_once(body=body)
+            except _RetryableError as e:
+                last_exc = e
+                if attempt + 1 < self.max_retries:
+                    wait = self.backoff_seconds[min(attempt, len(self.backoff_seconds) - 1)]
+                    logger.warning(
+                        "DeepSeek retry attempt=%d wait=%.1fs reason=%s",
+                        attempt + 1, wait, e,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400 and "strict" in (e.response.text or "").lower():
+                    if tool_class == ToolClass.WRITE:
+                        logger.error("strict 校验失败 write tool path → fail closed: %s", e.response.text)
+                        raise LLMFallbackError(f"strict schema 校验失败：{e.response.text}") from e
+                raise
+        if last_exc is None:
+            raise RuntimeError("retry 循环异常")
+        if tool_class == ToolClass.WRITE:
+            raise LLMFallbackError(f"达到 max_retries 仍失败：{last_exc}") from last_exc
+        raise last_exc
+
+    async def _call_once(self, *, body: dict) -> LLMResponse:
+        try:
+            resp = await self._http.post(
+                url=f"{self.base_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=body,
+                timeout=self.timeout_seconds,
+            )
+            resp.raise_for_status()
+        except httpx.TimeoutException as e:
+            raise _RetryableError(f"timeout: {e}") from e
+        except httpx.TransportError as e:
+            raise _RetryableError(f"transport: {e}") from e
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code in (408, 425, 429) or 500 <= code < 600:
+                raise _RetryableError(f"{code}: {e.response.text}") from e
+            raise
+
+        data = resp.json()
+        choice = data["choices"][0]
+        message = choice["message"]
+        finish_reason = choice.get("finish_reason", "stop")
+
+        if finish_reason == "insufficient_system_resource":
+            raise _RetryableError("insufficient_system_resource")
+        if finish_reason == "content_filter":
+            logger.warning("content_filter 拦截：messages=%s", body.get("messages"))
+        if finish_reason == "length":
+            logger.warning("撞 max_tokens — 截断告警，考虑缩短 prompt 或调大 max_tokens")
+
+        usage = data.get("usage", {})
+        hit = usage.get("prompt_cache_hit_tokens", 0)
+        miss = usage.get("prompt_cache_miss_tokens", 0)
+        cache_hit_rate = hit / max(hit + miss, 1)
+
+        return LLMResponse(
+            text=message.get("content") or "",
+            finish_reason=finish_reason,
+            tool_calls=message.get("tool_calls") or [],
+            cache_hit_rate=cache_hit_rate,
+            usage=usage,
+            raw=data,
+        )
+
+
+class _RetryableError(Exception):
+    """内部用 — 标记可退避重试的错误。"""
