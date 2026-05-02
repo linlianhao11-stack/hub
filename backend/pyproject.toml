@@ -67,6 +67,7 @@ filterwarnings = [
 ]
 markers = [
     "eval: 真实 LLM eval 测试（CI 默认跳过；Task 19 单独跑 pytest -m eval）",
+    "realllm: 真实 LLM 集成测试（需要 DEEPSEEK_API_KEY；无 key 时全 skip）",
 ]
 
 [tool.ruff]
