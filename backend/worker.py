@@ -20,20 +20,13 @@ async def main():
 
     from hub.adapters.channel.dingtalk_sender import DingTalkSender
     from hub.adapters.downstream.erp4 import Erp4Adapter
-    from hub.agent.chain_agent import ChainAgent
-    from hub.agent.context_builder import ContextBuilder
-    from hub.agent.llm_client import AgentLLMClient
-    from hub.agent.memory.loader import MemoryLoader
-    from hub.agent.memory.persistent import (
-        CustomerMemoryService,
-        ProductMemoryService,
-        UserMemoryService,
-    )
+    from hub.agent.graph.agent import GraphAgent
+    from hub.agent.llm_client import DeepSeekLLMClient
     from hub.agent.memory.session import SessionMemory
-    from hub.agent.prompt.builder import PromptBuilder
     from hub.agent.tools import analyze_tools, draft_tools, erp_tools, generate_tools
     from hub.agent.tools.confirm_gate import ConfirmGate
     from hub.agent.tools.registry import ToolRegistry
+    from hub.agent.types import AgentResult
     from hub.capabilities.factory import load_active_ai_provider
     from hub.crypto import decrypt_secret
     from hub.handlers.dingtalk_inbound import handle_inbound
@@ -94,7 +87,7 @@ async def main():
     # 业务依赖（Plan 4）：多轮上下文 + 价格策略 + 业务用例（pending_choice/confirm 路径保留）
     ai_provider = await load_active_ai_provider()
     if ai_provider is None:
-        logger.warning("ai_provider 表为空，ChainAgent 将无法调用 LLM（仅 RuleParser fallback 有效）")
+        logger.warning("ai_provider 表为空，GraphAgent 将无法调用 LLM（仅 RuleParser fallback 有效）")
     conversation_state = ConversationStateRepository(redis=redis_client, ttl_seconds=300)
     pricing = DefaultPricingStrategy(erp_adapter=erp_adapter)
     query_product = QueryProductUseCase(
@@ -104,7 +97,7 @@ async def main():
         erp=erp_adapter, pricing=pricing, sender=sender, state=conversation_state,
     )
 
-    # Plan 6：构造 ChainAgent（替代 chain_parser）
+    # Plan 6 v9 Task 7.2：构造 GraphAgent（替代 ChainAgent）
     # 1. ConfirmGate（写门禁 pending/confirmed 状态）
     confirm_gate = ConfirmGate(redis_client)
 
@@ -124,39 +117,78 @@ async def main():
     draft_tools.set_erp_adapter(erp_adapter)
     draft_tools.register_all(tool_registry)
 
-    # 4. MemoryLoader
-    memory_loader = MemoryLoader(
-        session=session_memory,
-        user=UserMemoryService(),
-        customer=CustomerMemoryService(),
-        product=ProductMemoryService(),
-    )
-
-    # 5. PromptBuilder（v8 review P2-#3：从 SystemConfig 加载 admin 编辑的 business_dict 覆盖默认）
-    # admin 后台改 SystemConfig.business_dict 后需重启 worker 生效（无热重载）
-    prompt_builder = await PromptBuilder.from_db()
-
-    # 6. ContextBuilder
-    context_builder = ContextBuilder(prompt_builder=prompt_builder)
-
-    # 7. AgentLLMClient（从 ai_provider 取 api_key / base_url / model）
-    agent_llm = AgentLLMClient(
+    # 4. DeepSeekLLMClient（GraphAgent 使用 DeepSeek v3 API）
+    agent_llm = DeepSeekLLMClient(
         api_key=ai_provider.api_key if ai_provider else "",
         base_url=ai_provider.base_url if ai_provider else "",
         model=ai_provider.model if ai_provider else "",
     )
 
-    # 8. ChainAgent
-    chain_agent = ChainAgent(
+    # 5. tool_executor 闭包：将 GraphAgent 的两参数调用转换为 ToolRegistry.call
+    #    hub_user_id / acting_as / conversation_id 从调用上下文中由 contextvars 注入，
+    #    避免 GraphAgent 实例绑定单个用户上下文（多用户共享同一 worker 实例）。
+    import contextvars
+    _tool_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
+        "tool_ctx", default={}
+    )
+
+    async def tool_executor(name: str, args: dict) -> object:
+        ctx = _tool_ctx.get()
+        return await tool_registry.call(
+            name, args,
+            hub_user_id=ctx.get("hub_user_id", 0),
+            acting_as=ctx.get("acting_as", 0),
+            conversation_id=ctx.get("conversation_id", ""),
+            round_idx=ctx.get("round_idx", 0),
+        )
+
+    # 6. GraphAgent（Plan 6 v9 主 agent）
+    graph_agent_inner = GraphAgent(
         llm=agent_llm,
         registry=tool_registry,
         confirm_gate=confirm_gate,
         session_memory=session_memory,
-        memory_loader=memory_loader,
-        context_builder=context_builder,
+        tool_executor=tool_executor,
     )
 
-    # RuleParser：保留作 ChainAgent 未预期异常时的降级兜底
+    # 7. GraphAgentAdapter：包装 GraphAgent，让其接口与 handler 期望的 AgentResult 兼容，
+    #    并在调用前设置 tool_ctx contextvar（注入 hub_user_id / acting_as / conversation_id）
+    class GraphAgentAdapter:
+        """将 GraphAgent.run(str|None) 包装为 AgentResult，同时注入 tool_ctx。"""
+
+        async def run(
+            self,
+            *,
+            user_message: str,
+            hub_user_id: int,
+            conversation_id: str,
+            acting_as: int | None = None,
+            channel_userid: str | None = None,
+        ) -> AgentResult:
+            token = _tool_ctx.set({
+                "hub_user_id": hub_user_id,
+                "acting_as": acting_as or 0,
+                "conversation_id": conversation_id,
+                "round_idx": 0,
+            })
+            try:
+                result = await graph_agent_inner.run(
+                    user_message=user_message,
+                    hub_user_id=hub_user_id,
+                    conversation_id=conversation_id,
+                    acting_as=acting_as,
+                    channel_userid=channel_userid,
+                )
+            finally:
+                _tool_ctx.reset(token)
+
+            if result is None:
+                return AgentResult.text_result("（无回复）")
+            return AgentResult.text_result(result)
+
+    chain_agent = GraphAgentAdapter()
+
+    # RuleParser：保留作 GraphAgent 未预期异常时的降级兜底
     rule_parser = RuleParser()
 
     runtime = WorkerRuntime(redis_client=redis_client)

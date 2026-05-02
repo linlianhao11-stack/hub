@@ -102,7 +102,7 @@ def test_re_confirm_does_not_match_non_confirm():
 async def test_inbound_calls_chain_agent_for_business_path(
     mock_chain_agent, mock_sender, mock_identity, mock_binding, mock_conversation_state,
 ):
-    """已绑定用户发普通消息 → 调 chain_agent.run，不调 chain_parser。"""
+    """已绑定用户发普通消息 → 调 chain_agent.run（GraphAgent），不调 chain_parser。"""
     mock_chain_agent.run.return_value = AgentResult.text_result("库存 49")
     payload = _make_payload("查 SKU50139")
 
@@ -118,17 +118,20 @@ async def test_inbound_calls_chain_agent_for_business_path(
     mock_chain_agent.run.assert_awaited_once()
     call_kwargs = mock_chain_agent.run.call_args.kwargs
     assert call_kwargs["user_message"] == "查 SKU50139"
-    assert call_kwargs["user_just_confirmed"] is False
+    # Plan 6 v9 Task 7.2：GraphAgent 不接受 user_just_confirmed，
+    # 确认词由 GraphAgent 内部 pre_router 处理，handler 不再传此参数。
+    assert "user_just_confirmed" not in call_kwargs
     mock_sender.send_text.assert_awaited()
 
 
-# ===== Case 3：user_just_confirmed=True =====
+# ===== Case 3：确认词消息直接传给 GraphAgent（pre_router 内部处理）=====
 
 @pytest.mark.asyncio
-async def test_inbound_passes_user_just_confirmed_true_for_yes(
+async def test_inbound_confirm_message_passed_to_graph_agent(
     mock_chain_agent, mock_sender, mock_identity, mock_binding, mock_conversation_state,
 ):
-    """用户整条消息是'是' → user_just_confirmed=True 传给 chain_agent。"""
+    """用户整条消息是'是' → 直接传给 GraphAgent（pre_router 内部识别确认意图），
+    不再由 handler 注入 user_just_confirmed 标志。"""
     mock_chain_agent.run.return_value = AgentResult.text_result("已创建凭证")
     payload = _make_payload("是")
 
@@ -141,8 +144,11 @@ async def test_inbound_passes_user_just_confirmed_true_for_yes(
         conversation_state=mock_conversation_state,
     )
 
+    mock_chain_agent.run.assert_awaited_once()
     call_kwargs = mock_chain_agent.run.call_args.kwargs
-    assert call_kwargs["user_just_confirmed"] is True
+    # GraphAgent 路径：user_message 原文传入，无 user_just_confirmed
+    assert call_kwargs["user_message"] == "是"
+    assert "user_just_confirmed" not in call_kwargs
 
 
 # ===== Case 4：clarification → send_text =====

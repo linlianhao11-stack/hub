@@ -2,20 +2,20 @@
 
 职责：
 - 解析命令：/绑定 X / /解绑 / 帮助 → 直走 BindingService
-- 已绑定 + ERP 启用：调 ChainAgent → 自然语言多轮对话
+- 已绑定 + ERP 启用：调 GraphAgent → 自然语言多轮对话（Plan 6 v9 Task 7.2）
 - 多轮编号选择（Plan 4 遗产）：从 ConversationState 取候选项 → 调 execute_selected_*
 - 低置信度（Plan 4 遗产）：保 state，让用户回"是"确认
-- RE_CONFIRM 识别：用户回"是/确认/yes"→ user_just_confirmed=True 传给 ChainAgent
+- 确认词识别：GraphAgent 内部 pre_router 处理"是/确认/yes"等确认消息，
+  handler 不再需要 user_just_confirmed 标志
 - 降级兜底：
-  - ChainAgent.run 抛出**未被内部捕获**的异常（如 Redis 死了 / 配置错）
+  - GraphAgent.run 抛出**未被内部捕获**的异常（如 Redis 死了 / 配置错）
     → 降级 RuleParser → rule 命中执行 use case，否则发友好文案
-  - LLMServiceError / asyncio.TimeoutError / PromptTooLargeError 等已被 ChainAgent
-    内部转为 AgentResult.error_result，**不触发降级**；用户直接收到 ChainAgent 翻译的
-    友好错误文案（"AI 响应超时"等）
+  - LLMServiceError 等已被 GraphAgent 内部处理为友好错误文本，
+    以 AgentResult.error_result 形式返回，**不触发降级**
 
 依赖外部注入（避免直连）：
 - binding_service / identity_service / sender（Plan 3）
-- chain_agent（Plan 6 新）/ rule_parser（fallback，可选）
+- chain_agent（Plan 6 v9：接受 GraphAgent 实例）/ rule_parser（fallback，可选）
 - conversation_state / query_product_usecase / query_customer_history_usecase /
   require_permissions（Plan 4，保留供 pending_choice / pending_confirm 路径）
 - live_publisher（Plan 5 task 6）：注入 LiveStreamPublisher 后，
@@ -53,9 +53,9 @@ async def handle_inbound(
     binding_service,
     identity_service,
     sender,
-    # Plan 6 新依赖
-    chain_agent=None,          # ChainAgent（主路径）
-    rule_parser=None,          # RuleParser（ChainAgent 未预期异常时降级 fallback）
+    # Plan 6 v9：GraphAgent（主路径），参数名保留 chain_agent 以维持向后兼容
+    chain_agent=None,          # GraphAgent 实例（主路径）
+    rule_parser=None,          # RuleParser（GraphAgent 未预期异常时降级 fallback）
     # Plan 4 遗产——保留供 pending_choice / pending_confirm 路径使用
     conversation_state=None,
     query_product_usecase=None,
@@ -177,22 +177,21 @@ async def handle_inbound(
                     record["final_status"] = "failed_user"
                 return
 
-            # ====== 第四层：ChainAgent 业务主路径（Plan 6 新）======
+            # ====== 第四层：GraphAgent 业务主路径（Plan 6 v9 Task 7.2）======
             if chain_agent is None:
-                # 没有 ChainAgent 时降级为友好提示（兼容测试 / 未配置场景）
+                # 没有 GraphAgent 时降级为友好提示（兼容测试 / 未配置场景）
                 await _send_text(sender, channel_userid,
                                  "我没听懂，请发送「帮助」查看可用功能。")
                 record["final_status"] = "failed_user"
                 return
 
             # 标注解析器（落 task_log.intent_parser，admin UI 用来区分 agent vs rule fallback 路径）
-            # Plan 6 chain_agent 不再有"discrete intent"概念，confidence 留 null
+            # GraphAgent 不再有"discrete intent"概念，confidence 留 null
             record["intent_parser"] = "agent"
 
-            # RE_CONFIRM 识别（Plan 6 §2161）：用户整条消息是确认词
-            # → user_just_confirmed=True 让 ChainAgent 调 confirm_gate.confirm_all_pending
-            user_just_confirmed = bool(RE_CONFIRM.match(content))
-
+            # GraphAgent.run 签名：user_message / hub_user_id / conversation_id /
+            # acting_as / channel_userid — 无 user_just_confirmed。
+            # 确认词识别由 GraphAgent 内部 pre_router 处理（检测 pending actions + 确认类消息）。
             try:
                 agent_result = await chain_agent.run(
                     user_message=content,
@@ -200,7 +199,6 @@ async def handle_inbound(
                     conversation_id=conversation_id,
                     acting_as=resolution.erp_user_id,
                     channel_userid=channel_userid,
-                    user_just_confirmed=user_just_confirmed,
                 )
             except BizError as e:
                 # BizError（权限拒绝等）：翻译成中文给用户
@@ -208,10 +206,10 @@ async def handle_inbound(
                 record["final_status"] = "failed_user"
                 return
             except Exception:
-                # ChainAgent 未预期异常（Redis 死 / 网络超时未被 agent 内部 catch 等）
+                # GraphAgent 未预期异常（Redis 死 / 网络超时未被 agent 内部 catch 等）
                 # → 降级 RuleParser
                 logger.exception(
-                    "ChainAgent 抛出未预期异常，降级 RuleParser conv=%s", conversation_id,
+                    "GraphAgent 抛出未预期异常，降级 RuleParser conv=%s", conversation_id,
                 )
                 await _fallback_to_rule_parser(
                     content=content, rule_parser=rule_parser,
@@ -224,9 +222,10 @@ async def handle_inbound(
                 )
                 return
 
-            # agent 返回 AgentResult（kind=text/clarification/error）
+            # agent_result 可能是 AgentResult（ChainAgent 兼容）或 str | None（GraphAgent 原生）
+            # GraphAgentAdapter（worker.py 构建）统一包装成 AgentResult
             if agent_result.kind == "error":
-                # ChainAgent 已翻译过的友好错误（"AI 响应超时" 之类）→ 直接发给用户
+                # 已翻译过的友好错误（"AI 响应超时" 之类）→ 直接发给用户
                 await _send_text(
                     sender, channel_userid,
                     agent_result.error or "AI 处理出了点问题",
@@ -251,7 +250,7 @@ async def _fallback_to_rule_parser(
     record: dict, parser_context: dict,
     resolution=None, query_product=None, query_customer=None, require_permissions=None,
 ) -> None:
-    """ChainAgent 未预期异常时降级走 RuleParser。
+    """GraphAgent 未预期异常时降级走 RuleParser。
 
     I1 修复（plan §2982）：rule 命中后直接调 _execute_intent 执行 use case，
     不再让用户'重发同格式'陷入循环。
@@ -281,7 +280,7 @@ async def _fallback_to_rule_parser(
     record["intent_confidence"] = getattr(intent, "confidence", None)
 
     # unknown / low_confidence → 友好兜底文案
-    # Plan 6 起 LLM agent 是主路径，RuleParser 仅做 ChainAgent 异常时的兜底兜底；
+    # Plan 6 起 LLM agent 是主路径，RuleParser 仅做 GraphAgent 异常时的兜底；
     # rule 也匹配不到的话，告诉用户稍后重试（不要让用户去模仿"查 SKU50139"这种过时格式）
     if intent.intent_type == "unknown" or getattr(intent, "confidence", 1.0) < 0.5:
         await _send_text(
