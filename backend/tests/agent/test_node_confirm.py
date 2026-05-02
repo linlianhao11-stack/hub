@@ -124,3 +124,80 @@ async def test_list_pending_order_stable_by_created_at(gate):
     assert all(o == orders[0] for o in orders)
     # 顺序与 created_at asc 一致
     assert orders[0] == ["adj-first", "adj-second", "adj-third"]
+
+
+# ====== Task 5.1：confirm_node 三分支测试 ======
+
+import pytest
+from hub.agent.graph.state import AgentState
+from hub.agent.graph.nodes.confirm import confirm_node
+
+
+@pytest.mark.asyncio
+async def test_confirm_node_zero_pending(gate):
+    """0 pending → 提示用户没有待办。"""
+    state = AgentState(user_message="确认", hub_user_id=1, conversation_id="c1")
+    out = await confirm_node(state, gate=gate)
+    assert "没有待办" in (out.final_response or "")
+    assert out.confirmed_subgraph is None
+    assert out.confirmed_action_id is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_node_one_pending_claims(gate):
+    """1 pending → claim 成功，state 写 confirmed_*。"""
+    p = await gate.create_pending(
+        action_prefix="adj", hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="阿里 X1 → 280",
+        payload={"tool_name": "adjust_price_request", "args": {"customer_id": 10, "product_id": 1, "new_price": 280.0, "reason": ""}},
+    )
+    state = AgentState(user_message="确认", hub_user_id=1, conversation_id="c1")
+    out = await confirm_node(state, gate=gate)
+    assert out.confirmed_subgraph == "adjust_price"
+    assert out.confirmed_action_id == p.action_id
+    assert out.confirmed_payload["args"]["customer_id"] == 10
+    assert out.errors == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_node_multi_pending_lists_does_not_claim(gate):
+    """多个 pending + 用户没说编号 → 列出来不 claim。"""
+    p1 = await gate.create_pending(
+        action_prefix="adj", hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="阿里 X1 → 280",
+        payload={"tool_name": "adjust_price_request", "args": {}},
+    )
+    p2 = await gate.create_pending(
+        action_prefix="vch", hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="SO-001 出库",
+        payload={"tool_name": "create_voucher_draft", "args": {}},
+    )
+    state = AgentState(user_message="确认", hub_user_id=1, conversation_id="c1")
+    out = await confirm_node(state, gate=gate)
+    assert "1)" in out.final_response and "2)" in out.final_response
+    # 都未 claim
+    assert not await gate.is_claimed(p1.action_id)
+    assert not await gate.is_claimed(p2.action_id)
+
+
+@pytest.mark.asyncio
+async def test_confirm_node_multi_pending_select_first_claims_only_first(gate):
+    """P1-C：多个 pending，用户回 "1" → 只 claim p1，p2 仍 pending；
+    state.confirmed_payload 必须是 p1 的 payload，不是 state 当前内容。"""
+    p1 = await gate.create_pending(
+        action_prefix="adj", hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="阿里 X1 → 280",
+        payload={"tool_name": "adjust_price_request", "args": {"customer_id": 10, "product_id": 1, "new_price": 280.0, "reason": ""}},
+    )
+    p2 = await gate.create_pending(
+        action_prefix="adj", hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="百度 Y1 → 350",
+        payload={"tool_name": "adjust_price_request", "args": {"customer_id": 20, "product_id": 5, "new_price": 350.0, "reason": ""}},
+    )
+    state = AgentState(user_message="1", hub_user_id=1, conversation_id="c1")
+    out = await confirm_node(state, gate=gate)
+    assert out.confirmed_action_id == p1.action_id
+    assert out.confirmed_payload["args"]["customer_id"] == 10
+    assert out.confirmed_payload["args"]["new_price"] == 280.0
+    # p2 仍 pending
+    assert not await gate.is_claimed(p2.action_id)
