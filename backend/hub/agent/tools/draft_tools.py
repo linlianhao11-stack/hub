@@ -31,6 +31,114 @@ from hub.models.draft import (
 
 logger = logging.getLogger("hub.agent.tools.draft_tools")
 
+
+# ===== Plan 6 v9 Task 2.2：strict tool schema（spec §1.3 / §5.2）=====
+
+CREATE_VOUCHER_DRAFT_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_voucher_draft",
+        "strict": True,
+        "description": "创建凭证草稿（挂会计审批 inbox）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "voucher_data",
+                "rule_matched",
+            ],
+            "properties": {
+                "voucher_data": {
+                    "type": "object",
+                    "description": "凭证内容，必须含 entries / total_amount / summary",
+                },
+                "rule_matched": {
+                    "type": "string",
+                    "description": "匹配到的凭证模板名（可选）；如无传 ''",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["voucher"],
+}
+
+CREATE_PRICE_ADJUSTMENT_REQUEST_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_price_adjustment_request",
+        "strict": True,
+        "description": "创建调价请求（挂销售主管审批 inbox）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "customer_id",
+                "product_id",
+                "new_price",
+                "reason",
+            ],
+            "properties": {
+                "customer_id": {
+                    "type": "integer",
+                    "description": "ERP 客户 ID",
+                },
+                "product_id": {
+                    "type": "integer",
+                    "description": "ERP 商品 ID",
+                },
+                "new_price": {
+                    "type": "number",
+                    "description": "申请调整后的价格（必须大于 0）",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "调价原因（可选）；如无传 ''",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["adjust_price"],
+}
+
+CREATE_STOCK_ADJUSTMENT_REQUEST_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_stock_adjustment_request",
+        "strict": True,
+        "description": "创建库存调整请求（挂库管/财务审批 inbox）",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "product_id",
+                "adjustment_qty",
+                "reason",
+                "warehouse_id",
+            ],
+            "properties": {
+                "product_id": {
+                    "type": "integer",
+                    "description": "ERP 商品 ID",
+                },
+                "adjustment_qty": {
+                    "type": "number",
+                    "description": "调整数量（正数增加，负数减少，不能为 0）",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "调整原因（可选）；如无传 ''",
+                },
+                "warehouse_id": {
+                    "type": "integer",
+                    "description": "仓库 ID（可选）；如无传 0（0 表示不指定仓库）",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["adjust_stock"],
+}
+
+
 # ============================================================
 # 模块级 ERP adapter（同 erp_tools 模式）
 # ============================================================
@@ -142,6 +250,9 @@ async def create_voucher_draft(
     ERP 落地由 admin 审批端点（admin/approvals/voucher/batch-approve）完成。
     未来重构不要把 ERP 写调用挪到此处。
     """
+    # sentinel 归一化（spec §1.3 v3.4）：LLM 传 "" 当 optional → 归一化成 None
+    rule_matched = rule_matched or None
+
     # M3: 先幂等查，再校验（回放路径不重新 query system_config）
     # 1. 幂等先查
     existing = await VoucherDraft.filter(
@@ -233,6 +344,9 @@ async def create_price_adjustment_request(
     ERP 落地由 admin 审批端点（admin/approvals/price/batch-approve）完成。
     未来重构不要把 ERP 写调用挪到此处。
     """
+    # sentinel 归一化（spec §1.3 v3.4）：LLM 传 "" 当 optional → 归一化成 None
+    reason = reason or None
+
     if new_price <= 0:
         raise ToolArgsValidationError("调价价格必须大于 0")
 
@@ -344,6 +458,12 @@ async def create_stock_adjustment_request(
     （StockAdjustmentRequest.adjustment_qty）以及 ERP 接口都用 adjustment_qty: float。
     本 tool 与模型字段保持一致。
     """
+    # sentinel 归一化（spec §1.3 v3.4）：LLM 传 "" 当 optional str → None；
+    # warehouse_id: int | None — 0 视为"未传"（schema 描述约定 0 = 不指定仓库），归一化成 None
+    reason = reason or None
+    if warehouse_id is not None and warehouse_id == 0:
+        warehouse_id = None
+
     if adjustment_qty == 0:
         raise ToolArgsValidationError("调整数量不能为 0")
 

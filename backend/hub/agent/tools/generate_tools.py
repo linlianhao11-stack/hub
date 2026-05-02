@@ -55,6 +55,112 @@ def _compute_contract_fingerprint(
 logger = logging.getLogger("hub.agent.tools.generate_tools")
 
 
+# ===== Plan 6 v9 Task 2.2：strict tool schema（spec §1.3 / §5.2）=====
+
+GENERATE_CONTRACT_DRAFT_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "generate_contract_draft",
+        "strict": True,
+        "description": "生成销售合同草稿 docx 并发到钉钉",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "template_id",
+                "customer_id",
+                "items",
+                "shipping_address",
+                "shipping_contact",
+                "shipping_phone",
+                "contract_no",
+                "payment_terms",
+                "tax_rate",
+                "extras",
+            ],
+            "properties": {
+                "template_id": {
+                    "type": "integer",
+                    "description": "ContractTemplate.id（销售合同模板一般是 1）",
+                },
+                "customer_id": {
+                    "type": "integer",
+                    "description": "ERP 客户 ID，必须用 search_customers 真返过的 id",
+                },
+                "items": {
+                    "type": "array",
+                    "description": "商品列表，每项含 product_id/name/qty/price；如无传 []",
+                    "items": {"type": "object"},
+                },
+                "shipping_address": {
+                    "type": "string",
+                    "description": "收货地址，如'广州市天河区华穗路406号'；如无传 ''",
+                },
+                "shipping_contact": {
+                    "type": "string",
+                    "description": "收货人姓名，如'林炼豪'；如无传 ''",
+                },
+                "shipping_phone": {
+                    "type": "string",
+                    "description": "收货人电话，如'13692977880'；如无传 ''",
+                },
+                "contract_no": {
+                    "type": "string",
+                    "description": "合同编号（admin 后台审批时再补）；如无传 ''",
+                },
+                "payment_terms": {
+                    "type": "string",
+                    "description": "付款方式，默认'乙方预付 100% 货款'；如无传 ''",
+                },
+                "tax_rate": {
+                    "type": "string",
+                    "description": "增值税税率字符串，如'13%'；如无传 ''",
+                },
+                "extras": {
+                    "type": "object",
+                    "description": "模板自定义占位符（极少用），如无传 {}",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["contract"],
+}
+
+GENERATE_PRICE_QUOTE_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "generate_price_quote",
+        "strict": True,
+        "description": "生成客户报价单 docx 并发到钉钉",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "customer_id",
+                "items",
+                "extras",
+            ],
+            "properties": {
+                "customer_id": {
+                    "type": "integer",
+                    "description": "ERP 客户 ID，必须用 search_customers 真返过的 id",
+                },
+                "items": {
+                    "type": "array",
+                    "description": "商品列表，每项含 product_id/name/qty/price；如无传 []",
+                    "items": {"type": "object"},
+                },
+                "extras": {
+                    "type": "object",
+                    "description": "模板自定义占位符（极少用），如无传 {}",
+                },
+            },
+        },
+    },
+    "_subgraphs": ["quote"],
+}
+
+
 # 模块单例（与 erp_tools 同模式）
 _dingtalk_sender: DingTalkSender | None = None
 _erp_adapter: Erp4Adapter | None = None
@@ -128,6 +234,15 @@ async def generate_contract_draft(
     (conversation_id, requester_hub_user_id, fingerprint) partial UNIQUE index +
     IntegrityError 回查复用，确保并发场景也不重复创建 draft。
     """
+    # sentinel 归一化（spec §1.3 v3.4）：LLM 传 "" 当 optional → 归一化成 None
+    shipping_address = shipping_address or None
+    shipping_contact = shipping_contact or None
+    shipping_phone = shipping_phone or None
+    contract_no = contract_no or None
+    payment_terms = payment_terms or None
+    tax_rate = tax_rate or None
+    extras = extras or {}
+
     # 1. 拉客户信息（v8 staging review #12：删宽容 fallback）
     # 旧逻辑：失败时用 "客户N" 假占位 → LLM 编错 customer_id 时合同上写"客户102"
     # 用户察觉前文件已发出，无法回滚。
@@ -390,6 +505,9 @@ async def generate_price_quote(
 
     简化第一版：自动找第一个 active 的 quote 类型模板。
     """
+    # sentinel 归一化（spec §1.3 v3.4）：LLM 传 {} 当 optional → 归一化成 {} 已 ok；extras={} 保持
+    extras = extras or {}
+
     template = await ContractTemplate.filter(
         template_type="quote",
         is_active=True,
