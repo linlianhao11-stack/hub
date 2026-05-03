@@ -310,6 +310,135 @@ async def test_pre_router_chat_no_pending_no_candidate_falls_to_llm_router():
 
 
 @pytest.mark.asyncio
+async def test_pre_router_pending_plus_candidate_routes_to_subgraph_not_confirm():
+    """review round 2 / P1：用户在候选选择流程里回 "选 2"，**即使**有旧 pending 也必须走候选 subgraph，
+    不能被 pending 路由抢走（否则单 pending + confirm_node 会直接 claim 写操作 = 误执行）。
+    """
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent, CustomerInfo
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    # 旧 pending 还在（来自前一个调价请求未确认）
+    fake_pendings = [
+        PendingAction(
+            action_id="adj-aaaa1111aaaa1111aaaa1111aaaa1111", conversation_id="c1",
+            hub_user_id=1, subgraph="adjust_price", summary="阿里 X1 → 280",
+            payload={"tool_name": "create_price_adjustment_request", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    # 用户当下在合同候选客户的选择流程
+    state = AgentState(user_message="选 2", hub_user_id=1, conversation_id="c1")
+    state.candidate_customers = [
+        CustomerInfo(id=10, name="阿里巴巴"),
+        CustomerInfo(id=11, name="阿里云"),
+    ]
+    state.active_subgraph = "contract"
+
+    out = await _pre_router_node(state, gate=gate)
+    # 关键断言：必须走 contract（候选选择），不是 CONFIRM
+    assert out.intent == Intent.CONTRACT, (
+        f"pending + candidate 同时存在时 '选 2' 应进候选 subgraph，"
+        f"绝不能进 CONFIRM 误 claim 写操作；实际 {out.intent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_router_single_pending_numeric_does_not_auto_claim():
+    """review round 2 / P1：单 pending + 用户回 "1" + **无 candidate**，不应自动进 CONFIRM。
+
+    用户可能是想新开一个流程而不是确认 pending。confirm_node 里 1 pending 直接 claim
+    写操作 = 误执行风险。建议：仅 pendings >= 2 才把数字当成"选第 N 个 pending"。
+    """
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    fake_pendings = [
+        PendingAction(
+            action_id="adj-aaaa1111aaaa1111aaaa1111aaaa1111", conversation_id="c1",
+            hub_user_id=1, subgraph="adjust_price", summary="阿里 X1 → 280",
+            payload={"tool_name": "create_price_adjustment_request", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    state = AgentState(user_message="1", hub_user_id=1, conversation_id="c1")
+    out = await _pre_router_node(state, gate=gate)
+    assert out.intent is None, (
+        f"单 pending + 数字 + 无 candidate 必须交给 LLM router 决定，"
+        f"不能自动 CONFIRM 触发 claim；实际 {out.intent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_router_multi_pending_numeric_no_candidate_routes_to_confirm():
+    """review round 2 / P1：多 pending（≥2）+ 数字 + 无 candidate → CONFIRM（用 confirm_node 按编号匹配 pending）。"""
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    fake_pendings = [
+        PendingAction(
+            action_id="adj-aaaa1111aaaa1111aaaa1111aaaa1111", conversation_id="c1",
+            hub_user_id=1, subgraph="adjust_price", summary="阿里 X1 → 280",
+            payload={"tool_name": "create_price_adjustment_request", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+        PendingAction(
+            action_id="vch-bbbb2222bbbb2222bbbb2222bbbb2222", conversation_id="c1",
+            hub_user_id=1, subgraph="voucher", summary="SO-1 出库",
+            payload={"tool_name": "create_voucher_draft", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    state = AgentState(user_message="1", hub_user_id=1, conversation_id="c1")
+    out = await _pre_router_node(state, gate=gate)
+    assert out.intent == Intent.CONFIRM
+
+
+@pytest.mark.asyncio
+async def test_pre_router_confirm_word_with_single_pending_still_routes_confirm():
+    """review round 2：确认词路径不变 — 单 pending + "确认" 仍进 CONFIRM（用户明确表达确认意图）。"""
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    fake_pendings = [
+        PendingAction(
+            action_id="adj-aaaa1111aaaa1111aaaa1111aaaa1111", conversation_id="c1",
+            hub_user_id=1, subgraph="adjust_price", summary="x", payload={},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    for word in ("确认", "是", "好的", "OK", "yes"):
+        state = AgentState(user_message=word, hub_user_id=1, conversation_id="c1")
+        out = await _pre_router_node(state, gate=gate)
+        assert out.intent == Intent.CONFIRM, (
+            f"确认词 {word!r} + 任意 pending 数应进 CONFIRM，实际 {out.intent!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_resets_per_turn_output_fields():
     """review issue 4：每轮 update_payload 必须重置上轮输出字段，
     避免 file_sent / confirmed_* 跨轮 hydrate 污染本轮判定。

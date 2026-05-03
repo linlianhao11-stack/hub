@@ -301,3 +301,72 @@ async def test_idempotency_stale_record_is_replaced_not_returned(gate):
     pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
     assert len(pendings) == 1
     assert pendings[0].action_id == p2.action_id
+
+
+@pytest.mark.asyncio
+async def test_idempotency_stale_cleanup_uses_cas_and_does_not_clobber_concurrent_reservation(gate):
+    """review round 2 / P1：stale 删除必须 CAS（仅当当前值 == 自己读到的旧值才 DEL）。
+
+    场景：A 协程读到 stale 旧 record；在 A DEL 之前，B 协程已经清理 stale 并成功
+    SET NX 创建新 reservation；A 不能盲目 DEL B 的新 reservation 然后再创建第二份
+    pending（同 idempotency_key 重复创建）。
+    """
+    # Step 1：先制造一份 stale 记录（A 即将读到的）
+    p1 = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 7}},
+        action_prefix="vch",
+        idempotency_key="vch:7:outbound",
+        ttl_seconds=600,
+    )
+    pending_key = gate._pending_key("c1", 1)
+    # 让 p1 在 pending hash 中消失，但 idem_key 仍指向它（stale 状态）
+    await gate.redis.hdel(pending_key, p1.action_id)
+
+    # Step 2：A 读到 stale 旧 record（保留快照）
+    idem_key = gate._idempotency_key("vch:7:outbound")
+    a_seen_raw = await gate.redis.get(idem_key)
+    assert a_seen_raw is not None, "前置：idem_key 必须存在 stale 旧值"
+
+    # Step 3：B 抢先：删除 stale + SET NX 写新 reservation（模拟 B 的 create_pending 完成 stale-recreate）
+    p2 = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 7}},
+        action_prefix="vch",
+        idempotency_key="vch:7:outbound",
+        ttl_seconds=600,
+    )
+    assert p2.action_id != p1.action_id  # B 应已创建新的
+
+    # Step 4：A 现在尝试 stale-cleanup 自己最初读到的那份；
+    # 必须用 CAS（仅当当前值 == a_seen_raw 才 DEL）→ B 的新值不能被 A 删
+    cas_deleted = await gate._cas_delete_idempotency_key(idem_key, a_seen_raw)
+    assert cas_deleted is False, (
+        "A 看到的 stale value 已被 B 替换，CAS DEL 必须返 False（不能误删 B 的新 reservation）"
+    )
+
+    # Step 5：B 的 reservation 仍存活；只有一个 pending
+    pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
+    assert len(pendings) == 1, f"应只剩 B 的 pending，实际 {len(pendings)}"
+    assert pendings[0].action_id == p2.action_id
+
+
+@pytest.mark.asyncio
+async def test_cas_delete_idempotency_key_succeeds_when_value_unchanged(gate):
+    """review round 2 / P1：CAS 删除在值未变时正常成功（保证正常 stale 清理路径仍走得通）。"""
+    p = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 99}},
+        action_prefix="vch",
+        idempotency_key="vch:99:outbound",
+        ttl_seconds=600,
+    )
+    idem_key = gate._idempotency_key("vch:99:outbound")
+    cur = await gate.redis.get(idem_key)
+    assert cur is not None
+    deleted = await gate._cas_delete_idempotency_key(idem_key, cur)
+    assert deleted is True
+    assert await gate.redis.get(idem_key) is None

@@ -300,20 +300,37 @@ class GraphAgent:
 # ─────────────────────────── routing functions ───────────────────────────
 
 async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> AgentState:
-    """P1-A v1.3 pre_router：基于上下文 + 消息类型直接判 intent，跳过 LLM。
+    """P1-A v1.3 pre_router（review round 2 P1 拆分确认词 vs 候选选择）：
+    基于上下文 + 消息类型直接判 intent，跳过 LLM。
 
-    优先级（review issue 1 修正：pending 命中时纯数字 / 选 N / 第 N 个 / id=N 也算 CONFIRM）：
-    1. 有 pending actions + 确认/选择类消息（"确认" / 数字 / "选 N" / "第 N 个" / id=N / action_id 前缀）
-       → Intent.CONFIRM。confirm_node 内部会按编号匹配 pending list。
-    2. 候选 + 选择词（仅当无 pending 时；pending 优先）
-       → 上轮活跃子图的 intent
-    3. 否则 intent = None → 交给 LLM router
+    优先级（**严格按顺序**，避免单 pending + 候选选择被误吞）：
+
+    1. **候选选择最优先**：candidate_* 非空 + selection（数字 / "选 N" / "第 N 个" / id=N）
+       → 走 active_subgraph 的 intent。即使有旧 pending 也不抢这条路径，否则用户在
+       合同/报价候选选择流程里回 "选 2" 会被旧 pending 单独 claim 错触写操作。
+    2. **确认词 / action_id 路径**：明确表达确认意图（"确认"/"是"/"好的"/"OK"/"yes"
+       或 action_id 前缀）+ 任意数量 pending（≥1）→ CONFIRM。
+       此路径无歧义，单 pending 也允许直接 claim。
+    3. **数字选择 + 多 pending**：selection（数字 / "选 N" / "第 N 个" / id=N）+
+       **无** candidate_* + pendings **≥ 2** → CONFIRM。confirm_node 内部按编号匹配。
+       单 pending（1 个）+ 数字 + 无 candidate **不**走 CONFIRM —— 用户可能是新发起一个
+       不相关流程，避免误 claim 写操作。
+    4. 否则 intent = None → 交给 LLM router 决定。
     """
     msg = state.user_message
+    is_confirm_word = _is_confirm_message(msg)  # 确认词 / action_id 前缀
+    is_selection = _is_selection_message(msg)  # 数字 / "选 N" / "第 N 个" / id=N
+    has_candidates = bool(state.candidate_customers or state.candidate_products)
 
-    # 1. pending + 确认/选择类消息：pending 优先于 candidate 路由
-    #    （review issue 1：用户回 "1" 选第 1 个 pending 必须能进 confirm_node）
-    if gate is not None and (_is_confirm_message(msg) or _is_selection_message(msg)):
+    # 1. 候选 + 选择 → 候选 subgraph（最优先；不被 pending 抢）
+    if is_selection and has_candidates:
+        intent = _subgraph_to_intent(state.active_subgraph)
+        if intent is not None:
+            state.intent = intent
+            return state
+
+    # 2. 确认词 / action_id + 任意 pending → CONFIRM（无歧义）
+    if gate is not None and is_confirm_word:
         try:
             pendings = await gate.list_pending_for_context(
                 conversation_id=state.conversation_id,
@@ -323,17 +340,23 @@ async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> Ag
                 state.intent = Intent.CONFIRM
                 return state
         except Exception:
-            pass  # 查 pending 失败 → 兜底走下一档（candidate / LLM）
+            pass
 
-    # 2. 候选 + 选择消息（pending 已检过；走到这里说明无 pending）
-    if _is_selection_message(msg):
-        if state.candidate_customers or state.candidate_products:
-            intent = _subgraph_to_intent(state.active_subgraph)
-            if intent is not None:
-                state.intent = intent
+    # 3. 数字选择 + **多** pending + 无 candidate → CONFIRM
+    #    单 pending + 数字 不走 CONFIRM（避免误 claim 单一写操作）
+    if gate is not None and is_selection and not has_candidates:
+        try:
+            pendings = await gate.list_pending_for_context(
+                conversation_id=state.conversation_id,
+                hub_user_id=state.hub_user_id,
+            )
+            if len(pendings) >= 2:
+                state.intent = Intent.CONFIRM
                 return state
+        except Exception:
+            pass
 
-    # 3. intent = None → 走 LLM router
+    # 4. 都不命中 → 交 LLM router
     state.intent = None
     return state
 

@@ -155,6 +155,45 @@ class ConfirmGate:
     def _idempotency_key(self, idempotency_key: str) -> str:
         return f"hub:agent:idempotency:{idempotency_key}"
 
+    async def _cas_delete_idempotency_key(self, idem_key: str, expected_raw) -> bool:
+        """CAS 删除：仅当当前值与 expected_raw 完全一致才 DEL，否则不动。
+
+        review round 2 / P1：stale 清理路径必须避免盲删；并发下另一个协程可能已经
+        清理 stale 并 SET NX 写入新 reservation，盲 DEL 会误清除新 reservation 导致
+        同 idempotency_key 双创。
+
+        实现：WATCH/MULTI/EXEC 事务保证 GET → DEL 之间 key 没被改才执行 DEL；
+        WATCH 期间被改 → EXEC 失败 → 返 False（不删）。
+
+        返：
+          - True：当前值确为 expected_raw，已删除
+          - False：当前值已被改 / 不存在 / 事务失败，未删除（也不应再删）
+        """
+        if expected_raw is None:
+            return False
+        try:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(idem_key)
+                    current = await pipe.get(idem_key)
+                    if current != expected_raw:
+                        # 别人改过 / 删过 → 我们不动
+                        await pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    pipe.delete(idem_key)
+                    await pipe.execute()
+                    return True
+                except Exception:
+                    # WatchError 或其他 → 视为 CAS 失败，不删
+                    try:
+                        await pipe.reset()
+                    except Exception:
+                        pass
+                    return False
+        except Exception:
+            return False
+
     # ====== Task 0.5 新 API：create_pending / list_pending_for_context / get_pending_by_id / is_claimed / claim ======
 
     async def create_pending(
@@ -277,9 +316,17 @@ class ConfirmGate:
                 )
 
             # Stale：idempotency_key 还在但 action_id 已不在 pending hash
-            # → 清掉 stale 记录，下一轮 attempt 会用新 action_id 重新 SET NX
-            await self.redis.delete(idem_key)
-            # 继续下一次 attempt
+            # → CAS 清理（仅当当前值仍是我们读到的旧 stale record 才删）；
+            # 下一轮 attempt 会用新 action_id 重新 SET NX。
+            #
+            # review round 2 / P1 修：旧实现盲目 DEL 在并发下会误删别人刚 SET 的新 reservation：
+            #   T1 GET → V1 stale；T2 也 GET → V1 stale；T2 DEL+SET → V2 (alive)；
+            #   T1 DEL 会把 V2 干掉，然后 T1 SET NX → V3 → 同 idempotency_key 双 reservation。
+            # CAS 删除（WATCH+MULTI+EXEC）让"被改"的 DEL 失败，T1 的下一轮 attempt 通过
+            # SET NX 也会失败（V2 已存在）→ 走 reuse 路径，避免双创。
+            await self._cas_delete_idempotency_key(idem_key, existing_raw)
+            # 继续下一次 attempt（CAS 成功 → 干净了；CAS 失败 → 别人写了新值，
+            # 下一轮 SET NX 会失败、转 reuse 路径，也是正确终态）
 
         # 不应到这里；safety
         raise RuntimeError(
