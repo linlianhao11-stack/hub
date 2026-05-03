@@ -124,6 +124,28 @@ async def extract_contract_context_node(state: ContractState, *, llm: DeepSeekLL
         state.errors.append("extract_context_json_decode_failed")
         return state
 
+    # 钉钉实测 hotfix（客户切换 e2e 测试 task=switch）：用户上一轮 contract 没走完
+    # cleanup（停在 ask_user 等用户补字段），state.customer 残留。这一轮用户改主意
+    # 给**新客户**做合同时,resolve_customer 看 state.customer 有值 early return,
+    # bot 用旧客户 + 上轮 items 生成合同 → 合同发错客户（严重 bug）。
+    #
+    # 切换检测：parsed.customer_name 跟 state.customer.name 互不为子串 → 视为新合同,
+    # 整体重置当前合同工作 state，让 resolve_customer 重新搜，items/products/shipping
+    # 也由本轮重新解析。
+    new_customer_name = parsed.get("customer_name") or ""
+    if new_customer_name and state.customer and state.customer.name:
+        existing_name = state.customer.name
+        if (new_customer_name not in existing_name
+                and existing_name not in new_customer_name):
+            # 切换客户 — 整体重置当前合同工作 state（保留 active_subgraph,留 contract 流程继续）
+            state.customer = None
+            state.candidate_customers = []
+            state.products = []
+            state.candidate_products = {}
+            state.items = []
+            state.shipping = ShippingInfo()
+            state.extracted_hints = {}
+
     # extracted_hints — 整字段替换（field reassignment），避免 LangGraph model_fields_set 陷阱
     # 只在抽到非 null/empty 时合并，避免覆盖跨轮已有值
     new_hints = dict(state.extracted_hints)

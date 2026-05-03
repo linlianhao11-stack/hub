@@ -322,6 +322,13 @@ class GraphAgent:
         # review issue 4：上一轮的输出字段（intent / final_response / file_sent /
         # confirmed_* / errors）必须显式 reset，避免跨轮 hydrate 污染本轮判定，
         # 比如普通聊天显示 file_sent=True、上轮 confirmed_payload 残留导致路由误判。
+        #
+        # 钉钉实测 hotfix（2026-05-03 task=oE-jk3-E debug log 抓到）：
+        # missing_fields 也是单轮工作字段 — validate_inputs 等节点会重算。但
+        # _route_after_resolve_customer 在 validate_inputs **之前**就用 missing_fields
+        # 决定走 ask_user 还是 resolve_products，跨轮残留（如上轮"还差客户"留下
+        # missing=['customer']）会让本轮即使 state.customer 已有值也错走 ask_user
+        # 路径,bot 报"还差客户"。每轮 reset 让所有节点从干净起点重新计算。
         update_payload: dict = {
             "user_message": user_message,
             "hub_user_id": hub_user_id,
@@ -330,6 +337,7 @@ class GraphAgent:
             "final_response": None,
             "errors": [],
             "file_sent": False,
+            "missing_fields": [],
             "confirmed_subgraph": None,
             "confirmed_action_id": None,
             "confirmed_payload": None,

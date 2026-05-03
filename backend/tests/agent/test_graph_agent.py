@@ -555,3 +555,413 @@ async def test_run_resets_per_turn_output_fields():
     assert p.get("intent") is None
     assert p.get("final_response") is None
     assert p.get("errors") == []
+    # 钉钉实测 hotfix（task=oE-jk3-E debug log）：missing_fields 也是单轮工作字段,
+    # 必须每轮 reset。否则上轮残留如 ['customer'] 会让本轮 _route_after_resolve_customer
+    # 错走 ask_user 即使 state.customer 已 hydrate 有值,bot 报"还差客户"。
+    assert p.get("missing_fields") == [], "missing_fields 必须每轮 reset 为 []"
+
+
+@pytest.mark.asyncio
+async def test_stale_missing_fields_does_not_block_contract_with_existing_customer(monkeypatch):
+    """钉钉实测真实场景复现（task=oE-jk3-E 14:01 debug log 抓到）：
+
+    场景：用户上一轮"广州得帆做合同"搜不到客户 → state.missing_fields=['customer']。
+    但因子图嵌套 schema 边界 + 早期 contract 未 cleanup,state.customer 仍是更早一轮的
+    "北京翼蓝"。这一轮用户发"现在给翼蓝做合同 H5/F1/K5 + 地址" — bot 应该走通生成
+    合同,**不应该**因为上轮残留的 missing_fields=['customer'] 误路由到 ask_user。
+
+    Fix：GraphAgent.run() update_payload 加 missing_fields=[] 每轮 reset。
+    """
+    from hub.agent.graph.config import build_langgraph_config
+    from hub.agent.graph.subgraphs import contract as contract_mod
+    from hub.agent.graph.state import CustomerInfo
+
+    # mock 掉 DB 查模板
+    async def _fake_template():
+        return 1
+    monkeypatch.setattr(contract_mod, "_resolve_default_template_id", _fake_template)
+
+    tool_call_log: list[tuple[str, dict]] = []
+
+    async def fake_tool_executor(name: str, args: dict):
+        tool_call_log.append((name, args))
+        if name == "search_customers":
+            # 翼蓝 唯一命中（避免歧义）
+            return [{"id": 7, "name": "北京翼蓝科技发展有限公司"}]
+        if name == "search_products":
+            q = args.get("query", "")
+            if "H5" in q:
+                return [{"id": 1, "name": "H5系列1代"}]
+            if "F1" in q:
+                return [{"id": 2, "name": "F1系列1代"}]
+            if "K5" in q:
+                return [{"id": 3, "name": "K5系列1代"}]
+            return []
+        if name == "generate_contract_draft":
+            return {"draft_id": 999}
+        return None
+
+    # 6 次 LLM call: router(contract) + extract_context + resolve_customer(tool) +
+    # 3 × resolve_products(tool) + validate_inputs + generate_contract(tool) + format
+    llm_responses = [
+        # router → CONTRACT
+        type("R", (), {"text": 'contract"', "finish_reason": "stop", "tool_calls": [],
+                       "cache_hit_rate": 0.0})(),
+        # extract_contract_context
+        type("R", (), {"text": json.dumps({
+            "customer_name": "翼蓝",
+            "product_hints": ["H5", "F1", "K5"],
+            "items_raw": [
+                {"hint": "H5", "qty": 10, "price": 300},
+                {"hint": "F1", "qty": 10, "price": 500},
+                {"hint": "K5", "qty": 20, "price": 300},
+            ],
+            "shipping": {
+                "address": "广州市天河区华穗路406号中景b座",
+                "contact": "林生", "phone": "13692977880",
+            },
+        }), "finish_reason": "stop", "tool_calls": [], "cache_hit_rate": 0.0})(),
+        # resolve_customer 即使 state.customer 有值也不会调 LLM（early return）
+        # resolve_products 每个 hint 一次（3 次）
+        type("R", (), {"text": "", "finish_reason": "tool_calls",
+                       "tool_calls": [{"id": "1", "type": "function",
+                          "function": {"name": "search_products",
+                                        "arguments": json.dumps({"query": "H5"})}}],
+                       "cache_hit_rate": 0.0})(),
+        # validate_inputs 返回空 missing
+        type("R", (), {"text": json.dumps({"missing_fields": [], "warnings": []}),
+                       "finish_reason": "stop", "tool_calls": [], "cache_hit_rate": 0.0})(),
+        # generate_contract_node 不调 LLM（直接构造 payload 调 tool）
+        # format_response
+        type("R", (), {"text": "合同已生成。", "finish_reason": "stop", "tool_calls": [],
+                       "cache_hit_rate": 0.0})(),
+    ]
+
+    llm = AsyncMock()
+    llm.chat = AsyncMock(side_effect=llm_responses)
+
+    gate = AsyncMock()
+    gate.list_pending_for_context = AsyncMock(return_value=[])
+
+    agent = GraphAgent(
+        llm=llm, registry=AsyncMock(), confirm_gate=gate,
+        session_memory=AsyncMock(), tool_executor=fake_tool_executor,
+    )
+
+    # 模拟上一轮残留 state（直接写入 checkpoint）
+    config = build_langgraph_config(conversation_id="c-stale", hub_user_id=1)
+    stale_customer = CustomerInfo(id=7, name="北京翼蓝科技发展有限公司")
+    await agent.compiled_graph.aupdate_state(
+        config,
+        {
+            "customer": stale_customer,
+            "missing_fields": ["customer"],          # ← 关键：上轮残留的脏 missing
+            "active_subgraph": "contract",
+            "user_message": "",
+            "hub_user_id": 1,
+            "conversation_id": "c-stale",
+        },
+    )
+
+    # 跑这一轮 — 用户发"现在给翼蓝做合同..."
+    result = await agent.run(
+        user_message="现在给翼蓝做个合同。H5 1代 10个 价格300，F1 10个 价格500，"
+                     "K5 20个 价格300.收件地址是广州市天河区华穗路 406号，林生，13692977880",
+        hub_user_id=1, conversation_id="c-stale",
+    )
+
+    tool_names = [n for n, _ in tool_call_log]
+    # 关键断言：必须真调到 generate_contract_draft（不是被 ask_user 拦截）
+    assert "generate_contract_draft" in tool_names, (
+        f"missing_fields 残留导致误路由 — 应走完 contract 流程,实际 tools={tool_names}, "
+        f"reply={result!r}"
+    )
+    # bot 不应该说"还差客户"
+    assert result is not None
+    assert "还差" not in result, f"不该再问'还差客户',实际 reply={result!r}"
+
+    # 验证最终 state — cleanup 后业务结果保留
+    snap = await agent.compiled_graph.aget_state(config)
+    assert snap.values.get("draft_id") == 999
+
+
+@pytest.mark.asyncio
+async def test_cleanup_after_contract_actually_clears_state_in_checkpoint(monkeypatch):
+    """钉钉实测发现 cleanup_after_contract_node 跑了但 [GA-PRE-STATE] 仍显示
+    customer=北京翼蓝 持续残留 — 说明 cleanup 设的 None 没写入父图 checkpoint，
+    LangGraph state 真值与 cleanup 期望不一致。
+
+    本测试：跑完整 contract 流程（成功生成）→ aget_state → 验证 customer/items/
+    candidate_*/shipping/extracted_hints/active_subgraph 都被清。
+    """
+    from hub.agent.graph.config import build_langgraph_config
+    from hub.agent.graph.subgraphs import contract as contract_mod
+
+    async def _fake_template():
+        return 1
+    monkeypatch.setattr(contract_mod, "_resolve_default_template_id", _fake_template)
+
+    async def fake_tool_executor(name: str, args: dict):
+        if name == "search_customers":
+            return [{"id": 7, "name": "北京翼蓝"}]
+        if name == "search_products":
+            return [{"id": 1, "name": "X1"}]
+        if name == "generate_contract_draft":
+            return {"draft_id": 999}
+        return None
+
+    llm_responses = [
+        type("R", (), {"text": 'contract"', "finish_reason": "stop", "tool_calls": [],
+                       "cache_hit_rate": 0.0})(),
+        type("R", (), {"text": json.dumps({
+            "customer_name": "翼蓝",
+            "product_hints": ["X1"],
+            "items_raw": [{"hint": "X1", "qty": 10, "price": 300}],
+            "shipping": {"address": "北京海淀", "contact": "张三", "phone": "13800001111"},
+        }), "finish_reason": "stop", "tool_calls": [], "cache_hit_rate": 0.0})(),
+        type("R", (), {"text": "", "finish_reason": "tool_calls",
+                       "tool_calls": [{"id": "1", "type": "function",
+                          "function": {"name": "search_customers",
+                                        "arguments": json.dumps({"query": "翼蓝"})}}],
+                       "cache_hit_rate": 0.0})(),
+        type("R", (), {"text": "", "finish_reason": "tool_calls",
+                       "tool_calls": [{"id": "2", "type": "function",
+                          "function": {"name": "search_products",
+                                        "arguments": json.dumps({"query": "X1"})}}],
+                       "cache_hit_rate": 0.0})(),
+        type("R", (), {"text": json.dumps({"missing_fields": [], "warnings": []}),
+                       "finish_reason": "stop", "tool_calls": [], "cache_hit_rate": 0.0})(),
+        type("R", (), {"text": "合同已生成。", "finish_reason": "stop", "tool_calls": [],
+                       "cache_hit_rate": 0.0})(),
+    ]
+
+    llm = AsyncMock()
+    llm.chat = AsyncMock(side_effect=llm_responses)
+
+    gate = AsyncMock()
+    gate.list_pending_for_context = AsyncMock(return_value=[])
+
+    agent = GraphAgent(
+        llm=llm, registry=AsyncMock(), confirm_gate=gate,
+        session_memory=AsyncMock(), tool_executor=fake_tool_executor,
+    )
+
+    config = build_langgraph_config(conversation_id="c-cleanup", hub_user_id=1)
+    await agent.run(
+        user_message="给翼蓝做合同 X1 10 个 300，地址北京海淀，张三 13800001111",
+        hub_user_id=1, conversation_id="c-cleanup",
+    )
+
+    # 关键：cleanup 跑完后 state 实际值
+    snap = await agent.compiled_graph.aget_state(config)
+    v = snap.values
+
+    # 业务结果 — 必须保留
+    assert v.get("draft_id") == 999, "draft_id 应保留（合同生成的输出）"
+
+    # 工作字段 — cleanup 必须真的清干净
+    # 这些字段如果残留,下一个合同会被上一个的客户/商品/地址污染
+    # （参见 task=oE-jk3-E 14:01 [GA-PRE-STATE] 看到 customer 持续残留的现象）
+    assert v.get("customer") is None, (
+        f"cleanup 必须清 customer,实际 {v.get('customer')}"
+    )
+    assert v.get("items") in (None, []), (
+        f"cleanup 必须清 items,实际 {v.get('items')}"
+    )
+    assert v.get("products") in (None, []), (
+        f"cleanup 必须清 products,实际 {v.get('products')}"
+    )
+    assert v.get("candidate_customers") in (None, []), (
+        f"cleanup 必须清 candidate_customers,实际 {v.get('candidate_customers')}"
+    )
+    assert v.get("candidate_products") in (None, {}), (
+        f"cleanup 必须清 candidate_products,实际 {v.get('candidate_products')}"
+    )
+    assert v.get("active_subgraph") is None, (
+        f"cleanup 必须清 active_subgraph,实际 {v.get('active_subgraph')!r}"
+    )
+    # shipping 是嵌套对象
+    shipping = v.get("shipping")
+    if shipping is not None:
+        # 可能是 ShippingInfo 实例或 dict
+        addr = shipping.address if hasattr(shipping, "address") else shipping.get("address")
+        assert addr is None, f"cleanup 必须清 shipping.address,实际 {addr!r}"
+    extracted = v.get("extracted_hints")
+    assert extracted in (None, {}), f"cleanup 必须清 extracted_hints,实际 {extracted}"
+
+
+@pytest.mark.asyncio
+async def test_customer_switch_resets_stale_customer(monkeypatch):
+    """钉钉真实 bug：上一轮 contract 没 cleanup（停在 ask_user）→ state.customer
+    残留 = "阿里巴巴"。这一轮用户改主意"给翼蓝做合同 X1 10 个 300, 地址北京"。
+
+    现状（bug）：resolve_customer 看 state.customer 有值就 early return,bot 用旧
+    阿里巴巴 + 新 X1 items 生成合同 → 严重错误（合同发错客户)。
+
+    Fix（应有的行为）：extract_contract_context 解析到新 customer_name 跟当前
+    state.customer.name **不同** 时,清空 state.customer + items + products +
+    candidate_* + shipping,让 resolve_customer 重新搜。
+    """
+    from hub.agent.graph.config import build_langgraph_config
+    from hub.agent.graph.subgraphs import contract as contract_mod
+    from hub.agent.graph.state import CustomerInfo, ProductInfo, ContractItem, ShippingInfo
+    from decimal import Decimal
+
+    async def _fake_template():
+        return 1
+    monkeypatch.setattr(contract_mod, "_resolve_default_template_id", _fake_template)
+
+    captured_args: dict = {}
+
+    async def fake_tool_executor(name: str, args: dict):
+        if name == "search_customers":
+            return [{"id": 7, "name": "北京翼蓝科技发展有限公司"}]
+        if name == "search_products":
+            return [{"id": 1, "name": "X1"}]
+        if name == "generate_contract_draft":
+            captured_args.update(args)
+            return {"draft_id": 999}
+        return None
+
+    llm_responses = [
+        type("R", (), {"text": 'contract"', "finish_reason": "stop", "tool_calls": [],
+                       "cache_hit_rate": 0.0})(),
+        # extract: 用户提"翼蓝"客户,新 items
+        type("R", (), {"text": json.dumps({
+            "customer_name": "翼蓝",
+            "product_hints": ["X1"],
+            "items_raw": [{"hint": "X1", "qty": 10, "price": 300}],
+            "shipping": {"address": "北京海淀", "contact": "张三", "phone": "13800001111"},
+        }), "finish_reason": "stop", "tool_calls": [], "cache_hit_rate": 0.0})(),
+        # resolve_customer 必须重新搜（state.customer 必须先被清）
+        type("R", (), {"text": "", "finish_reason": "tool_calls",
+                       "tool_calls": [{"id": "1", "type": "function",
+                          "function": {"name": "search_customers",
+                                        "arguments": json.dumps({"query": "翼蓝"})}}],
+                       "cache_hit_rate": 0.0})(),
+        # resolve_products
+        type("R", (), {"text": "", "finish_reason": "tool_calls",
+                       "tool_calls": [{"id": "2", "type": "function",
+                          "function": {"name": "search_products",
+                                        "arguments": json.dumps({"query": "X1"})}}],
+                       "cache_hit_rate": 0.0})(),
+        # validate
+        type("R", (), {"text": json.dumps({"missing_fields": [], "warnings": []}),
+                       "finish_reason": "stop", "tool_calls": [], "cache_hit_rate": 0.0})(),
+        # format
+        type("R", (), {"text": "合同已生成。", "finish_reason": "stop", "tool_calls": [],
+                       "cache_hit_rate": 0.0})(),
+    ]
+
+    llm = AsyncMock()
+    llm.chat = AsyncMock(side_effect=llm_responses)
+
+    gate = AsyncMock()
+    gate.list_pending_for_context = AsyncMock(return_value=[])
+
+    agent = GraphAgent(
+        llm=llm, registry=AsyncMock(), confirm_gate=gate,
+        session_memory=AsyncMock(), tool_executor=fake_tool_executor,
+    )
+
+    config = build_langgraph_config(conversation_id="c-switch", hub_user_id=1)
+
+    # 模拟上一轮残留：阿里巴巴客户 + 上轮 items + shipping
+    stale_customer = CustomerInfo(id=99, name="阿里巴巴")
+    stale_items = [ContractItem(product_id=999, name="OldProduct", qty=5, price=Decimal("100"))]
+    stale_products = [ProductInfo(id=999, name="OldProduct")]
+    await agent.compiled_graph.aupdate_state(
+        config,
+        {
+            "customer": stale_customer,
+            "items": stale_items,
+            "products": stale_products,
+            "shipping": ShippingInfo(address="老地址北京中关村", contact="老张", phone="13700000000"),
+            "active_subgraph": "contract",
+            "user_message": "",
+            "hub_user_id": 1,
+            "conversation_id": "c-switch",
+        },
+    )
+
+    # 跑这一轮 — 用户切换到翼蓝
+    result = await agent.run(
+        user_message="给翼蓝做合同 X1 10 个 300，地址北京海淀，张三 13800001111",
+        hub_user_id=1, conversation_id="c-switch",
+    )
+
+    # 关键断言：generate_contract_draft 拿到的必须是新客户(id=7)，新 items(product_id=1)，新地址
+    assert captured_args.get("customer_id") == 7, (
+        f"必须用新客户 id=7（北京翼蓝），不能用残留的阿里巴巴 id=99。"
+        f"实际 customer_id={captured_args.get('customer_id')}"
+    )
+    new_items = captured_args.get("items", [])
+    assert len(new_items) == 1 and new_items[0].get("product_id") == 1, (
+        f"必须用新 items（product_id=1 X1），不能带残留的 OldProduct id=999。"
+        f"实际 items={new_items}"
+    )
+    assert captured_args.get("shipping_address") == "北京海淀", (
+        f"必须用新地址,不能用残留的老地址。实际 shipping_address={captured_args.get('shipping_address')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_customer_substring_match_does_not_trigger_switch(monkeypatch):
+    """切换检测不能误伤"同一客户的简称 / 全称"场景。
+
+    场景：T1 user 输 "翼蓝" → state.customer.name="北京翼蓝科技发展有限公司"。
+    T2 user 又输 "翼蓝" → 应该被识别为**同一客户**（"翼蓝" in
+    "北京翼蓝科技..."），不应该清掉 state.customer 触发新搜索。
+    """
+    from hub.agent.graph.nodes.extract_contract_context import extract_contract_context_node
+    from hub.agent.graph.state import ContractState, CustomerInfo
+    from unittest.mock import AsyncMock
+
+    state = ContractState(user_message="给翼蓝再加 X1 5 个 200",
+                            hub_user_id=1, conversation_id="c1")
+    state.customer = CustomerInfo(id=7, name="北京翼蓝科技发展有限公司")
+
+    llm = AsyncMock()
+    llm.chat = AsyncMock(return_value=type("R", (), {"text": json.dumps({
+        "customer_name": "翼蓝",  # ← 简称提到,跟 state.customer.name 互为子串
+        "product_hints": ["X1"],
+        "items_raw": [{"hint": "X1", "qty": 5, "price": 200}],
+        "shipping": {"address": None, "contact": None, "phone": None},
+    }), "finish_reason": "stop", "tool_calls": []})())
+
+    out = await extract_contract_context_node(state, llm=llm)
+
+    # state.customer 必须保留（因为是同一客户的简称）
+    assert out.customer is not None, "客户简称匹配,不应清掉 state.customer"
+    assert out.customer.id == 7
+    assert out.customer.name == "北京翼蓝科技发展有限公司"
+
+
+@pytest.mark.asyncio
+async def test_no_customer_in_message_does_not_clear_existing(monkeypatch):
+    """用户消息没提客户名时（补字段场景）,不应该清掉 state.customer。
+
+    场景：T1 bot 问"还差地址"。T2 user 输 "北京海淀"（只补地址）。
+    extract_context 解析 customer_name=null,不应触发切换重置。
+    """
+    from hub.agent.graph.nodes.extract_contract_context import extract_contract_context_node
+    from hub.agent.graph.state import ContractState, CustomerInfo
+    from unittest.mock import AsyncMock
+
+    state = ContractState(user_message="北京海淀,张三 13800001111",
+                            hub_user_id=1, conversation_id="c1")
+    state.customer = CustomerInfo(id=7, name="北京翼蓝")
+
+    llm = AsyncMock()
+    llm.chat = AsyncMock(return_value=type("R", (), {"text": json.dumps({
+        "customer_name": None,
+        "product_hints": [],
+        "items_raw": [],
+        "shipping": {"address": "北京海淀", "contact": "张三", "phone": "13800001111"},
+    }), "finish_reason": "stop", "tool_calls": []})())
+
+    out = await extract_contract_context_node(state, llm=llm)
+
+    # state.customer 必须保留（用户没换客户,只是补地址）
+    assert out.customer is not None
+    assert out.customer.id == 7
