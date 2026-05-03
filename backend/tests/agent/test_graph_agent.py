@@ -6,6 +6,36 @@ from hub.agent.graph.agent import GraphAgent
 
 
 @pytest.mark.asyncio
+async def test_graph_agent_accepts_external_checkpointer_for_persistence():
+    """Plan 6 v9 staging hotfix：GraphAgent 必须能接受外部 checkpointer 注入，
+    让生产用 AsyncPostgresSaver 持久化对话 state、跨 worker 重启 hydrate。
+    默认 None 时退回 MemorySaver（仅测试 / 一次性脚本）。
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+    from hub.agent.graph.agent import GraphAgent
+
+    # 注入自定义 saver — 应该被 _build 用上
+    custom_saver = MemorySaver()
+    agent = GraphAgent(
+        llm=AsyncMock(), registry=AsyncMock(), confirm_gate=AsyncMock(),
+        session_memory=AsyncMock(), tool_executor=AsyncMock(),
+        checkpointer=custom_saver,
+    )
+    # compiled_graph 内部 checkpointer 应是注入的那个
+    inner = agent.compiled_graph.checkpointer
+    assert inner is custom_saver, (
+        "外部注入的 checkpointer 必须被 GraphAgent 用上（生产路径靠这个跨重启 hydrate）"
+    )
+
+    # 不注入 → 默认 MemorySaver
+    default_agent = GraphAgent(
+        llm=AsyncMock(), registry=AsyncMock(), confirm_gate=AsyncMock(),
+        session_memory=AsyncMock(), tool_executor=AsyncMock(),
+    )
+    assert isinstance(default_agent.compiled_graph.checkpointer, MemorySaver)
+
+
+@pytest.mark.asyncio
 async def test_graph_agent_uses_compound_thread_id():
     """spec §2.1：LangGraph config thread_id 必须 = f'{conv}:{user}'。"""
     captured = {}

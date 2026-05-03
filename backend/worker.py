@@ -159,12 +159,34 @@ async def main():
         )
 
     # 6. GraphAgent（Plan 6 v9 主 agent）
+    # Plan 6 v9：用 AsyncPostgresSaver 让 LangGraph state 跨 worker 重启持久化，
+    # 取代默认 in-process MemorySaver（重启即丢上下文，钉钉对话"前面说的事 bot 忘了"）。
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg_pool import AsyncConnectionPool
+    import os
+
+    pg_url = os.environ.get("HUB_DATABASE_URL", "")
+    if pg_url.startswith("postgres://"):  # psycopg 要求 postgresql://
+        pg_url = "postgresql://" + pg_url[len("postgres://"):]
+    _checkpoint_pool = AsyncConnectionPool(
+        pg_url, open=False, max_size=4,
+        kwargs={"autocommit": True, "prepare_threshold": 0},  # langgraph 要求 autocommit
+    )
+    await _checkpoint_pool.open()
+    _checkpointer = AsyncPostgresSaver(_checkpoint_pool)
+    try:
+        await _checkpointer.setup()  # 创建 checkpoints / writes / blobs 表（幂等）
+        logger.info("LangGraph AsyncPostgresSaver checkpoint tables ready")
+    except Exception as e:
+        logger.exception("AsyncPostgresSaver.setup 失败 — checkpoint 仍可工作但跨重启 hydrate 不保证: %s", e)
+
     graph_agent_inner = GraphAgent(
         llm=agent_llm,
         registry=tool_registry,
         confirm_gate=confirm_gate,
         session_memory=session_memory,
         tool_executor=tool_executor,
+        checkpointer=_checkpointer,
     )
 
     # 7. GraphAgentAdapter：包装 GraphAgent，让其接口与 handler 期望的 AgentResult 兼容，

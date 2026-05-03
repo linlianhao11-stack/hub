@@ -154,12 +154,19 @@ class GraphAgent:
         session_memory=None,
         tool_executor: Callable[[str, dict], Awaitable[object]] | None = None,
         compiled_graph=None,
+        checkpointer=None,
     ):
+        """Args:
+            checkpointer: LangGraph BaseCheckpointSaver。
+                None → 用 MemorySaver（**仅测试 / 一次性脚本**；进程重启即丢上下文）。
+                生产 → 传 AsyncPostgresSaver（持久化到 hub-postgres，跨重启保留对话）。
+        """
         self.llm = llm
         self.registry = registry
         self.confirm_gate = confirm_gate
         self.session_memory = session_memory
         self.tool_executor = tool_executor
+        self._checkpointer = checkpointer
 
         if compiled_graph is not None:
             self.compiled_graph = compiled_graph
@@ -290,7 +297,9 @@ class GraphAgent:
         g.add_edge("commit_adjust_stock", END)
         g.add_edge("commit_voucher", END)
 
-        checkpointer = MemorySaver()
+        # 默认 MemorySaver（in-process，测试用）；生产从外部注入 AsyncPostgresSaver
+        # 让对话 state 在 worker 重启后仍能 hydrate。
+        checkpointer = self._checkpointer if self._checkpointer is not None else MemorySaver()
         return g.compile(checkpointer=checkpointer)
 
     # ───────────────────── public interface ─────────────────────
