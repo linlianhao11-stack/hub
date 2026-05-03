@@ -9,5 +9,7 @@ turns:
       check_inventory: 1
       generate_contract_draft: 0
       create_price_adjustment_request: 0
-    must_contain: ["|"]  # Markdown 表格
-    forbid: ["是否需要做合同"]
+    # Plan 6 v9 hotfix（plan §钉钉实测 markdown 渲染差）：query 子图改纯文本
+    # 短行格式，不再用 Markdown 表格。期望"库存"字面 + 几个产品代号在内。
+    must_contain: ["库存"]
+    forbid: ["是否需要做合同", "|"]

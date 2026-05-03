@@ -17,6 +17,31 @@ RESOLVE_PRODUCTS_PROMPT = """根据用户消息找产品。强制调 search_prod
 """
 
 
+def _filter_by_hint_relevance(results: list, hint: str) -> list:
+    """ERP4 search_products 用 ILIKE 模糊匹配 sku 字段，hint=F1 会命中
+    SKU=DS-125F10A3 的"按摩披肩"（F1 是 F10 的子串）。
+
+    策略：name/brand/category 完整含 hint（不区分大小写）的优先；
+    若有 name 命中的，仅保留 name 命中的；name/brand/category 都不命中、
+    只是 SKU 子串命中的，丢弃为噪声。
+    退路：所有候选都没在 name/brand/category 命中（用户输的是纯 SKU/编号），
+    则保留全部（可能用户在搜 SKU 前缀）。
+    """
+    if not results or not hint:
+        return results
+    h = (hint or "").lower().strip()
+    if not h:
+        return results
+    name_matches = []
+    for r in results:
+        name = (r.get("name") or "").lower()
+        brand = (r.get("brand") or "").lower()
+        category = (r.get("category") or "").lower()
+        if h in name or h in brand or h in category:
+            name_matches.append(r)
+    return name_matches if name_matches else results
+
+
 def _try_consume_product_selection(message: str, candidates: list) -> "ProductInfo | None":
     """P2-C v1.2 / P1-B v1.5：识别"选 N" / "1" / "id=X" / 名字 — 同 customer 选择逻辑。"""
     if not candidates:
@@ -111,6 +136,10 @@ async def resolve_products_node(
         # ERP4 返 {"items": [...], "total": N}；统一成 list
         if isinstance(results, dict):
             results = results.get("items", [])
+        # ERP SKU contains 噪声过滤（用 LLM 实际下发的 query 当 hint）
+        merged_q = args.get("query") if isinstance(args, dict) else None
+        if merged_q:
+            results = _filter_by_hint_relevance(results, merged_q)
         if not results:
             state.missing_fields = new_missing + ["products"]
             return state
@@ -136,6 +165,8 @@ async def resolve_products_node(
         # ERP4 返 {"items": [...], "total": N}；统一成 list
         if isinstance(results, dict):
             results = results.get("items", [])
+        # ERP SKU contains 噪声过滤：name/brand/category 含 hint 优先；都不含才保留 SKU 命中
+        results = _filter_by_hint_relevance(results, hint)
         if len(results) == 0:
             new_missing.append(f"product_not_found:{hint}")
             continue

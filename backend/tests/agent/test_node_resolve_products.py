@@ -55,6 +55,60 @@ async def test_resolve_products_same_name_ambiguous():
 
 
 @pytest.mark.asyncio
+async def test_resolve_products_filters_sku_substring_noise():
+    """ERP4 search_products 用 ILIKE 模糊匹配 SKU 字段，hint=F1 会命中
+    SKU=DS-125F10A3 的"按摩披肩"（F1 是 F10 的子串）。
+
+    resolve_products_node 应过滤这种 noise：name/brand/category 不含 hint
+    但 SKU 含 hint 子串的，丢弃；唯一真正的 F1 产品（name 含 F1）单条命中
+    应直接归到 products 而不是弹候选。
+    """
+    llm = AsyncMock()
+    llm.chat = AsyncMock(return_value=type("R", (), {"text": "", "finish_reason": "tool_calls",
+        "tool_calls": [{"id": "1", "type": "function",
+            "function": {"name": "search_products",
+                          "arguments": json.dumps({"query": "F1"})}}]})())
+    state = ContractState(user_message="F1 10 个 500", hub_user_id=1, conversation_id="c1",
+                            extracted_hints={"product_hints": ["F1"]})
+
+    # ERP4 ILIKE 匹配返 2 条：F1 系列（name 含 F1） + 按摩披肩（SKU=DS-125F10A3 子串噪声）
+    out = await resolve_products_node(state, llm=llm,
+        tool_executor=AsyncMock(return_value=[
+            {"id": 5034, "name": "按摩披肩", "sku": "DS-125F10A3", "brand": "", "category": "代采代发"},
+            {"id": 14, "name": "F1系列1代 SKG筋膜枪 银色 尊享款", "sku": "MAT0130104",
+             "brand": "SKG", "category": "商品"},
+        ]))
+    # 期望：按摩披肩被过滤掉（name/brand/category 都不含 F1）；F1 系列单条命中
+    assert len(out.products) == 1
+    assert out.products[0].id == 14
+    assert "F1系列" in out.products[0].name
+    assert "F1" not in out.candidate_products  # 不应该弹候选
+    # 不应该把 product_choice:F1 加到 missing_fields
+    assert not any("product_choice:F1" in mf for mf in out.missing_fields)
+
+
+@pytest.mark.asyncio
+async def test_resolve_products_keeps_all_when_no_name_match():
+    """退路：name/brand/category 都不命中 hint（用户输的是纯 SKU/编号），保留全部。"""
+    llm = AsyncMock()
+    llm.chat = AsyncMock(return_value=type("R", (), {"text": "", "finish_reason": "tool_calls",
+        "tool_calls": [{"id": "1", "type": "function",
+            "function": {"name": "search_products",
+                          "arguments": json.dumps({"query": "MAT0130"})}}]})())
+    state = ContractState(user_message="搜下 MAT0130", hub_user_id=1, conversation_id="c1",
+                            extracted_hints={"product_hints": ["MAT0130"]})
+    out = await resolve_products_node(state, llm=llm,
+        tool_executor=AsyncMock(return_value=[
+            {"id": 14, "name": "F1系列", "sku": "MAT0130104"},
+            {"id": 99, "name": "H5系列", "sku": "MAT0130136"},
+        ]))
+    # name/brand/category 都不含 "MAT0130"，但用户在搜 SKU 前缀 — 应保留全部
+    assert "MAT0130" in out.candidate_products or len(out.products) == 2
+    total = len(out.products) + len(out.candidate_products.get("MAT0130", []))
+    assert total == 2
+
+
+@pytest.mark.asyncio
 async def test_resolve_products_not_found():
     """产品没找到 — missing_fields 加 'products'。"""
     llm = AsyncMock()
