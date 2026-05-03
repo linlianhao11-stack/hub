@@ -1,0 +1,11 @@
+name: 单轮做合同（信息齐全）
+turns:
+  # T1：信息齐全的合同请求
+  - input: "给阿里做合同 X1 10 个 300，地址北京海淀，张三 13800001111"
+    mock_tool_calls_must_include: [search_customer, search_product, create_contract_draft]
+    final_message_contains_any: ["preview", "确认", "请回"]
+
+  # T2：用户回"是" — 触发执行
+  - input: "是"
+    mock_tool_calls_must_include: [confirm_action]
+    final_message_contains_any: ["已生成", "draft_id"]
