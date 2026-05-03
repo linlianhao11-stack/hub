@@ -11,7 +11,8 @@ SUPPORTED_TURN_FIELDS（8 个机检维度）：
   - must_contain           : 回复文本必须包含的子串列表
   - forbid                 : 回复文本不得包含的子串列表
   - sent_files_min         : file_sent 布尔 → ≥1 视为 1
-  - items_count            : state.items 精确长度
+  - items_count            : 本轮 generate/create 类 tool 调用时传入的 items 数（不读 state.items，
+                              避免 cleanup 清空后误判；review issue 3）
   - creates_pending_action : 本轮是否在 gate 中新建了 pending
   - pending_state          : {action_id: "still_pending"|"claimed"|"expired"|"missing"}
 """
@@ -133,12 +134,26 @@ async def assert_scenario_turn(
                 f"sent_files: 期望 ≥{turn['sent_files_min']}，实际 {sent}"
             )
 
-    # 6. items_count
+    # 6. items_count — review issue 3：从本轮 tool 调用 args 读，不读 state.items
+    # （cleanup_after_contract / cleanup_after_quote 都会清空 state.items）。
+    # 取本轮最后一次包含 "items" key 的 generate/create 类 tool 调用。
     if "items_count" in turn:
-        items = state_values.get("items") or []
-        if len(items) != turn["items_count"]:
+        tool_log_subset = tool_log[tool_log_before:]
+        actual_items_count = None
+        for tname, targs in reversed(tool_log_subset):
+            # 关注产生文件 / 草稿的写 tool（generate_contract_draft / generate_price_quote /
+            # create_voucher_draft 等都把 items 数组传过去）
+            if "items" in (targs or {}) and isinstance(targs.get("items"), list):
+                actual_items_count = len(targs["items"])
+                break
+        if actual_items_count is None:
             errors.append(
-                f"items_count: 期望 {turn['items_count']}，实际 {len(items)}"
+                f"items_count: 期望 {turn['items_count']}，但本轮 tool 调用里"
+                f"没有任何 generate/create 调用带 items 数组（tool_log_subset={[n for n,_ in tool_log_subset]})"
+            )
+        elif actual_items_count != turn["items_count"]:
+            errors.append(
+                f"items_count: 期望 {turn['items_count']}，实际 tool args items={actual_items_count}"
             )
 
     # 7. creates_pending_action

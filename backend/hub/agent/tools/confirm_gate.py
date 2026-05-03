@@ -173,39 +173,135 @@ class ConfirmGate:
 
         - action_id 生产路径：f"{action_prefix}-{uuid4().hex}"（32-hex）
         - idempotency_key 同 (conv, user) 命中 → 复用；跨 context 命中 → raise CrossContextIdempotency
-        """
-        # idempotency 检查
-        if idempotency_key:
-            idem_key = self._idempotency_key(idempotency_key)
-            existing_raw = await self.redis.get(idem_key)
-            if existing_raw:
-                existing = json.loads(existing_raw)
-                if (existing["conversation_id"] == conversation_id
-                        and existing["hub_user_id"] == hub_user_id):
-                    # 同 context 命中 → 复用
-                    return PendingAction(
-                        action_id=existing["action_id"],
-                        conversation_id=existing["conversation_id"],
-                        hub_user_id=existing["hub_user_id"],
-                        subgraph=existing["subgraph"],
-                        summary=existing["summary"],
-                        payload=existing["payload"],
-                        created_at=datetime.fromisoformat(existing["created_at"]),
-                        ttl_seconds=existing.get("ttl_seconds", 600),
-                        token=existing.get("token"),
-                        idempotency_key=existing.get("idempotency_key"),
-                    )
-                else:
-                    raise CrossContextIdempotency(
-                        f"idempotency_key={idempotency_key!r} 已被不同 context 使用"
-                    )
 
-        # 自动生成 action_id（生产路径）；测试 fixture 传入覆盖
+        review issue 2 加固（v9 round 2）：
+          - 用 SET NX EX 做**原子**预占：旧实现 GET → 检查 → SET 在并发下会双 create
+          - 命中已有 idempotency_key 时再做 stale check：HEXISTS pending hash；
+            旧 action_id 已被 claim/手动清/过期 → DEL stale 记录 + 重试一次（避免给用户死 action）
+        """
+        if idempotency_key is None:
+            # 无幂等需求 — 直接走非幂等路径
+            return await self._create_pending_record(
+                hub_user_id=hub_user_id, conversation_id=conversation_id,
+                subgraph=subgraph, summary=summary, payload=payload,
+                action_prefix=action_prefix, ttl_seconds=ttl_seconds,
+                idempotency_key=None, action_id=action_id,
+            )
+
+        idem_key = self._idempotency_key(idempotency_key)
+
+        # 最多重试一次：第一次失败 + stale → DEL + 第二次必须成功（自己再竞争）
+        for attempt in range(2):
+            # 准备候选 record
+            candidate_action_id = (
+                action_id if (action_id and attempt == 0)
+                else f"{action_prefix}-{uuid4_hex()}"
+            )
+            now = datetime.now(tz=timezone.utc)
+            token = self.compute_token(
+                conversation_id, hub_user_id, candidate_action_id,
+                payload.get("tool_name", ""),
+                self.canonicalize(payload.get("args", {})),
+            )
+            record = {
+                "action_id": candidate_action_id,
+                "conversation_id": conversation_id,
+                "hub_user_id": hub_user_id,
+                "subgraph": subgraph,
+                "summary": summary,
+                "payload": payload,
+                "created_at": now.isoformat(),
+                "ttl_seconds": ttl_seconds,
+                "token": token,
+                "idempotency_key": idempotency_key,
+            }
+            record_json = json.dumps(record, ensure_ascii=False)
+
+            # 原子预占 idempotency_key（SET NX EX 是 Redis 原生原子操作）
+            reserved = await self.redis.set(
+                idem_key, record_json, nx=True, ex=ttl_seconds,
+            )
+            if reserved:
+                # 我们抢到了 → 写 pending hash
+                pending_key = self._pending_key(conversation_id, hub_user_id)
+                await self.redis.hset(pending_key, candidate_action_id, record_json)
+                await self.redis.expire(pending_key, max(ttl_seconds, self.TTL))
+                return PendingAction(
+                    action_id=candidate_action_id,
+                    conversation_id=conversation_id,
+                    hub_user_id=hub_user_id,
+                    subgraph=subgraph,
+                    summary=summary,
+                    payload=payload,
+                    created_at=now,
+                    ttl_seconds=ttl_seconds,
+                    token=token,
+                    idempotency_key=idempotency_key,
+                )
+
+            # 没抢到 → key 已存在，读出来判断是 reuse / cross-context / stale
+            existing_raw = await self.redis.get(idem_key)
+            if existing_raw is None:
+                # 极端 race：刚才 SET NX 失败 → GET 又拿不到（别人删了/过期）
+                # → 直接重试（attempt 2）
+                continue
+            existing = json.loads(existing_raw)
+
+            # 跨 context → 立即拒绝，绝不返别人的 action_id
+            if (existing.get("conversation_id") != conversation_id
+                    or existing.get("hub_user_id") != hub_user_id):
+                raise CrossContextIdempotency(
+                    f"idempotency_key={idempotency_key!r} 已被不同 context 使用"
+                )
+
+            # 同 context — 验证现存的 action_id 是否还在 pending hash 里
+            existing_aid = existing.get("action_id")
+            existing_pending_key = self._pending_key(conversation_id, hub_user_id)
+            is_alive = (
+                bool(existing_aid)
+                and await self.redis.hexists(existing_pending_key, existing_aid)
+            )
+            if is_alive:
+                # 真复用 — 返回现有 PendingAction
+                return PendingAction(
+                    action_id=existing_aid,
+                    conversation_id=existing["conversation_id"],
+                    hub_user_id=existing["hub_user_id"],
+                    subgraph=existing["subgraph"],
+                    summary=existing["summary"],
+                    payload=existing["payload"],
+                    created_at=datetime.fromisoformat(existing["created_at"]),
+                    ttl_seconds=existing.get("ttl_seconds", 600),
+                    token=existing.get("token"),
+                    idempotency_key=existing.get("idempotency_key"),
+                )
+
+            # Stale：idempotency_key 还在但 action_id 已不在 pending hash
+            # → 清掉 stale 记录，下一轮 attempt 会用新 action_id 重新 SET NX
+            await self.redis.delete(idem_key)
+            # 继续下一次 attempt
+
+        # 不应到这里；safety
+        raise RuntimeError(
+            f"create_pending 重试耗尽 (idempotency_key={idempotency_key!r}) — "
+            f"Redis 状态异常，请检查"
+        )
+
+    async def _create_pending_record(
+        self, *,
+        hub_user_id: int,
+        conversation_id: str,
+        subgraph: str,
+        summary: str,
+        payload: dict,
+        action_prefix: str,
+        ttl_seconds: int,
+        idempotency_key: str | None,
+        action_id: str | None,
+    ) -> PendingAction:
+        """无幂等路径 — 直接生成 + 写入。"""
         if action_id is None:
             action_id = f"{action_prefix}-{uuid4_hex()}"
-        # 验证 action_id 格式（必须含 "-"，后面是 32-hex）
-        # 允许测试传短 id（如 "adj-1"）以便断言，不强制校验长度
-
         now = datetime.now(tz=timezone.utc)
         token = self.compute_token(
             conversation_id, hub_user_id, action_id,
@@ -230,12 +326,6 @@ class ConfirmGate:
             json.dumps(record, ensure_ascii=False),
         )
         await self.redis.expire(pending_key, max(ttl_seconds, self.TTL))
-
-        if idempotency_key:
-            idem_key = self._idempotency_key(idempotency_key)
-            await self.redis.set(idem_key, json.dumps(record, ensure_ascii=False),
-                                 ex=ttl_seconds)
-
         return PendingAction(
             action_id=action_id,
             conversation_id=conversation_id,

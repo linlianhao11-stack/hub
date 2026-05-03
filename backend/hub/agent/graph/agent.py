@@ -265,7 +265,10 @@ class GraphAgent:
         spec §2.1：LangGraph config thread_id = f"{conversation_id}:{hub_user_id}"
         """
         # P1-A v1.5 update_payload：只传本轮新字段，让 LangGraph checkpoint
-        # 从上一轮 hydrate 跨轮状态（不强写 [] / {} 默认值覆盖）
+        # 从上一轮 hydrate 跨轮状态（不强写 [] / {} 默认值覆盖）。
+        # review issue 4：上一轮的输出字段（intent / final_response / file_sent /
+        # confirmed_* / errors）必须显式 reset，避免跨轮 hydrate 污染本轮判定，
+        # 比如普通聊天显示 file_sent=True、上轮 confirmed_payload 残留导致路由误判。
         update_payload: dict = {
             "user_message": user_message,
             "hub_user_id": hub_user_id,
@@ -273,6 +276,10 @@ class GraphAgent:
             "intent": None,
             "final_response": None,
             "errors": [],
+            "file_sent": False,
+            "confirmed_subgraph": None,
+            "confirmed_action_id": None,
+            "confirmed_payload": None,
         }
         if acting_as is not None:
             update_payload["acting_as"] = acting_as
@@ -295,15 +302,18 @@ class GraphAgent:
 async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> AgentState:
     """P1-A v1.3 pre_router：基于上下文 + 消息类型直接判 intent，跳过 LLM。
 
-    优先级：
-    1. 有 pending actions + 确认词 → CONFIRM
-    2. 有 candidate_* / active_subgraph + 选择词 → 上轮活跃子图的 intent
+    优先级（review issue 1 修正：pending 命中时纯数字 / 选 N / 第 N 个 / id=N 也算 CONFIRM）：
+    1. 有 pending actions + 确认/选择类消息（"确认" / 数字 / "选 N" / "第 N 个" / id=N / action_id 前缀）
+       → Intent.CONFIRM。confirm_node 内部会按编号匹配 pending list。
+    2. 候选 + 选择词（仅当无 pending 时；pending 优先）
+       → 上轮活跃子图的 intent
     3. 否则 intent = None → 交给 LLM router
     """
     msg = state.user_message
 
-    # 1. pending + 确认类消息
-    if gate is not None and _is_confirm_message(msg):
+    # 1. pending + 确认/选择类消息：pending 优先于 candidate 路由
+    #    （review issue 1：用户回 "1" 选第 1 个 pending 必须能进 confirm_node）
+    if gate is not None and (_is_confirm_message(msg) or _is_selection_message(msg)):
         try:
             pendings = await gate.list_pending_for_context(
                 conversation_id=state.conversation_id,
@@ -313,9 +323,9 @@ async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> Ag
                 state.intent = Intent.CONFIRM
                 return state
         except Exception:
-            pass  # 查 pending 失败 → 兜底走 LLM
+            pass  # 查 pending 失败 → 兜底走下一档（candidate / LLM）
 
-    # 2. 候选 + 选择消息
+    # 2. 候选 + 选择消息（pending 已检过；走到这里说明无 pending）
     if _is_selection_message(msg):
         if state.candidate_customers or state.candidate_products:
             intent = _subgraph_to_intent(state.active_subgraph)

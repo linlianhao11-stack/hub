@@ -35,13 +35,17 @@ async def generate_contract_node(state: ContractState, *, llm, tool_executor) ->
 
 
 async def cleanup_after_contract_node(state: ContractState) -> ContractState:
-    # items 不清空 — parse_contract_items 每次都重新生成，保留供 e2e 测试验证
-    # 其余跨轮工作字段（候选、客户、产品、地址、hints、缺字段）全部重置
+    # review issue 3：items 必须清空 — 之前 v1.11 保留 items 是为了 e2e 验证，
+    # 但 checkpoint 会让下一轮的 chat/query/admin snapshot 误显示上一单明细，
+    # 新合同流程等待候选/缺字段时也可能继续携带上一单 items。
+    # 与 quote cleanup_after_quote_node 对齐：items 整字段替换为空 list。
+    # eval items_count 改从 generate_contract_draft tool args 读，不依赖 state.items。
     state.active_subgraph = None
     state.candidate_customers = []
     state.candidate_products = {}
     state.customer = None
     state.products = []
+    state.items = []
     state.shipping = ShippingInfo()
     state.extracted_hints = {}
     state.missing_fields = []

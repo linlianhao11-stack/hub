@@ -201,3 +201,103 @@ async def test_confirm_node_multi_pending_select_first_claims_only_first(gate):
     assert out.confirmed_payload["args"]["new_price"] == 280.0
     # p2 仍 pending
     assert not await gate.is_claimed(p2.action_id)
+
+
+# ─────────────── review issue 2: idempotency 原子 + stale check ───────────────
+
+
+@pytest.mark.asyncio
+async def test_idempotency_concurrent_same_context_creates_only_one_action(gate):
+    """review issue 2：并发 create_pending 同 idempotency_key 同 context 必须只创建 1 个 action。
+
+    旧实现是 GET → 检查 → SET，并发会创建 2 个 pending（hash 里 2 个 entry）。
+    新实现用 Lua 原子 check-and-set，2 个并发只有 1 个能创建。
+    """
+    async def worker():
+        return await gate.create_pending(
+            hub_user_id=1, conversation_id="c1",
+            subgraph="voucher", summary="SO-1 出库",
+            payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+            action_prefix="vch",
+            idempotency_key="vch:1:outbound",
+            ttl_seconds=600,
+        )
+
+    # 并发跑 5 个 worker
+    results = await asyncio.gather(*[worker() for _ in range(5)])
+    # 5 个返回的 action_id 应全相同（只创建 1 个）
+    action_ids = {p.action_id for p in results}
+    assert len(action_ids) == 1, (
+        f"并发同 idempotency_key 应只创建 1 个 action，实际创建了 {len(action_ids)} 个: {action_ids}"
+    )
+    # 验 pending hash 只有 1 个 entry
+    pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
+    assert len(pendings) == 1, f"pending hash 应只有 1 个 entry，实际 {len(pendings)}"
+    assert pendings[0].action_id == results[0].action_id
+
+
+@pytest.mark.asyncio
+async def test_idempotency_concurrent_cross_context_one_succeeds_one_raises(gate):
+    """review issue 2：并发 create_pending 同 key 跨 context 必须 1 成功 / 其他 raise。"""
+    async def worker(conv: str, user: int):
+        try:
+            return await gate.create_pending(
+                hub_user_id=user, conversation_id=conv,
+                subgraph="voucher", summary="x",
+                payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+                action_prefix="vch",
+                idempotency_key="vch:1:outbound",
+                ttl_seconds=600,
+            )
+        except Exception as e:
+            return e
+
+    # A 在 c1-private 跑 / B 在 c2-group 跑
+    results = await asyncio.gather(
+        worker("c1-private", 1),
+        worker("c2-group", 2),
+    )
+    # 必须正好 1 个 PendingAction + 1 个 CrossContextIdempotency
+    from hub.agent.tools.confirm_gate import CrossContextIdempotency
+    pending_count = sum(1 for r in results if isinstance(r, PendingAction))
+    cross_count = sum(1 for r in results if isinstance(r, CrossContextIdempotency))
+    assert pending_count == 1, f"应正好 1 个并发成功，实际 {pending_count}"
+    assert cross_count == 1, f"应正好 1 个并发被 CrossContextIdempotency 拒，实际 {cross_count}"
+
+
+@pytest.mark.asyncio
+async def test_idempotency_stale_record_is_replaced_not_returned(gate):
+    """review issue 2：idempotency_key 命中但对应 action_id 已不在 pending hash（被 claim/过期/手动清）
+    必须被识别为 stale，重新创建一个新的 PendingAction，而不是返回死 action_id。
+    """
+    # 先创建一个 pending
+    p1 = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:1:outbound",
+        ttl_seconds=600,
+    )
+
+    # 模拟 stale：从 pending hash 中删除该 action_id（保留 idempotency_key 不动）
+    pending_key = gate._pending_key("c1", 1)
+    await gate.redis.hdel(pending_key, p1.action_id)
+    # 此时 idempotency_key 还在，但指向的 action_id 已不在 pending hash → stale
+
+    # 再次 create_pending：应识别 stale，创建新的 action_id（不返回旧死 id）
+    p2 = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:1:outbound",
+        ttl_seconds=600,
+    )
+    assert p2.action_id != p1.action_id, (
+        f"stale idempotency_key 应被替换；旧 {p1.action_id} 不应再返回"
+    )
+    # 新的 action_id 必须真在 pending hash 里
+    pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
+    assert len(pendings) == 1
+    assert pendings[0].action_id == p2.action_id

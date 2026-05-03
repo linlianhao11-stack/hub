@@ -179,13 +179,173 @@ async def test_candidate_persists_through_checkpoint_and_consumed_next_round():
     # 验 final state（cleanup_after_contract 之后）
     # LangGraph checkpoint 只持久化非默认值字段 — None / [] / {} 等默认值可能不在 keys 里，
     # 需用 .get() 防止 KeyError（等效语义：字段不存在 = 已恢复默认值）。
-    # items 不清空 — parse_contract_items 每次重新生成，e2e 测试可验证 items_count。
+    # review issue 3：items 也清空 — eval items_count 改从 generate tool args 读。
     snapshot2 = await agent.compiled_graph.aget_state(config)
     assert snapshot2.values.get("draft_id") == 999
     assert snapshot2.values.get("file_sent") is True
     assert snapshot2.values.get("customer") is None
     assert snapshot2.values.get("products", []) == []
+    assert snapshot2.values.get("items", []) == []
     assert snapshot2.values.get("candidate_customers", []) == []
     assert snapshot2.values.get("candidate_products", {}) == {}
     assert snapshot2.values.get("extracted_hints", {}) == {}
     assert snapshot2.values.get("active_subgraph") is None
+
+
+# ─────────────────────────── pre_router 路由测试（review issue 1） ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pre_router_routes_numeric_to_confirm_when_pendings_exist():
+    """review issue 1：pending 存在时，纯数字 / 选 N / 第 N 个 / id=N 都路由到 CONFIRM。
+
+    场景：context 里有两个 pending action，用户回 "1" 期望选第 1 个 pending 执行；
+    若 _is_confirm_message 不识别纯数字，会先走 LLM router 误判 chat/unknown。
+    """
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    fake_pendings = [
+        PendingAction(
+            action_id="adj-aaaa1111", conversation_id="c1", hub_user_id=1,
+            subgraph="adjust_price", summary="阿里 X1 → 280",
+            payload={"tool_name": "create_price_adjustment_request", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+        PendingAction(
+            action_id="vch-bbbb2222", conversation_id="c1", hub_user_id=1,
+            subgraph="voucher", summary="SO-1 出库",
+            payload={"tool_name": "create_voucher_draft", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    selection_inputs = ["1", "选 1", "选1", "第一个", "第1个", "id=adj-aaaa1111"]
+    for msg in selection_inputs:
+        state = AgentState(user_message=msg, hub_user_id=1, conversation_id="c1")
+        out = await _pre_router_node(state, gate=gate)
+        assert out.intent == Intent.CONFIRM, (
+            f"消息 {msg!r} 在有 pending 时应路由到 CONFIRM，实际 {out.intent!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pre_router_action_id_routes_to_confirm():
+    """review issue 1：用户复制 action_id 回复时进 CONFIRM。"""
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    fake_pendings = [
+        PendingAction(
+            action_id="adj-aaaa1111aaaa1111aaaa1111aaaa1111", conversation_id="c1",
+            hub_user_id=1, subgraph="adjust_price", summary="x", payload={},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    state = AgentState(
+        user_message="adj-aaaa1111aaaa1111aaaa1111aaaa1111",
+        hub_user_id=1, conversation_id="c1",
+    )
+    out = await _pre_router_node(state, gate=gate)
+    assert out.intent == Intent.CONFIRM
+
+
+@pytest.mark.asyncio
+async def test_pre_router_candidate_selection_not_hijacked_by_pending():
+    """review issue 1：candidate_* 选择不应被 pending 路由抢走。
+
+    场景：context 里没有 pending，但有 candidate_customers + active_subgraph=contract，
+    用户回 "1" 应该路由到 CONTRACT（候选选择），不是 CONFIRM。
+    """
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent, CustomerInfo
+    from hub.agent.tools.confirm_gate import ConfirmGate
+    from unittest.mock import AsyncMock
+
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=[])  # 无 pending
+
+    state = AgentState(user_message="1", hub_user_id=1, conversation_id="c1")
+    state.candidate_customers = [
+        CustomerInfo(id=10, name="阿里巴巴"),
+        CustomerInfo(id=11, name="阿里云"),
+    ]
+    state.active_subgraph = "contract"
+    out = await _pre_router_node(state, gate=gate)
+    assert out.intent == Intent.CONTRACT, (
+        f"无 pending + candidate_customers + 活跃 contract 时 '1' 应路由 CONTRACT，"
+        f"实际 {out.intent!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_router_chat_no_pending_no_candidate_falls_to_llm_router():
+    """review issue 1：无 pending + 无 candidate 时纯数字应让 LLM router 决定（intent=None）。"""
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState
+    from hub.agent.tools.confirm_gate import ConfirmGate
+    from unittest.mock import AsyncMock
+
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=[])
+
+    state = AgentState(user_message="1", hub_user_id=1, conversation_id="c1")
+    out = await _pre_router_node(state, gate=gate)
+    assert out.intent is None, f"无 pending + 无 candidate 应交给 LLM router，实际 {out.intent!r}"
+
+
+# ─────────────────────────── run() 字段重置测试（review issue 4） ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_resets_per_turn_output_fields():
+    """review issue 4：每轮 update_payload 必须重置上轮输出字段，
+    避免 file_sent / confirmed_* 跨轮 hydrate 污染本轮判定。
+    """
+    from hub.agent.graph.agent import GraphAgent
+
+    captured_payloads: list[dict] = []
+
+    class CapturingCompiled:
+        async def ainvoke(self, payload, *, config):
+            captured_payloads.append(payload)
+            return {"final_response": "ok"}
+
+        async def aget_state(self, config):
+            return None
+
+        def get_graph(self):
+            class G:
+                nodes = []
+                edges = []
+            return G()
+
+    agent = GraphAgent(
+        compiled_graph=CapturingCompiled(), llm=AsyncMock(),
+        registry=AsyncMock(), confirm_gate=AsyncMock(),
+        session_memory=AsyncMock(), tool_executor=AsyncMock(),
+    )
+    await agent.run(user_message="hi", hub_user_id=1, conversation_id="c1")
+    assert len(captured_payloads) == 1
+    p = captured_payloads[0]
+    # 每轮必须显式 reset 这些上轮输出字段（避免 LangGraph checkpoint hydrate 污染）
+    assert p.get("file_sent") is False, "file_sent 必须每轮 reset 为 False"
+    assert p.get("confirmed_subgraph") is None, "confirmed_subgraph 必须每轮 reset 为 None"
+    assert p.get("confirmed_action_id") is None, "confirmed_action_id 必须每轮 reset 为 None"
+    assert p.get("confirmed_payload") is None, "confirmed_payload 必须每轮 reset 为 None"
+    # 现有的也应保留
+    assert p.get("intent") is None
+    assert p.get("final_response") is None
+    assert p.get("errors") == []

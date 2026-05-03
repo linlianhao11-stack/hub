@@ -79,8 +79,10 @@ async def test_cleanup_after_contract_clears_complete_working_state():
 
     assert out.customer is None
     assert out.products == []
-    # items 保留（parse_contract_items 每次重新生成；保留供 e2e items_count 校验）
-    assert len(out.items) == 1  # 不被清空
+    # review issue 3：items 也必须清空（与 quote cleanup 对齐），
+    # 防止下一轮 chat/query/admin/eval snapshot 误显示上一单 items；
+    # eval items_count 改从 generate_contract_draft tool args 取，不再依赖 state.items
+    assert out.items == [], f"items 应该被清空，实际 {out.items}"
     assert out.shipping.address is None
     assert out.shipping.contact is None
     assert out.shipping.phone is None
