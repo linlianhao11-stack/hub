@@ -9,7 +9,6 @@ backend/hub/agent/llm_client.py）,让 LangGraph create_react_agent 能直接用
 """
 from __future__ import annotations
 import logging
-from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -85,7 +84,7 @@ class DeepSeekChatModel(BaseChatModel):
     # Pydantic v2 配置（langchain-core 0.3.x 已用 Pydantic 2;`class Config` 无效）
     model_config = ConfigDict(arbitrary_types_allowed=True)  # DeepSeekLLMClient 不是 Pydantic
 
-    deepseek_client: Any  # DeepSeekLLMClient 或测试用 mock（duck-typing）
+    deepseek_client: DeepSeekLLMClient
     # 可变默认值用 Field(default_factory=...),避免 Pydantic v2 的 mutable default 校验报错
     bound_tools: list[dict] = Field(default_factory=list)  # OpenAI schema dict 列表（bind_tools 后填）
     temperature: float = 0.0
@@ -113,23 +112,17 @@ class DeepSeekChatModel(BaseChatModel):
     ) -> ChatResult:
         """LangChain async generation 入口 — 转 hub DeepSeekLLMClient.chat()。
 
-        DeepSeekLLMClient 内部已处理 httpx 级别重试（400/429/5xx 等）。
-        若 client 抛出 LLMServiceError（max_retries 全部耗尽），wrapper 再补一次
-        重试机会，以应对极少数情况下 client 内部 retry 全部失败但下次调用可恢复的场景。
+        DeepSeekLLMClient 内部已做完整 retry（400/408/425/429/500-504/TransportError +
+        指数退避）。wrapper 不重复 retry — 若 client 抛 LLMServiceError 直接上报,
+        LangGraph 收到后由 ReActAgent.run 顶层 except 兜底（→ 友好错误 / fallback）。
         """
-        from hub.capabilities.deepseek import LLMServiceError
         oai_messages = _messages_to_openai_format(messages)
-        call_kwargs = dict(
+        resp = await self.deepseek_client.chat(
             messages=oai_messages,
             tools=self.bound_tools or None,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        try:
-            resp = await self.deepseek_client.chat(**call_kwargs)
-        except LLMServiceError:
-            logger.warning("DeepSeekLLMClient raised LLMServiceError, retrying once")
-            resp = await self.deepseek_client.chat(**call_kwargs)
         # resp.text / resp.tool_calls / resp.finish_reason
         ai_msg_kwargs: dict = {"content": resp.text or ""}
         if resp.tool_calls:
