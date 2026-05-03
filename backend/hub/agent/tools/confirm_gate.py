@@ -312,10 +312,14 @@ class ConfirmGate:
                         # review round 4 / P1：idem TTL 与 pending 物理 TTL 同步（max_pending_ttl），
                         # 不能用 ttl_seconds —— 否则 ttl_seconds < self.TTL 时 idem 先过期，旧 pending
                         # 仍在物理 hash 里，新请求绕过 stale 检查再创建 → 同 idempotency_key 双 pending。
+                        # review round 5 / P1：pending_key 是 (conv,user) 共享 hash，多 action 复用同一
+                        # 物理 key；EXPIRE 必须用 GT 只延长不缩短，否则后建短 TTL action 会让先建长
+                        # TTL action（如 voucher 12h）物理 entry 提前消失 → idem 还在但 hash 没了
+                        # → 下次同 key 请求把它判 stale → 双 pending。
                         pipe.multi()
                         pipe.set(idem_key, record_json, ex=max_pending_ttl)
                         pipe.hset(pending_key, candidate_action_id, record_json)
-                        pipe.expire(pending_key, max_pending_ttl)
+                        pipe.expire(pending_key, max_pending_ttl, gt=True)
                         await pipe.execute()
                         return PendingAction(
                             action_id=candidate_action_id,
@@ -427,7 +431,9 @@ class ConfirmGate:
             pending_key, action_id,
             json.dumps(record, ensure_ascii=False),
         )
-        await self.redis.expire(pending_key, max(ttl_seconds, self.TTL))
+        # review round 5 / P1：EXPIRE GT 只延长不缩短，避免短 TTL 邻居把已有的
+        # 长 TTL voucher (12h) hash 缩短到 30min。pending_key 是 (conv,user) 共享 hash。
+        await self.redis.expire(pending_key, max(ttl_seconds, self.TTL), gt=True)
         return PendingAction(
             action_id=action_id,
             conversation_id=conversation_id,

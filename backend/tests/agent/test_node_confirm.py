@@ -574,6 +574,135 @@ async def test_idempotency_key_ttl_matches_pending_physical_ttl(gate):
 
 
 @pytest.mark.asyncio
+async def test_pending_hash_ttl_only_extends_never_shrinks_with_idempotency(gate):
+    """review round 5 / P1：同会话先长 TTL voucher 再短 TTL adjust_price，
+    pending_key 物理 TTL 必须只延长不缩短。
+
+    旧实现：每次 create_pending 都 EXPIRE pending_key max_pending_ttl，
+    后建的短 TTL action 会把整个 hash key 的 TTL 缩短到 max(short_ttl, self.TTL=1800)，
+    长 TTL voucher 物理过期后旧 idem 还活着 → 同 idempotency_key 新请求把它当
+    stale 删除并重新创建 → 同订单同类型双 pending，破坏 12h 幂等承诺。
+
+    新实现：用 `EXPIRE ... GT` 只在新 TTL 大于现有 TTL 时更新；
+    多 action 在同一 hash 时长 TTL 永远不被短 TTL 覆盖。
+    """
+    # 1. 长 TTL voucher (12h)
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="SO-1 出库",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:1:outbound",
+        ttl_seconds=43200,  # 12h
+    )
+    pending_key = gate._pending_key("c1", 1)
+    long_ttl = await gate.redis.ttl(pending_key)
+    assert long_ttl >= 43000, f"voucher 创建后 hash TTL 应≥43000s，实际 {long_ttl}"
+
+    # 2. 同会话再来一个短 TTL adjust_price (10min)
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="阿里 X1 → 280",
+        payload={"tool_name": "create_price_adjustment_request",
+                 "args": {"customer_id": 10, "product_id": 1, "new_price": 280.0}},
+        action_prefix="adj",
+        idempotency_key="adj:c1:1:1:10:1:280",
+        ttl_seconds=600,  # 10min；max_pending_ttl 取 max(600, 1800)=1800s
+    )
+
+    # 关键断言：hash TTL 不被缩短
+    after_ttl = await gate.redis.ttl(pending_key)
+    assert after_ttl >= 43000, (
+        f"短 TTL action 不能缩短 voucher 长 TTL：voucher 12h 后建短 adjust_price 10min，"
+        f"hash TTL 现在 {after_ttl}s（应仍 ≥43000s）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_voucher_idempotency_survives_short_ttl_neighbor_in_same_conv(gate):
+    """review round 5 / P1：voucher 12h 幂等承诺不被同会话短 TTL 邻居破坏（端到端）。
+
+    模拟用户行为：
+      t=0: create voucher pending (12h)
+      t≈0: 同会话 create adjust_price pending (10min)
+      若 hash TTL 被缩短到 30min，voucher 物理 entry 在 30min 后消失
+      但 voucher idem_key 仍活 12h → 同订单同类型新请求会"恢复"创建 → 双 pending
+    """
+    # 长 TTL voucher
+    p1_voucher = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="SO-1 出库",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:1:outbound",
+        ttl_seconds=43200,
+    )
+    # 短 TTL adjust_price
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="x",
+        payload={"tool_name": "x", "args": {}},
+        action_prefix="adj",
+        idempotency_key="adj:c1:1:1:1:1:1",
+        ttl_seconds=600,
+    )
+
+    # voucher pending 物理 TTL 应仍接近 12h（不被 adjust_price 缩短）
+    pending_key = gate._pending_key("c1", 1)
+    after_ttl = await gate.redis.ttl(pending_key)
+    assert after_ttl >= 43000, (
+        f"voucher 12h 幂等承诺被破坏：hash TTL={after_ttl}s（应仍接近 43200s）"
+    )
+
+    # 同 idempotency_key 重新发起 → 必须复用 p1_voucher（不是创建新的）
+    p2_voucher = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="SO-1 出库",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:1:outbound",
+        ttl_seconds=43200,
+    )
+    assert p2_voucher.action_id == p1_voucher.action_id, (
+        f"voucher idempotency 必须复用同一 action_id；旧 {p1_voucher.action_id} 新 {p2_voucher.action_id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_pending_record_no_idempotency_path_also_extends_only(gate):
+    """review round 5 / P1：无幂等路径（_create_pending_record）的 EXPIRE 也必须只延长。
+
+    没传 idempotency_key 时走 _create_pending_record；同样 EXPIRE pending_key 不能
+    把已有的长 TTL hash 缩短。
+    """
+    # 1. 同会话先有一个长 TTL（通过 idem 路径建）
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "x", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:1:outbound",
+        ttl_seconds=43200,
+    )
+    pending_key = gate._pending_key("c1", 1)
+    assert await gate.redis.ttl(pending_key) >= 43000
+
+    # 2. 同会话用无 idempotency_key 路径建短 TTL action
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="x",
+        payload={"tool_name": "x", "args": {}},
+        action_prefix="adj",
+        ttl_seconds=600,  # 短
+        # 不传 idempotency_key → 走 _create_pending_record
+    )
+    after_ttl = await gate.redis.ttl(pending_key)
+    assert after_ttl >= 43000, (
+        f"_create_pending_record 路径也应只延长 hash TTL，不缩短；实际 {after_ttl}s"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cas_delete_idempotency_key_succeeds_when_value_unchanged(gate):
     """review round 2 / P1：CAS 删除在值未变时正常成功（保证正常 stale 清理路径仍走得通）。"""
     p = await gate.create_pending(
