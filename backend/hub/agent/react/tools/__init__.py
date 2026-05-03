@@ -9,6 +9,7 @@ from hub.agent.react.tools.write import (
     create_contract_draft, create_quote_draft, create_voucher_draft,
     request_price_adjustment, request_stock_adjustment,
 )
+from hub.agent.react.tools.confirm import confirm_action
 
 ALL_TOOLS = [
     # read
@@ -19,4 +20,7 @@ ALL_TOOLS = [
     # write (plan 阶段)
     create_contract_draft, create_quote_draft, create_voucher_draft,
     request_price_adjustment, request_stock_adjustment,
+    # confirm
+    confirm_action,
 ]
+# 共 16 个
