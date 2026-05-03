@@ -80,6 +80,9 @@ PERMISSIONS.extend([
      "审批库存调整", "允许仓管审批库存调整草稿"),
     ("usecase.create_voucher.approve", "usecase", "create_voucher", "approve",
      "审批凭证", "允许会计批量审凭证草稿"),
+    ("usecase.query_recent_drafts.use", "usecase", "query_recent_drafts", "use",
+     "复用上份合同查询",
+     "允许 ReAct agent 查最近合同草稿(用于'同样给 X 也来一份'类自然表达)"),
 ])
 
 
@@ -146,6 +149,7 @@ ROLES["bot_user_basic"]["permissions"].extend([
     "usecase.query_customer.use",
     "usecase.query_inventory.use",
     "usecase.query_orders.use",
+    "usecase.query_recent_drafts.use",
 ])
 
 # bot_user_sales 加：query_customer / query_customer_balance / query_inventory /
@@ -158,6 +162,7 @@ ROLES["bot_user_sales"]["permissions"].extend([
     "usecase.generate_quote.use",
     "usecase.export.use",
     "usecase.adjust_price.use",
+    "usecase.query_recent_drafts.use",
 ])
 
 # bot_user_finance 加：query_customer / query_customer_balance / query_orders /

@@ -9,6 +9,13 @@ from langchain_core.tools import tool
 from hub.agent.tools import erp_tools, analyze_tools
 from hub.agent.react.tools._invoke import invoke_business_tool
 
+# 模块级 import — 让测试 monkeypatch 能命中 read.* 路径
+from hub.agent.react.context import tool_ctx
+from hub.agent.tools.erp_tools import current_erp_adapter
+from hub.models.contract import ContractDraft
+from hub.permissions import require_permissions
+from hub.observability.tool_logger import log_tool_call
+
 
 @tool
 async def search_customer(query: str) -> list[dict]:
@@ -129,3 +136,96 @@ async def analyze_top_customers(period: str = "近一月", top_n: int = 10) -> d
         args={"period": period, "top_n": top_n},
         fn=analyze_tools.analyze_top_customers,
     )
+
+
+async def _query_recent_contract_drafts(
+    conversation_id: str, hub_user_id: int, limit: int,
+) -> list[dict]:
+    """查 ContractDraft sent 的最近 limit 条 — 抽成 helper 便于 mock。"""
+    drafts = await (
+        ContractDraft.filter(
+            conversation_id=conversation_id,
+            requester_hub_user_id=hub_user_id,
+            status="sent",
+        )
+        .order_by("-created_at")
+        .limit(limit)
+    )
+    return [
+        {
+            "id": d.id,
+            "customer_id": d.customer_id,
+            "items": d.items or [],
+            "extras": d.extras or {},
+            "status": d.status,
+            "created_at": str(d.created_at),
+        }
+        for d in drafts
+    ]
+
+
+async def _get_erp_customer_name(customer_id: int, acting_as_user_id: int) -> str:
+    """从 ERP 拿客户 name（drafts 表只存 id）。"""
+    adapter = current_erp_adapter()
+    try:
+        detail = await adapter.get_customer(
+            customer_id=customer_id, acting_as_user_id=acting_as_user_id,
+        )
+        return detail.get("name", f"<id={customer_id}>")
+    except Exception:
+        return f"<id={customer_id}>"
+
+
+@tool
+async def get_recent_drafts(limit: int = 5) -> list[dict]:
+    """**关键 tool：当前会话最近的合同草稿(contract only),让 LLM 处理"同样/上次/复用"等表达。**
+
+    返回最近 limit 条 contract 草稿（按 created_at desc 排序),每条含 customer_name /
+    items / shipping / payment_terms / tax_rate / created_at。
+
+    使用时机：用户消息提到"和上份一样" / "前面那份给 X 也来一份" / "复制上次合同"
+    等表达,先调本 tool 拿 items 和 shipping,再调 search_customer 找新客户,然后
+    调 create_contract_draft 提交。
+
+    返 [] 表示当前会话没有合同历史。范围限定为 contract（YAGNI）。
+    """
+    c = tool_ctx.get()
+    if c is None:
+        raise RuntimeError("tool_ctx 未 set")
+
+    await require_permissions(c["hub_user_id"], ["usecase.query_recent_drafts.use"])
+
+    async with log_tool_call(
+        conversation_id=c["conversation_id"],
+        hub_user_id=c["hub_user_id"],
+        round_idx=0,
+        tool_name="get_recent_drafts",
+        args={"limit": limit},
+    ) as log_ctx:
+        raw = await _query_recent_contract_drafts(
+            c["conversation_id"],
+            c["hub_user_id"],
+            limit,
+        )
+
+        acting_as = c.get("acting_as") or c["hub_user_id"]
+        out: list[dict] = []
+        for d in raw:
+            cust_name = await _get_erp_customer_name(d["customer_id"], acting_as)
+            ext = d.get("extras") or {}
+            out.append({
+                "draft_id": d["id"],
+                "customer_id": d["customer_id"],
+                "customer_name": cust_name,
+                "items": d.get("items") or [],
+                "shipping": {
+                    "address": ext.get("shipping_address") or "",
+                    "contact": ext.get("shipping_contact") or "",
+                    "phone": ext.get("shipping_phone") or "",
+                },
+                "payment_terms": ext.get("payment_terms") or "",
+                "tax_rate": ext.get("tax_rate") or "",
+                "created_at": d.get("created_at") or "",
+            })
+        log_ctx.set_result(out)
+        return out

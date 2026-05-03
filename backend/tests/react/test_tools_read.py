@@ -138,3 +138,61 @@ async def test_analyze_top_customers(fake_ctx):
         result = await analyze_top_customers.ainvoke({"period": "近一月", "top_n": 10})
     fake_fn.assert_awaited_once_with(period="近一月", top_n=10, acting_as_user_id=1)
     assert result["items"][0]["customer_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_get_recent_drafts(fake_ctx, monkeypatch):
+    """contract 类型,调 _query_recent_contract_drafts helper 拿草稿,反向填到 result。"""
+    from hub.agent.react.tools.read import get_recent_drafts
+    from unittest.mock import AsyncMock
+
+    fake_drafts = [{
+        "id": 20,
+        "customer_id": 7,
+        "requester_hub_user_id": 1,
+        "conversation_id": "test-conv",
+        "items": [{"product_id": 1, "qty": 10, "price": 300}],
+        "extras": {
+            "shipping_address": "北京海淀", "shipping_contact": "张三",
+            "shipping_phone": "138...",
+            "payment_terms": "30 天", "tax_rate": "13%",
+        },
+        "status": "sent",
+        "created_at": "2026-05-03T10:00:00",
+    }]
+    async def _fake_query(conv_id, hub_user_id, limit):
+        # 防御性断言：实施者不能误删 helper 的 conversation_id / hub_user_id 过滤
+        assert conv_id == "test-conv"
+        assert hub_user_id == 1
+        return fake_drafts
+    monkeypatch.setattr(
+        "hub.agent.react.tools.read._query_recent_contract_drafts", _fake_query,
+    )
+    monkeypatch.setattr(
+        "hub.agent.react.tools.read._get_erp_customer_name",
+        AsyncMock(return_value="翼蓝"),
+    )
+    monkeypatch.setattr(
+        "hub.agent.react.tools.read.require_permissions", AsyncMock(),
+    )
+    from contextlib import asynccontextmanager
+
+    class _FakeLogCtx:
+        def set_result(self, _r): ...
+
+    @asynccontextmanager
+    async def _fake_log_tool_call(**kwargs):
+        yield _FakeLogCtx()
+
+    monkeypatch.setattr(
+        "hub.agent.react.tools.read.log_tool_call", _fake_log_tool_call,
+    )
+
+    result = await get_recent_drafts.ainvoke({"limit": 5})
+
+    assert len(result) == 1
+    assert result[0]["draft_id"] == 20
+    assert result[0]["customer_name"] == "翼蓝"
+    assert result[0]["items"][0]["product_id"] == 1
+    assert result[0]["shipping"]["address"] == "北京海淀"
+    assert result[0]["payment_terms"] == "30 天"
