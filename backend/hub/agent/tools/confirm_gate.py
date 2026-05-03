@@ -156,6 +156,42 @@ class ConfirmGate:
     def _idempotency_key(self, idempotency_key: str) -> str:
         return f"hub:agent:idempotency:{idempotency_key}"
 
+    @staticmethod
+    def _record_is_expired(data: dict) -> bool:
+        """根据 pending record 的 created_at + ttl_seconds 判定逻辑是否过期。
+
+        review round 4 / P1：物理 hash TTL = max(ttl_seconds, self.TTL=1800s)，
+        但 record 自己的 ttl_seconds 是真实可确认窗口。两者不一致时，必须用
+        record-level TTL 做判定，否则 ttl_seconds < self.TTL 时旧 pending 还会被
+        list / claim / 当作 alive 复用。
+        """
+        try:
+            created_at = datetime.fromisoformat(data["created_at"])
+            ttl = int(data.get("ttl_seconds", 600))
+        except (KeyError, ValueError, TypeError):
+            return False  # 数据缺字段 → 保守认为不过期，沿用旧行为
+        delta = datetime.now(tz=timezone.utc) - created_at
+        return delta.total_seconds() > ttl
+
+    async def _is_pending_alive_not_expired(
+        self, *, conversation_id: str, hub_user_id: int, action_id: str,
+    ) -> bool:
+        """物理存在 + 逻辑未过期 → True。
+
+        review round 4 / P1 修：旧实现仅 HEXISTS，逻辑过期 action 仍当 alive 复用。
+        """
+        if not action_id:
+            return False
+        pending_key = self._pending_key(conversation_id, hub_user_id)
+        raw = await self.redis.hget(pending_key, action_id)
+        if raw is None:
+            return False
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        return not self._record_is_expired(data)
+
     async def _cas_delete_idempotency_key(self, idem_key: str, expected_raw) -> bool:
         """CAS 删除：仅当当前值与 expected_raw 完全一致才 DEL，否则不动。
 
@@ -273,8 +309,11 @@ class ConfirmGate:
                     existing_raw = await pipe.get(idem_key)
                     if existing_raw is None:
                         # 原子提交 reservation + pending HSET
+                        # review round 4 / P1：idem TTL 与 pending 物理 TTL 同步（max_pending_ttl），
+                        # 不能用 ttl_seconds —— 否则 ttl_seconds < self.TTL 时 idem 先过期，旧 pending
+                        # 仍在物理 hash 里，新请求绕过 stale 检查再创建 → 同 idempotency_key 双 pending。
                         pipe.multi()
-                        pipe.set(idem_key, record_json, ex=ttl_seconds)
+                        pipe.set(idem_key, record_json, ex=max_pending_ttl)
                         pipe.hset(pending_key, candidate_action_id, record_json)
                         pipe.expire(pending_key, max_pending_ttl)
                         await pipe.execute()
@@ -307,11 +346,14 @@ class ConfirmGate:
                     f"idempotency_key={idempotency_key!r} 已被不同 context 使用"
                 )
 
-            # 同 context — 验证现存的 action_id 是否还在 pending hash 里
+            # 同 context — 验证现存的 action_id 是否仍 alive（物理在 + 逻辑未过期）
+            # review round 4 / P1：旧实现仅 HEXISTS，逻辑过期 action 会被当 alive
+            # 复用 → 死 action 给用户。新实现同时检查 record.is_expired()。
             existing_aid = existing.get("action_id")
-            is_alive = (
-                bool(existing_aid)
-                and await self.redis.hexists(pending_key, existing_aid)
+            is_alive = await self._is_pending_alive_not_expired(
+                conversation_id=conversation_id,
+                hub_user_id=hub_user_id,
+                action_id=existing_aid,
             )
             if is_alive:
                 # 真复用 — 返回现有 PendingAction
@@ -402,14 +444,27 @@ class ConfirmGate:
     async def list_pending_for_context(
         self, *, conversation_id: str, hub_user_id: int
     ) -> list[PendingAction]:
-        """返回该 (conv, user) 的所有 pending action，按 created_at asc 排序（同时刻用 action_id break tie）。"""
-        raw = await self.redis.hgetall(self._pending_key(conversation_id, hub_user_id))
+        """返回该 (conv, user) 的 alive pending action，按 created_at asc 排序。
+
+        review round 4 / P1：过滤逻辑过期 action（record.is_expired()）+ lazy GC：
+        把过期 entry 从物理 hash 里 HDEL 掉。否则 confirm_node 会把过期 action
+        列在"您有以下待确认操作"里，用户回 "1" 选中 → 死 action 误执行。
+        """
+        pending_key = self._pending_key(conversation_id, hub_user_id)
+        raw = await self.redis.hgetall(pending_key)
         items: list[PendingAction] = []
+        expired_aids: list[str] = []
         for aid_bytes, payload_bytes in (raw or {}).items():
             aid = aid_bytes.decode() if isinstance(aid_bytes, bytes) else aid_bytes
-            data = json.loads(payload_bytes)
+            try:
+                data = json.loads(payload_bytes)
+            except (json.JSONDecodeError, ValueError):
+                continue
             # 只有 create_pending 写入的记录才有 created_at 字段
             if "created_at" not in data:
+                continue
+            if self._record_is_expired(data):
+                expired_aids.append(aid)
                 continue
             items.append(PendingAction(
                 action_id=aid,
@@ -423,6 +478,12 @@ class ConfirmGate:
                 token=data.get("token"),
                 idempotency_key=data.get("idempotency_key"),
             ))
+        # Lazy GC：清理过期 entry，避免 hash 长期累积垃圾
+        if expired_aids:
+            try:
+                await self.redis.hdel(pending_key, *expired_aids)
+            except Exception:
+                pass  # GC 失败不影响返回结果
         items.sort(key=lambda p: (p.created_at, p.action_id))
         return items
 
@@ -461,14 +522,15 @@ class ConfirmGate:
         self, *, action_id: str, token: str,
         hub_user_id: int, conversation_id: str,
     ) -> bool:
-        """消费一个 PendingAction token（单次；跨 context 抛 CrossContextClaim）。
+        """消费一个 PendingAction token（单次；跨 context / 过期均抛 CrossContextClaim）。
 
         流程：
         1. HGET pending_key action_id → 校验存在性
         2. 校验 conversation_id 和 hub_user_id 一致 → 不一致 raise CrossContextClaim
-        3. 校验 token 匹配
-        4. 原子 HDEL（单次消费）
-        5. 写 claimed audit log（TTL 24h）
+        3. **校验 record 未过期**（review round 4 / P1）→ 过期 HDEL + raise
+        4. 校验 token 匹配
+        5. 原子 HDEL（单次消费）
+        6. 写 claimed audit log（TTL 24h）
         """
         pending_key = self._pending_key(conversation_id, hub_user_id)
         raw = await self.redis.hget(pending_key, action_id)
@@ -493,6 +555,18 @@ class ConfirmGate:
             raise CrossContextClaim(
                 f"action_id={action_id!r} 属于 conv={stored_conv!r} user={stored_user}，"
                 f"拒绝 conv={conversation_id!r} user={hub_user_id} 的 claim"
+            )
+        # review round 4 / P1：record 逻辑过期必须拒 + 清理
+        # 物理 hash TTL 比 record.ttl_seconds 长（max(ttl_seconds, self.TTL=1800)），
+        # 仅 HEXISTS 不够；必须用 record-level TTL 把过期 action 拦在 claim 外，
+        # 否则用户能确认一个早已逻辑过期的写操作。
+        if self._record_is_expired(data):
+            try:
+                await self.redis.hdel(pending_key, action_id)
+            except Exception:
+                pass  # 清理失败不影响拒绝
+            raise CrossContextClaim(
+                f"action_id={action_id!r} 已过期（expired），不能确认"
             )
         # 校验 token
         stored_token = data.get("token")

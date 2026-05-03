@@ -453,6 +453,127 @@ async def test_idempotency_no_double_pending_when_yield_between_set_and_hset(gat
 
 
 @pytest.mark.asyncio
+async def test_idempotency_expired_pending_treated_as_stale_not_reused(gate):
+    """review round 4 / P1：pending action 逻辑过期后必须被识别为 stale。
+
+    旧实现：is_alive 仅 HEXISTS pending hash，不检查 PendingAction.is_expired() →
+    短 ttl_seconds 的 action 物理 TTL 由 max(ttl_seconds, self.TTL) 撑长，hash 里
+    还在 → 同 idempotency_key 新请求会复用过期 action_id（死 action 给用户）。
+    新实现：is_alive 检查 HEXISTS + is_expired() 双重，过期 → 走 stale 重建。
+    """
+    p1 = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:expire-test:outbound",
+        ttl_seconds=1,  # 极短 — 1s 后逻辑过期
+    )
+    # 等 p1 逻辑过期（is_expired() True）
+    await asyncio.sleep(1.2)
+
+    # 同 idempotency_key 再来 — 必须识别为 stale 重建（不复用 p1）
+    p2 = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:expire-test:outbound",
+        ttl_seconds=600,  # 重新长 TTL
+    )
+    assert p2.action_id != p1.action_id, (
+        f"过期 action 必须被替换，不能复用；旧 {p1.action_id}, 新 {p2.action_id}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_pending_for_context_filters_and_gcs_expired(gate):
+    """review round 4 / P1：list_pending_for_context 必须过滤过期 action 并清理。
+
+    旧实现：直接返回 hash 中所有 entry，过期 action 也会被列出，confirm_node 会
+    把过期 action 列在 "您有以下待确认操作"，用户选 "1" claim → 死 action。
+    新实现：过滤 is_expired()，并 HDEL 清理过期项（lazy GC）。
+    """
+    p_short = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="short",
+        payload={"tool_name": "x", "args": {"order_id": 1}},
+        action_prefix="vch",
+        ttl_seconds=1,
+    )
+    p_long = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="adjust_price", summary="long",
+        payload={"tool_name": "x", "args": {"customer_id": 1}},
+        action_prefix="adj",
+        ttl_seconds=600,
+    )
+    await asyncio.sleep(1.2)
+
+    pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
+    aids = {p.action_id for p in pendings}
+    assert p_short.action_id not in aids, "过期 action 必须被过滤"
+    assert p_long.action_id in aids, "未过期 action 应保留"
+
+    # GC：过期 entry 应已被 HDEL 清理
+    pending_key = gate._pending_key("c1", 1)
+    raw = await gate.redis.hgetall(pending_key)
+    keys_after = {(k.decode() if isinstance(k, bytes) else k) for k in (raw or {}).keys()}
+    assert p_short.action_id not in keys_after, (
+        "过期 action 应被 lazy GC 清理出 hash"
+    )
+    assert p_long.action_id in keys_after
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_expired_pending(gate):
+    """review round 4 / P1：claim 已逻辑过期的 pending 必须被拒绝（不可执行写操作）。"""
+    p = await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "create_voucher_draft", "args": {"order_id": 1}},
+        action_prefix="vch",
+        ttl_seconds=1,
+    )
+    await asyncio.sleep(1.2)
+
+    with pytest.raises(CrossContextClaim, match="过期|expired"):
+        await gate.claim(
+            action_id=p.action_id, token=p.token,
+            hub_user_id=1, conversation_id="c1",
+        )
+
+    # 过期 entry 应已被清理
+    pending_key = gate._pending_key("c1", 1)
+    assert not await gate.redis.hexists(pending_key, p.action_id)
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_ttl_matches_pending_physical_ttl(gate):
+    """review round 4 / P1：idem_key TTL 不应短于 pending 物理 hash TTL，
+    否则 idem 先过期 → 同 key 新请求时旧 action 仍在物理 hash 里但 idem 已消失
+    → 走"创建"路径而不是 stale 替换路径 → 双创。
+    """
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "x", "args": {"order_id": 1}},
+        action_prefix="vch",
+        idempotency_key="vch:ttl-sync-test:outbound",
+        ttl_seconds=600,  # 比 self.TTL (1800) 短
+    )
+
+    idem_key = gate._idempotency_key("vch:ttl-sync-test:outbound")
+    pending_key = gate._pending_key("c1", 1)
+    idem_ttl = await gate.redis.ttl(idem_key)
+    pending_ttl = await gate.redis.ttl(pending_key)
+    assert idem_ttl >= pending_ttl - 2, (  # -2 容忍 round-off
+        f"idem TTL ({idem_ttl}s) 必须 >= pending 物理 TTL ({pending_ttl}s)；"
+        f"idem 不能比 pending 先过期，否则同 key 新请求会绕过 stale 检查"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cas_delete_idempotency_key_succeeds_when_value_unchanged(gate):
     """review round 2 / P1：CAS 删除在值未变时正常成功（保证正常 stale 清理路径仍走得通）。"""
     p = await gate.create_pending(
