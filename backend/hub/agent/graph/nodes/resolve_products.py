@@ -108,6 +108,9 @@ async def resolve_products_node(
         # 兜底：单次合并搜
         args = json.loads(resp.tool_calls[0]["function"]["arguments"])
         results = await tool_executor("search_products", args)
+        # ERP4 返 {"items": [...], "total": N}；统一成 list
+        if isinstance(results, dict):
+            results = results.get("items", [])
         if not results:
             state.missing_fields = new_missing + ["products"]
             return state
@@ -130,6 +133,9 @@ async def resolve_products_node(
     # 每个 hint 单独搜
     for hint in hints:
         results = await tool_executor("search_products", {"query": hint})
+        # ERP4 返 {"items": [...], "total": N}；统一成 list
+        if isinstance(results, dict):
+            results = results.get("items", [])
         if len(results) == 0:
             new_missing.append(f"product_not_found:{hint}")
             continue

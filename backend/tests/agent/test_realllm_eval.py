@@ -88,7 +88,7 @@ async def test_eval_case(real_graph_agent_factory, case_index):
         snapshot = await agent.compiled_graph.aget_state(config)
         state_values = snapshot.values if snapshot else {}
         await assert_scenario_turn(
-            agent, gate, tool_log_before, turn, res, state_values,
+            agent, gate, tool_log, tool_log_before, turn, res, state_values, conv, user,
         )
         intent = state_values.get("intent")
         intent_value = intent.value if hasattr(intent, "value") else intent

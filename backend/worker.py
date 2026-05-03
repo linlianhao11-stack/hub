@@ -117,11 +117,27 @@ async def main():
     draft_tools.set_erp_adapter(erp_adapter)
     draft_tools.register_all(tool_registry)
 
-    # 4. DeepSeekLLMClient（GraphAgent 使用 DeepSeek v3 API）
+    # 4. DeepSeekLLMClient（GraphAgent 使用 DeepSeek beta endpoint）
+    # Plan 6 v9：GraphAgent router / chat / extract_context 都用 prefix completion +
+    # strict mode + thinking 控制 — 这些是 DeepSeek **beta** endpoint 才支持的特性。
+    # admin 后台配的 base_url 若是 main（https://api.deepseek.com）会让所有调用 400。
+    # 策略：admin 配的 url 含 /beta 就照用（允许自建代理），否则强制升级到 BETA_URL。
+    from hub.agent.llm_client import DEEPSEEK_BETA_URL
+    admin_base_url = ai_provider.base_url if ai_provider else ""
+    if admin_base_url and "/beta" in admin_base_url:
+        agent_base_url = admin_base_url
+    else:
+        agent_base_url = DEEPSEEK_BETA_URL
+        if admin_base_url:
+            logger.info(
+                "GraphAgent 将 base_url 从 %r 升级到 beta endpoint %r"
+                "（router/strict/thinking 需 beta 支持）",
+                admin_base_url, DEEPSEEK_BETA_URL,
+            )
     agent_llm = DeepSeekLLMClient(
         api_key=ai_provider.api_key if ai_provider else "",
-        base_url=ai_provider.base_url if ai_provider else "",
-        model=ai_provider.model if ai_provider else "",
+        base_url=agent_base_url,
+        model=ai_provider.model if ai_provider else "deepseek-v4-flash",
     )
 
     # 5. tool_executor 闭包：将 GraphAgent 的两参数调用转换为 ToolRegistry.call
@@ -165,6 +181,39 @@ async def main():
             acting_as: int | None = None,
             channel_userid: str | None = None,
         ) -> AgentResult:
+            # Plan 6 v9 debug：每条消息进出都 log，方便排查"上下文不连贯"问题
+            cid_short = (conversation_id or "")[-12:]
+            logger.info(
+                "[GA-IN] cid=...%s user=%d msg=%r",
+                cid_short, hub_user_id, user_message[:200],
+            )
+            # peek 上轮 state（cross-turn checkpoint hydrate 验证）
+            try:
+                from hub.agent.graph.config import build_langgraph_config
+                cfg = build_langgraph_config(
+                    conversation_id=conversation_id, hub_user_id=hub_user_id,
+                )
+                snap = await graph_agent_inner.compiled_graph.aget_state(cfg)
+                if snap and snap.values:
+                    s = snap.values
+                    logger.info(
+                        "[GA-PRE-STATE] cid=...%s active_subgraph=%r "
+                        "candidate_customers=%d candidate_products=%s "
+                        "customer=%s products=%d items=%d shipping_addr=%r",
+                        cid_short,
+                        s.get("active_subgraph"),
+                        len(s.get("candidate_customers") or []),
+                        list((s.get("candidate_products") or {}).keys()),
+                        (s.get("customer") or {}).get("name") if s.get("customer") else None,
+                        len(s.get("products") or []),
+                        len(s.get("items") or []),
+                        (s.get("shipping") or {}).get("address") if s.get("shipping") else None,
+                    )
+                else:
+                    logger.info("[GA-PRE-STATE] cid=...%s (无上轮 state，新会话)", cid_short)
+            except Exception as e:
+                logger.warning("[GA-PRE-STATE] peek failed: %s", e)
+
             token = _tool_ctx.set({
                 "hub_user_id": hub_user_id,
                 "acting_as": acting_as or 0,
@@ -181,6 +230,23 @@ async def main():
                 )
             finally:
                 _tool_ctx.reset(token)
+
+            # 出口 log + post-state
+            try:
+                cfg = build_langgraph_config(
+                    conversation_id=conversation_id, hub_user_id=hub_user_id,
+                )
+                snap = await graph_agent_inner.compiled_graph.aget_state(cfg)
+                post_intent = None
+                if snap and snap.values:
+                    intent_obj = snap.values.get("intent")
+                    post_intent = intent_obj.value if hasattr(intent_obj, "value") else intent_obj
+                logger.info(
+                    "[GA-OUT] cid=...%s intent=%s reply=%r",
+                    cid_short, post_intent, (result or "")[:200],
+                )
+            except Exception as e:
+                logger.warning("[GA-OUT] state read failed: %s; reply=%r", e, (result or "")[:200])
 
             if result is None:
                 return AgentResult.text_result("（无回复）")

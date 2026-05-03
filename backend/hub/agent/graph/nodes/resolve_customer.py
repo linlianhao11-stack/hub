@@ -94,6 +94,9 @@ async def resolve_customer_node(
         return state
     args = json.loads(resp.tool_calls[0]["function"]["arguments"])
     results = await tool_executor("search_customers", args)
+    # ERP4 返 {"items": [...], "total": N}；统一成 list
+    if isinstance(results, dict):
+        results = results.get("items", [])
 
     # P1-B 三分支：合同/报价是对外文件，错客户比反问严重得多
     if len(results) == 0:
