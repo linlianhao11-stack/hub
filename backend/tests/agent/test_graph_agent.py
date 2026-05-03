@@ -94,7 +94,7 @@ async def test_graph_agent_router_to_subgraph_routing():
 
 
 @pytest.mark.asyncio
-async def test_candidate_persists_through_checkpoint_and_consumed_next_round():
+async def test_candidate_persists_through_checkpoint_and_consumed_next_round(monkeypatch):
     """P1-A v1.4 + P2-D v1.5 集成验收：多客户候选 → '选 2' → 2nd round 不重查 search_customers。
 
     完整两轮 ainvoke：
@@ -110,6 +110,12 @@ async def test_candidate_persists_through_checkpoint_and_consumed_next_round():
         - validate / generate / format / cleanup
     """
     from hub.agent.graph.config import build_langgraph_config
+    from hub.agent.graph.subgraphs import contract as contract_mod
+
+    # contract.generate_contract_node 现在调 DB 查模板 — mock 它返回固定模板 id
+    async def _fake_template():
+        return 1
+    monkeypatch.setattr(contract_mod, "_resolve_default_template_id", _fake_template)
 
     tool_call_log: list[tuple[str, dict]] = []
 
