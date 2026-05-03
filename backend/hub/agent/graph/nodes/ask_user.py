@@ -7,13 +7,17 @@ P2-C v1.2 关键：candidate_customers / candidate_products 不能只输出 'cus
 from __future__ import annotations
 from hub.agent.graph.state import ContractState
 
+# 与 validate_inputs.VALID_MISSING_FIELDS_FIXED 保持同步，覆盖所有 fixed enum
 FIELD_LABELS = {
-    "shipping_address": "收货地址",
-    "contact": "联系人",
-    "phone": "电话",
     "customer": "客户",
     "items": "产品明细",
     "products": "产品",
+    "shipping_address": "收货地址",
+    "shipping_contact": "收货联系人",
+    "shipping_phone": "收货电话",
+    "contact": "收货联系人",  # 保留旧字段名兼容（向后）
+    "phone": "收货电话",
+    "template": "合同模板（请联系管理员到后台上传销售合同模板）",
 }
 
 
