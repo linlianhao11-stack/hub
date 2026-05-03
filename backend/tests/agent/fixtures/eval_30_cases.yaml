@@ -1,0 +1,336 @@
+# backend/tests/agent/fixtures/eval_30_cases.yaml
+# 30 个 gold-set case，每 case 必须含机检字段：
+# - id / turns(input/expected_intent/tool_caps/must_contain/forbid) / rubric
+# tool_caps 双语义（v1.3 P2-D）：
+#   - int N         → exact，count 必须正好 == N（写"必须调 1 次"用 1，"绝不调"用 0）
+#   - {min:A,max:B} → range，A <= count <= B（如 search_products: {min:1, max:2}）
+# 分布：chat 4 / query 6 / contract 6 / quote 3 / voucher 3 / adjust_price 3 /
+#       adjust_stock 2 / cross-round 1 / boundary 1 + isolation 1 = 30 总计
+# 每个 intent ≥ 3 case，跨轮 / 边界各 ≥ 1
+
+# ===== chat (4) =====
+- id: chat-01
+  turns:
+    - input: "你好"
+      expected_intent: chat
+      tool_caps: {}
+      forbid: ["请问您要", "查询什么"]
+  rubric: ["natural_tone", "brevity"]
+
+- id: chat-02
+  turns:
+    - input: "最近怎样"
+      expected_intent: chat
+      tool_caps: {}
+      forbid: ["业务", "订单"]
+  rubric: ["natural_tone"]
+
+- id: chat-03
+  turns:
+    - input: "辛苦了"
+      expected_intent: chat
+      tool_caps: {}
+  rubric: ["natural_tone"]
+
+- id: chat-04-edge-emoji
+  turns:
+    - input: "👍"
+      expected_intent: chat
+      tool_caps: {}
+  rubric: ["natural_tone"]
+
+# ===== query (6) =====
+- id: query-01-inventory
+  turns:
+    - input: "查 SKG 有哪些产品有库存"
+      expected_intent: query
+      tool_caps: {check_inventory: 1, generate_contract_draft: 0, adjust_price_request: 0}
+      must_contain: ["|"]
+      forbid: ["是否需要做合同"]
+  rubric: ["table_quality"]
+
+- id: query-02-orders
+  turns:
+    - input: "看看阿里上个月订单"
+      expected_intent: query
+      tool_caps: {search_orders: 1, generate_contract_draft: 0}
+      must_contain: ["|"]
+  rubric: ["table_quality"]
+
+- id: query-03-balance
+  turns:
+    - input: "阿里现在欠多少"
+      expected_intent: query
+      tool_caps: {get_customer_balance: 1, search_customers: 1}
+  rubric: ["brevity"]
+
+- id: query-04-product-detail
+  turns:
+    - input: "X1 现在多少钱"
+      expected_intent: query
+      tool_caps: {search_products: 1, get_product_detail: 1}
+  rubric: ["brevity"]
+
+- id: query-05-aging
+  turns:
+    - input: "看下哪些库存超 6 个月没动"
+      expected_intent: query
+      tool_caps: {get_inventory_aging: 1, analyze_slow_moving_products: 1}
+      must_contain: ["|"]
+  rubric: ["table_quality"]
+
+- id: query-06-top-customers
+  turns:
+    - input: "这个季度前 10 客户"
+      expected_intent: query
+      tool_caps: {analyze_top_customers: 1}
+      must_contain: ["|"]
+  rubric: ["table_quality"]
+
+# ===== contract (6) =====
+- id: contract-01-full-info
+  turns:
+    - input: "给阿里做合同 X1 10 个 300，地址北京海淀，张三 13800000000"
+      expected_intent: contract
+      tool_caps:
+        search_customers: 1
+        search_products: 1
+        generate_contract_draft: 1
+        check_inventory: 0
+      must_contain: ["合同已生成"]
+      sent_files_min: 1
+  rubric: ["receipt_clarity"]
+
+- id: contract-02-multi-items
+  turns:
+    - input: "给百度做合同 H5 10 个 500，K5 20 个 300，地址上海，李四 13900001111"
+      expected_intent: contract
+      tool_caps:
+        search_customers: 1
+        search_products: {min: 1, max: 2}  # 合并搜或分别搜都可
+        generate_contract_draft: 1
+        check_inventory: 0
+      sent_files_min: 1
+      items_count: 2
+  rubric: ["receipt_clarity"]
+
+- id: contract-03-missing-address
+  turns:
+    - input: "给阿里做合同 X1 10 个 300"
+      expected_intent: contract
+      tool_caps: {search_customers: 1, search_products: 1, generate_contract_draft: 0}
+      must_contain: ["地址"]  # ask_user 提示
+      sent_files_min: 0
+  rubric: ["ask_clarity"]
+
+- id: contract-04-cross-round-query-then-contract
+  turns:
+    - input: "查 SKG 库存"
+      expected_intent: query
+      tool_caps: {check_inventory: 1}
+    - input: "给翼蓝做合同 H5 10 个 300，F1 10 个 500，K5 20 个 300，地址广州市天河区华穗路406号中景B座，林生，13692977880"
+      expected_intent: contract
+      tool_caps:
+        check_inventory: 0   # 第二轮物理不挂
+        search_customers: 1
+        generate_contract_draft: 1
+      sent_files_min: 1
+      items_count: 3
+  rubric: ["no_redundant_query", "natural_tone"]
+
+- id: contract-05-multi-customer-ambiguity
+  # P2-E v1.4：第一轮信息齐（含地址/联系人/电话），只测客户多命中歧义；
+  # 第二轮"选 1"消费候选 + 直接生成合同（不再缺其他字段）
+  turns:
+    - input: "给阿里做合同 X1 10 个 300，地址北京海淀，张三 13800001111"
+      expected_intent: contract
+      tool_caps: {search_customers: 1, generate_contract_draft: 0}  # 客户歧义未消，不生成
+      must_contain: ["1)", "2)", "id="]  # 多候选客户列编号
+    - input: "1"  # 用户选第 1 个
+      expected_intent: contract
+      tool_caps: {generate_contract_draft: 1, search_customers: 0}  # 直接消费候选，不再搜
+      sent_files_min: 1
+      items_count: 1
+  rubric: ["candidate_selection_clarity"]
+
+- id: contract-06-missing-price
+  turns:
+    - input: "给阿里做合同 X1 10 个"
+      expected_intent: contract
+      tool_caps: {generate_contract_draft: 0}
+      must_contain: ["单价"]  # 缺价格不默认
+  rubric: ["ask_clarity"]
+
+# ===== quote (3) =====
+- id: quote-01
+  turns:
+    - input: "给阿里报 X1 50 个的价"
+      expected_intent: quote
+      tool_caps: {search_customers: 1, search_products: 1, generate_price_quote: 1}
+      must_contain: ["报价单已生成"]
+      sent_files_min: 1
+  rubric: ["receipt_clarity"]
+
+- id: quote-02-list-price
+  turns:
+    - input: "Y3 100 个给百度报价"
+      expected_intent: quote
+      tool_caps: {generate_price_quote: 1}
+      sent_files_min: 1
+  rubric: ["receipt_clarity"]
+
+- id: quote-03-missing-qty
+  turns:
+    - input: "给阿里报 X1 的价"
+      expected_intent: quote
+      tool_caps: {generate_price_quote: 0}
+      must_contain: ["数量"]
+  rubric: ["ask_clarity"]
+
+# ===== voucher (3) =====
+- id: voucher-01
+  turns:
+    - input: "出库 SO-202404-0001"
+      expected_intent: voucher
+      tool_caps: {search_orders: 1, get_order_detail: 1, create_voucher_draft: 0}
+      must_contain: ["确认"]
+    - input: "确认"
+      expected_intent: confirm
+      tool_caps: {create_voucher_draft: 1}
+      must_contain: ["凭证已提交"]
+  rubric: ["receipt_clarity"]
+
+- id: voucher-02-already-exists
+  turns:
+    - input: "出库 SO-EXISTING"  # 假定已有凭证的订单
+      expected_intent: voucher
+      tool_caps: {get_order_detail: 1, create_voucher_draft: 0}
+      must_contain: ["已有凭证"]
+  rubric: ["error_clarity"]
+
+- id: voucher-03-not-approved
+  turns:
+    - input: "出库 SO-DRAFT"  # 假定未审批订单
+      expected_intent: voucher
+      tool_caps: {create_voucher_draft: 0}
+      must_contain: ["未审批"]
+  rubric: ["error_clarity"]
+
+# ===== adjust_price (3) =====
+- id: adjust-price-01
+  turns:
+    - input: "把阿里的 X1 价格调到 280"
+      expected_intent: adjust_price
+      tool_caps:
+        search_customers: 1
+        search_products: 1
+        get_product_customer_prices: 1
+        adjust_price_request: 0  # 必须 preview 不直接落
+      must_contain: ["调价预览", "确认"]
+    - input: "确认"
+      expected_intent: confirm
+      tool_caps: {adjust_price_request: 1}
+      must_contain: ["调价已申请"]
+  rubric: ["preview_clarity"]
+
+- id: adjust-price-02-cross-conv-isolation
+  turns:
+    - input: "把百度的 Y2 价格调到 350"
+      conversation_id: c1-private
+      expected_intent: adjust_price
+      tool_caps: {adjust_price_request: 0}
+    - input: "确认"
+      conversation_id: c2-group  # 切到群聊
+      expected_intent: confirm
+      tool_caps: {adjust_price_request: 0}  # 跨会话不可见
+      must_contain: ["没有待办"]
+  rubric: ["isolation_clarity"]
+
+- id: adjust-price-03-multi-pending-select
+  turns:
+    - input: "把阿里的 X1 价格调到 280"
+      expected_intent: adjust_price
+    - input: "把百度的 Y2 价格调到 350"
+      expected_intent: adjust_price
+    - input: "确认"
+      expected_intent: confirm
+      tool_caps: {adjust_price_request: 0}  # 多 pending 不自动 claim
+      must_contain: ["1)", "2)"]
+    - input: "1"
+      expected_intent: confirm
+      tool_caps: {adjust_price_request: 1}
+  rubric: ["multi_pending_clarity"]
+
+# ===== adjust_stock (2) =====
+- id: adjust-stock-01
+  turns:
+    - input: "X1 库存调到 100"
+      expected_intent: adjust_stock
+      tool_caps: {adjust_stock_request: 0}
+      must_contain: ["确认"]
+    - input: "确认"
+      expected_intent: confirm
+      tool_caps: {adjust_stock_request: 1}
+  rubric: ["preview_clarity"]
+
+- id: adjust-stock-02-idempotent
+  turns:
+    - input: "X1 库存 +50"
+      expected_intent: adjust_stock
+    - input: "X1 库存 +50"  # 同输入再来一次
+      expected_intent: adjust_stock
+      # 幂等命中：复用上一个 pending（同 action_id），不创建新的
+  rubric: ["idempotency"]
+
+# ===== cross-round + boundary (2) =====
+- id: cross-01-query-then-quote
+  turns:
+    - input: "查 X1 价格"
+      expected_intent: query
+      tool_caps: {get_product_detail: 1}
+    - input: "给阿里报 X1 50 个的价"
+      expected_intent: quote
+      tool_caps: {generate_price_quote: 1}
+      sent_files_min: 1
+  rubric: ["no_redundant_query"]
+
+- id: boundary-01-empty-then-greeting
+  turns:
+    - input: "。。。"
+      expected_intent: unknown
+      tool_caps: {}
+      forbid: ["合同", "报价"]
+    - input: "你好"
+      expected_intent: chat
+      tool_caps: {}
+  rubric: ["graceful_unknown"]
+
+# ===== isolation (1) — P2-E v1.3 补第 30 条 =====
+- id: isolation-01-group-per-user-context
+  # 同群聊里 user A 起合同到一半（candidate 客户待选），user B 在同群里起另一个查询
+  # 必须：A 的 candidate_customers / 业务上下文不被 B 污染；B 的查询不影响 A
+  turns:
+    - input: "给阿里做合同 X1 10 个 300"
+      conversation_id: group-1
+      hub_user_id: 1
+      expected_intent: contract
+      tool_caps:
+        search_customers: 1
+        generate_contract_draft: 0   # 多客户候选还没选，不能生成
+      must_contain: ["1)", "2)", "id="]   # 候选列编号
+    - input: "查 SKG 库存"
+      conversation_id: group-1
+      hub_user_id: 2     # 同群另一个 user
+      expected_intent: query
+      tool_caps:
+        check_inventory: 1
+        search_customers: 0   # 不应碰 user 1 的合同流程
+        generate_contract_draft: 0
+    - input: "1"        # user 1 回到合同流程，选第 1 个候选客户
+      conversation_id: group-1
+      hub_user_id: 1
+      expected_intent: contract       # pre_router 据 user 1 的 candidate_customers 沿用 contract
+      tool_caps:
+        generate_contract_draft: 0   # 还缺地址
+      must_contain: ["地址"]
+  rubric: ["per_user_isolation", "candidate_persistence"]
