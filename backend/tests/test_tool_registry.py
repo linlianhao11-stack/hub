@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -116,6 +117,56 @@ async def test_register_extracts_openai_schema(reg):
     assert "hub_user_id" not in params["properties"]
     assert "confirmation_action_id" not in params["properties"]
     assert "confirmation_token" not in params["properties"]
+
+
+@pytest.mark.asyncio
+async def test_register_handles_plain_dict_and_list_types(reg):
+    """钉钉实测 hotfix（task=aFzEpPml 13:07）：plain `dict` / `list` /
+    `dict | None` 不能落 string fallback —— generate_contract_draft
+    签名 `extras: dict | None = None` 之前推断成 string，contract subgraph
+    传 `extras={}` 触发 ToolArgsValidationError: '{}' is not of type 'string'。
+    """
+    async def fake_tool(
+        items_arr: list,                    # plain list → array
+        ctx_dict: dict,                     # plain dict → object
+        opt_dict: dict | None = None,       # dict | None → object
+        opt_list: list | None = None,       # list | None → array
+        amount: float = 0.0,
+    ) -> dict:
+        """fake."""
+        return {}
+
+    from hub.agent.tools.types import ToolType
+    reg.register("fake_tool", fake_tool,
+                 perm="usecase.test.use",
+                 tool_type=ToolType.READ,
+                 description="测试 plain 类型推断")
+
+    with patch("hub.agent.tools.registry.has_permission", AsyncMock(return_value=True)):
+        schemas = await reg.schema_for_user(hub_user_id=1)
+
+    props = schemas[0]["function"]["parameters"]["properties"]
+    assert props["items_arr"]["type"] == "array", "plain list 应推断为 array"
+    assert props["ctx_dict"]["type"] == "object", "plain dict 应推断为 object（不是 string fallback）"
+    assert props["opt_dict"]["type"] == "object", "dict | None 应推断为 object"
+    assert props["opt_list"]["type"] == "array", "list | None 应推断为 array"
+    assert props["amount"]["type"] == "number"
+
+
+@pytest.mark.asyncio
+async def test_register_decimal_type_returns_number(reg):
+    """Decimal 应推断成 number（合同 / 报价单的 price 字段都是 Decimal）。"""
+    from hub.agent.tools.types import ToolType
+    async def fake_dec_tool(amount: Decimal) -> dict:
+        """f."""
+        return {}
+    reg.register("fake_dec", fake_dec_tool,
+                 perm="usecase.test.use",
+                 tool_type=ToolType.READ,
+                 description="d")
+    with patch("hub.agent.tools.registry.has_permission", AsyncMock(return_value=True)):
+        schemas = await reg.schema_for_user(hub_user_id=1)
+    assert schemas[0]["function"]["parameters"]["properties"]["amount"]["type"] == "number"
 
 
 @pytest.mark.asyncio

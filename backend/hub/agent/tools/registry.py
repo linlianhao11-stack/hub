@@ -190,7 +190,14 @@ class ToolRegistry:
         }
 
     def _py_to_json_type(self, t):
-        """Python type → OpenAI function schema type。"""
+        """Python type → OpenAI function schema type。
+
+        plan6-v9 hotfix（钉钉实测 task=aFzEpPml 13:07）：plain `dict` / `list`
+        / Decimal 之前会落 string fallback。`generate_contract_draft(extras: dict | None = None)`
+        签名推断到 plain dict，原代码无 plain class 分支 → 回退 string，导致
+        contract subgraph 构造的 `extras={}` payload 触发
+        ToolArgsValidationError: '{}' is not of type 'string'。
+        """
         if t is int:
             return "integer"
         if t is str:
@@ -199,6 +206,18 @@ class ToolRegistry:
             return "number"
         if t is bool:
             return "boolean"
+        # plain class：list / dict（typing.List / Dict / Optional[X] 在下面解 origin）
+        if t is list:
+            return "array"
+        if t is dict:
+            return "object"
+        # decimal.Decimal 当 number（合同 price 字段）
+        try:
+            from decimal import Decimal as _Decimal
+            if t is _Decimal:
+                return "number"
+        except Exception:
+            pass
         # typing.List / typing.Dict / typing.Optional[X] 等需要解 origin
         origin = getattr(t, "__origin__", None)
         if origin is list:
@@ -207,7 +226,7 @@ class ToolRegistry:
             return "object"
         if origin is type(None) or t is type(None):
             return "null"
-        # Optional[X] 取 X
+        # Optional[X] / Union[X, None] / X | None 取 X
         args = getattr(t, "__args__", ())
         non_none = [a for a in args if a is not type(None)]
         if len(non_none) == 1:
