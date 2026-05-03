@@ -99,14 +99,24 @@ class ConfirmGate:
 
     # Lua 脚本：v6 round 2 P1 加固 —— 原子 restore（tool.fn 抛错时把 confirmed + pending 都还回去）
     # KEYS[1] = confirmed_key, KEYS[2] = pending_key
-    # ARGV: [action_id, confirmed_raw, ttl, pending_raw_or_empty]
-    # 用 Lua 保证 restore 也是原子的，不会出现 confirmed 还回去但 pending 没还的中间态
+    # ARGV[1] = action_id
+    # ARGV[2] = confirmed_raw
+    # ARGV[3] = confirmed TTL (self.TTL)
+    # ARGV[4] = pending_raw_or_empty
+    # ARGV[5] = pending TTL = max(record.ttl_seconds, self.TTL)（review round 6 / P2-2）
+    #
+    # review round 6 / P2-1：EXPIRE 用 NX + GT 组合 —— NX 兜底新 key，GT 防缩短已有
+    # 更长 TTL（如同 hash 里有 12h voucher，restore 短 record 不能把 hash 缩短）。
+    # review round 6 / P2-2：pending TTL 用 ARGV[5] = max(record.ttl_seconds, self.TTL)，
+    # 不再写死 self.TTL，避免 restore 12h voucher 时把它缩短到 30min。
     _RESTORE_LUA = """
     redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[1], ARGV[3], 'NX')
+    redis.call('EXPIRE', KEYS[1], ARGV[3], 'GT')
     if ARGV[4] and ARGV[4] ~= '' then
         redis.call('HSET', KEYS[2], ARGV[1], ARGV[4])
-        redis.call('EXPIRE', KEYS[2], ARGV[3])
+        redis.call('EXPIRE', KEYS[2], ARGV[5], 'NX')
+        redis.call('EXPIRE', KEYS[2], ARGV[5], 'GT')
     end
     return 1
     """
@@ -172,6 +182,39 @@ class ConfirmGate:
             return False  # 数据缺字段 → 保守认为不过期，沿用旧行为
         delta = datetime.now(tz=timezone.utc) - created_at
         return delta.total_seconds() > ttl
+
+    async def _set_or_extend_pending_ttl(self, key: str, target_seconds: int) -> None:
+        """对一个 hash key 设置或延长 TTL：保证有 TTL（NX 兜底）+ 不缩短（GT 延长）。
+
+        review round 6 / P2-1：单独 EXPIRE GT 在无 TTL key 上是 **no-op**（真 Redis 把
+        无 TTL 视为无穷大，target < 无穷 → GT 不更新），导致新建 pending hash 没有物理
+        TTL → 内存泄漏 + 不会过期。fakeredis 行为不忠实于真 Redis，所以仅 GT 会让
+        测试假绿。
+        所以两条命令组合：
+          - EXPIRE key target NX：仅当 key 当前**没有** TTL 才设置（兜底新 key）
+          - EXPIRE key target GT：仅当 target 大于现有 TTL 才更新（已有更长 TTL 不缩短）
+        组合语义：set-if-missing-or-extend-not-shrink。
+        """
+        # 顺序无所谓 — NX 失败时 GT 仍会按"延长"语义补刀；NX 成功时 GT 是 no-op
+        await self.redis.expire(key, target_seconds, nx=True)
+        await self.redis.expire(key, target_seconds, gt=True)
+
+    @staticmethod
+    def _compute_restore_pending_ttl(pending_raw) -> int:
+        """根据 pending_raw 内 record.ttl_seconds 算 restore 时该用的 pending TTL。
+
+        review round 6 / P2-2：restore_action 旧实现 ARGV[3] 写死 self.TTL（30min），
+        12h voucher 一旦 restore 物理 TTL 被缩短 → idem 还活但 hash 会先过期 → 双 pending。
+        正确做法：用 record 自己的 ttl_seconds，但保底不少于 self.TTL（防 0 / 缺失）。
+        """
+        if not pending_raw:
+            return ConfirmGate.TTL
+        try:
+            data = json.loads(pending_raw)
+            record_ttl = int(data.get("ttl_seconds", ConfirmGate.TTL))
+            return max(record_ttl, ConfirmGate.TTL)
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            return ConfirmGate.TTL
 
     async def _is_pending_alive_not_expired(
         self, *, conversation_id: str, hub_user_id: int, action_id: str,
@@ -313,12 +356,15 @@ class ConfirmGate:
                         # 不能用 ttl_seconds —— 否则 ttl_seconds < self.TTL 时 idem 先过期，旧 pending
                         # 仍在物理 hash 里，新请求绕过 stale 检查再创建 → 同 idempotency_key 双 pending。
                         # review round 5 / P1：pending_key 是 (conv,user) 共享 hash，多 action 复用同一
-                        # 物理 key；EXPIRE 必须用 GT 只延长不缩短，否则后建短 TTL action 会让先建长
-                        # TTL action（如 voucher 12h）物理 entry 提前消失 → idem 还在但 hash 没了
-                        # → 下次同 key 请求把它判 stale → 双 pending。
+                        # 物理 key；EXPIRE 必须只延长不缩短，否则后建短 TTL action 会让先建长 TTL
+                        # action（如 voucher 12h）物理 entry 提前消失 → idem 还在但 hash 没了 → 双 pending。
+                        # review round 6 / P2-1：单独 EXPIRE GT 在**无 TTL key** 上真 Redis 是 no-op
+                        # （无 TTL 视为无穷大），fresh hash 会没物理 TTL 内存泄漏。要先 NX 兜底再 GT 延长。
+                        # 两条 EXPIRE 都在 MULTI 内，仍是同一原子事务。
                         pipe.multi()
                         pipe.set(idem_key, record_json, ex=max_pending_ttl)
                         pipe.hset(pending_key, candidate_action_id, record_json)
+                        pipe.expire(pending_key, max_pending_ttl, nx=True)
                         pipe.expire(pending_key, max_pending_ttl, gt=True)
                         await pipe.execute()
                         return PendingAction(
@@ -431,9 +477,11 @@ class ConfirmGate:
             pending_key, action_id,
             json.dumps(record, ensure_ascii=False),
         )
-        # review round 5 / P1：EXPIRE GT 只延长不缩短，避免短 TTL 邻居把已有的
+        # review round 5 / P1：EXPIRE 只延长不缩短，避免短 TTL 邻居把已有的
         # 长 TTL voucher (12h) hash 缩短到 30min。pending_key 是 (conv,user) 共享 hash。
-        await self.redis.expire(pending_key, max(ttl_seconds, self.TTL), gt=True)
+        # review round 6 / P2-1：用 helper（NX 兜底 + GT 延长），单独 GT 在无 TTL key 上
+        # 真 Redis 是 no-op，会让 fresh hash 没物理 TTL。
+        await self._set_or_extend_pending_ttl(pending_key, max(ttl_seconds, self.TTL))
         return PendingAction(
             action_id=action_id,
             conversation_id=conversation_id,
@@ -742,9 +790,19 @@ class ConfirmGate:
             and data.get("normalized_args") == normalized
         )
         if not consistent:
+            # review round 6 / P2-2：Lua 现在需要 ARGV[5]=pending_ttl；
+            # 用 record 自己的 ttl_seconds（≥ self.TTL），不写死 self.TTL。
+            pending_raw_for_restore = pending_raw or ""
+            pending_ttl = self._compute_restore_pending_ttl(pending_raw_for_restore)
             await self._restore_script(
                 keys=[confirmed_key, pending_key],
-                args=[action_id, confirmed_raw, str(self.TTL), pending_raw or ""],
+                args=[
+                    action_id,
+                    confirmed_raw,
+                    str(self.TTL),
+                    pending_raw_for_restore,
+                    str(pending_ttl),
+                ],
             )
             return None
 
@@ -760,16 +818,22 @@ class ConfirmGate:
 
         bundle 来自 claim_action 返回值，含 confirmed_raw + pending_raw（可能 None）。
         Lua 脚本保证 confirmed 和 pending 都被原子还回去；不会出现 confirmed 还了但 pending 没还的中间态。
-        TTL 重置 30 min；用户在窗口内还能重试。
+
+        review round 6 / P2-2：pending TTL 用 record 自己的 ttl_seconds（max ≥ self.TTL），
+        不再写死 self.TTL。否则 restore 12h voucher 时被缩短到 30min，破坏 12h 幂等承诺。
+        review round 6 / P2-1：Lua 内 EXPIRE 用 NX + GT 组合，避免单 GT 在无 TTL key 上 no-op。
         """
         confirmed_key = self._confirmed_key(conversation_id, hub_user_id)
         pending_key = self._pending_key(conversation_id, hub_user_id)
+        pending_raw = bundle.get("pending_raw") or ""
+        pending_ttl = self._compute_restore_pending_ttl(pending_raw)
         await self._restore_script(
             keys=[confirmed_key, pending_key],
             args=[
                 action_id,
                 bundle["confirmed_raw"],
                 str(self.TTL),
-                bundle.get("pending_raw") or "",
+                pending_raw,
+                str(pending_ttl),  # review round 6 / P2-2：pending TTL 来自 record
             ],
         )

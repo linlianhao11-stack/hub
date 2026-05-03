@@ -703,6 +703,104 @@ async def test_create_pending_record_no_idempotency_path_also_extends_only(gate)
 
 
 @pytest.mark.asyncio
+async def test_set_or_extend_pending_ttl_helper_three_cases(gate):
+    """review round 6 / P2-1：_set_or_extend_pending_ttl 必须正确处理 3 种情况：
+    1. 无 TTL key → NX 兜底设置 TTL（真 Redis EXPIRE GT 单独在无 TTL key 上是 no-op）
+    2. 已有 TTL 但更短 → GT 延长到目标
+    3. 已有 TTL 且更长 → 不动（不缩短）
+    """
+    # Case 1：无 TTL → 应被设置
+    await gate.redis.hset("hub:agent:test:no_ttl", "f", "v")
+    assert await gate.redis.ttl("hub:agent:test:no_ttl") == -1, "前置：应无 TTL"
+    await gate._set_or_extend_pending_ttl("hub:agent:test:no_ttl", 600)
+    ttl_after = await gate.redis.ttl("hub:agent:test:no_ttl")
+    assert ttl_after > 0, f"NX 应为无 TTL key 设置 TTL，实际 ttl={ttl_after}"
+    assert ttl_after <= 600
+
+    # Case 2：已有较短 TTL → 延长
+    await gate.redis.hset("hub:agent:test:short_ttl", "f", "v")
+    await gate.redis.expire("hub:agent:test:short_ttl", 60)
+    await gate._set_or_extend_pending_ttl("hub:agent:test:short_ttl", 1200)
+    assert await gate.redis.ttl("hub:agent:test:short_ttl") > 60
+
+    # Case 3：已有更长 TTL → 不缩短
+    await gate.redis.hset("hub:agent:test:long_ttl", "f", "v")
+    await gate.redis.expire("hub:agent:test:long_ttl", 7200)
+    await gate._set_or_extend_pending_ttl("hub:agent:test:long_ttl", 600)
+    ttl_long = await gate.redis.ttl("hub:agent:test:long_ttl")
+    assert ttl_long > 600, f"已有更长 TTL 不应被缩短，实际 ttl={ttl_long}"
+
+
+@pytest.mark.asyncio
+async def test_create_pending_sets_ttl_via_nx_path_for_fresh_hash(gate, monkeypatch):
+    """review round 6 / P2-1：模拟真 Redis "GT 在无 TTL key 上 no-op"，
+    create_pending 必须仍能给 fresh pending hash 设置 TTL（靠 NX 兜底）。
+
+    fakeredis 默认与真 Redis 不一致 — fakeredis 的 GT 在无 TTL key 上会"成功"设置 TTL；
+    真 Redis 把无 TTL 当无穷大，GT 是 no-op。本测试 monkeypatch redis.expire 让
+    gt=True 在无 TTL key 上变 no-op（模拟真 Redis），验证创建后 hash 仍有 TTL。
+    """
+    real_expire = gate.redis.expire
+    expire_calls: list[dict] = []
+
+    async def realistic_expire(key, seconds, *args, **kwargs):
+        nx = kwargs.get("nx", False)
+        gt = kwargs.get("gt", False)
+        # 模拟真 Redis：GT 在无 TTL key 上 no-op
+        current_ttl = await gate.redis.ttl(key)
+        expire_calls.append({"key": key, "seconds": seconds, "nx": nx, "gt": gt, "ttl_before": current_ttl})
+        if gt and current_ttl == -1:
+            return False  # 真 Redis 行为：no-op
+        return await real_expire(key, seconds, *args, **kwargs)
+
+    monkeypatch.setattr(gate.redis, "expire", realistic_expire)
+
+    # Fresh create_pending — 应通过 NX 路径（不仅仅 GT）确保 TTL 设置
+    await gate.create_pending(
+        hub_user_id=1, conversation_id="c1",
+        subgraph="voucher", summary="x",
+        payload={"tool_name": "x", "args": {}},
+        action_prefix="vch",
+        ttl_seconds=600,
+    )
+    pending_key = gate._pending_key("c1", 1)
+    ttl = await gate.redis.ttl(pending_key)
+    assert ttl > 0, (
+        f"create_pending 必须给 fresh pending hash 设置 TTL（即便 GT 在真 Redis 上 no-op）；"
+        f"实际 ttl={ttl}（-1 = 无 TTL，意味着 hash 永不过期，会泄漏内存）。"
+        f"调用记录：{expire_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_restore_pending_ttl_honors_record_ttl_seconds(gate):
+    """review round 6 / P2-2：restore_action 用的 pending TTL 必须从 record.ttl_seconds 解析，
+    至少为 max(record_ttl, self.TTL)，不能写死 self.TTL（30min）让 12h voucher 缩短。
+    """
+    import json
+
+    # 12h voucher record → 应返 43200
+    voucher_raw = json.dumps({
+        "action_id": "vch-x", "ttl_seconds": 43200,
+        "conversation_id": "c1", "hub_user_id": 1,
+        "subgraph": "voucher", "summary": "x", "payload": {},
+        "created_at": "2026-05-03T00:00:00+00:00",
+    }, ensure_ascii=False)
+    assert gate._compute_restore_pending_ttl(voucher_raw) == 43200
+
+    # 短 TTL record (10min) → 至少 self.TTL (30min)
+    short_raw = json.dumps({"ttl_seconds": 600})
+    assert gate._compute_restore_pending_ttl(short_raw) == gate.TTL  # 1800
+
+    # 空 / None → self.TTL 兜底
+    assert gate._compute_restore_pending_ttl(None) == gate.TTL
+    assert gate._compute_restore_pending_ttl("") == gate.TTL
+
+    # 损坏 JSON → self.TTL 兜底（不抛错）
+    assert gate._compute_restore_pending_ttl("not-json") == gate.TTL
+
+
+@pytest.mark.asyncio
 async def test_cas_delete_idempotency_key_succeeds_when_value_unchanged(gate):
     """review round 2 / P1：CAS 删除在值未变时正常成功（保证正常 stale 清理路径仍走得通）。"""
     p = await gate.create_pending(
