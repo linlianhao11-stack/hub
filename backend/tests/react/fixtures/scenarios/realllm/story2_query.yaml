@@ -1,0 +1,6 @@
+name: 单轮查询库存
+turns:
+  - input: "查 SKG 有哪些产品"
+    expected_tool_calls_at_least:
+      - search_product
+    final_message_contains_any: ["SKG", "F1", "H5", "K5", "X1"]

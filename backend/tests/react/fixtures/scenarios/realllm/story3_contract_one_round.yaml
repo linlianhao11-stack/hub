@@ -1,0 +1,14 @@
+name: 单轮合同（信息一次到齐）— 两步：preview + confirm
+turns:
+  - input: "给阿里做合同 X1 10 个 300，地址北京海淀，张三 13800001111"
+    expected_tool_calls_at_least:
+      - search_customer
+      - create_contract_draft
+    expected_tool_calls_zero:
+      - confirm_action
+    final_message_contains_any: ["preview", "确认", "回'是'", "请回"]
+
+  - input: "是"
+    expected_tool_calls_at_least:
+      - confirm_action
+    final_message_contains_any: ["draft_id", "已生成", "已发送"]

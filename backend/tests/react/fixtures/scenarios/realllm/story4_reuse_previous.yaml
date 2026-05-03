@@ -1,0 +1,13 @@
+name: 复用上份合同（"同样给 X 也来一份"）
+turns:
+  - input: "给翼蓝做合同 X1 10 个 300，地址北京海淀，张三 13800001111"
+    expected_tool_calls_at_least: [search_customer, create_contract_draft]
+  - input: "是"
+    expected_tool_calls_at_least: [confirm_action]
+  - input: "同样的内容给得帆也做一份"
+    expected_tool_calls_at_least:
+      - get_recent_drafts
+      - search_customer
+      - create_contract_draft
+  - input: "是"
+    expected_tool_calls_at_least: [confirm_action]
