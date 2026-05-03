@@ -18,14 +18,43 @@ from hub.agent.graph.nodes.format_response import format_response_node
 from hub.agent.llm_client import DeepSeekLLMClient
 
 
+async def _resolve_default_template_id() -> int | None:
+    """选默认销售合同模板：第一条 is_active=True + template_type='sales'。
+    多模板时未来要让 LLM 看用户消息推断（"销售/代理/OEM"），现 hub 只有 1 条。
+    返 None 时表示库里没启用模板（应让管理员去 admin 后台上传）。
+    """
+    from hub.models.contract import ContractTemplate
+    tpl = (
+        await ContractTemplate.filter(is_active=True, template_type="sales")
+        .order_by("id").first()
+    )
+    return tpl.id if tpl else None
+
+
 async def generate_contract_node(state: ContractState, *, llm, tool_executor) -> ContractState:
+    # Plan 6 v9 hotfix（钉钉实测 2026-05-03 12:41 task=JIsCqeYj）：
+    # 之前 payload 只传 6 个字段，schema 是 strict 要求 10 个 required + 字段名 contact/phone
+    # 而 schema 是 shipping_contact/shipping_phone — jsonschema 报 'template_id' is a required property
+    # 兜底链：异常 → 降级 RuleParser → unknown → 用户看到"AI 处理出了点问题"。
+    template_id = await _resolve_default_template_id()
+    if template_id is None:
+        # 库里没启用模板 — 给用户明确提示而不是 fallback 到 RuleParser
+        state.errors = list(state.errors) + ["no_active_contract_template"]
+        state.missing_fields = list(state.missing_fields) + ["template"]
+        return state
+
     payload = {
+        "template_id": template_id,
         "customer_id": state.customer.id,
         "items": [{"product_id": i.product_id, "qty": i.qty, "price": float(i.price)}
                   for i in state.items],
         "shipping_address": state.shipping.address or "",
-        "contact": state.shipping.contact or "",
-        "phone": state.shipping.phone or "",
+        "shipping_contact": state.shipping.contact or "",
+        "shipping_phone": state.shipping.phone or "",
+        # 这 3 个 schema required 但 admin 后台审批时再补；agent 一律传空串
+        "contract_no": "",
+        "payment_terms": "",
+        "tax_rate": "",
         "extras": {},
     }
     result = await tool_executor("generate_contract_draft", payload)
