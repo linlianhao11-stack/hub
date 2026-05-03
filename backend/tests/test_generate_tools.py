@@ -361,6 +361,66 @@ def test_compute_contract_fingerprint_extras_change_creates_new():
 
 # ===== v8 staging review #18: fingerprint UNIQUE index race 回查路径 =====
 
+async def test_generate_contract_draft_idempotent_hit_resends_docx(mock_sender):
+    """钉钉实测 hotfix（task=A1ytGjLE 17:39）：用户连续两次发同样的"做合同"消息,
+    第二次 fingerprint 命中（draft.status=sent），bot 说"合同已生成"但**用户实际
+    没收到 docx**(短路 return 跳过 send_file)。
+
+    Fix：复用 draft DB 行,但**继续走 render + send 路径**让 docx 重新发到钉钉。
+    用户主动发起新合同应该总收到文件 — 这是 UX 预期。
+    """
+    from hub.agent.tools.generate_tools import generate_contract_draft
+
+    template = MagicMock()
+    template.id = 1
+    template.is_active = True
+    template.file_storage_key = _make_template_docx_b64()
+    template.placeholders = []
+
+    # 已存在的 draft，status=sent（之前已经发过）
+    existing_draft = MagicMock()
+    existing_draft.id = 20
+    existing_draft.status = "sent"
+    existing_draft.save = AsyncMock()
+
+    binding = MagicMock()
+    binding.channel_userid = "ding-u1"
+
+    with (
+        patch("hub.agent.document.contract.ContractTemplate") as mock_contract_template,
+        patch("hub.agent.tools.generate_tools.ContractDraft") as mock_draft,
+        patch("hub.agent.tools.generate_tools.ChannelUserBinding") as mock_binding,
+    ):
+        tqs = MagicMock()
+        tqs.first = AsyncMock(return_value=template)
+        mock_contract_template.filter.return_value = tqs
+
+        # fingerprint 命中已存在 draft（status=sent）
+        mock_draft.filter.return_value.first = AsyncMock(return_value=existing_draft)
+        # create 不应该被调（复用 existing draft）
+        mock_draft.create = AsyncMock()
+
+        bqs = MagicMock()
+        bqs.first = AsyncMock(return_value=binding)
+        mock_binding.filter.return_value = bqs
+
+        result = await generate_contract_draft(
+            template_id=1,
+            customer_id=100,
+            items=SAMPLE_ITEMS,
+            hub_user_id=1,
+            conversation_id="conv-1",
+            acting_as_user_id=1,
+        )
+
+    # 关键断言：复用 existing draft.id=20 + 仍然 send 文件
+    assert result["draft_id"] == 20, "复用已存在的 draft id"
+    assert result["file_sent"] is True, "幂等命中也必须重新发 docx 给用户"
+    assert "note" not in result, "不再返回'未重复发送'的 note（已重发）"
+    mock_draft.create.assert_not_awaited()  # 不创新 draft
+    mock_sender.send_file.assert_awaited_once()  # **关键**：send_file 必须真调
+
+
 async def test_generate_contract_draft_race_integrity_error_recovers(mock_sender):
     """**核心 race 测试** v8 review #18：
     并发场景下 ContractDraft.create 抛 IntegrityError（partial UNIQUE 拦截重复），

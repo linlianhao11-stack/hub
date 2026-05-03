@@ -444,17 +444,19 @@ async def generate_contract_draft(
             "ContractDraft 幂等命中（fingerprint）复用 draft_id=%s status=%s conv=%s",
             draft.id, draft.status, conversation_id,
         )
-        # v8 review #23：已成功发过钉钉的 draft 不重发文件
-        # 防 LLM 把用户的"是"理解成"再生成一次"，导致同一文件发到钉钉 2 次
-        # 仅 status="sent" 才跳过；status="generated"（render 成功但 send 失败）继续走 send 路径
-        if draft.status == "sent":
-            file_name = f"销售合同_{customer.get('name')}_{date.today().isoformat()}.docx"
-            return {
-                "draft_id": draft.id,
-                "file_sent": True,
-                "file_name": file_name,
-                "note": "该合同已生成并发送过钉钉，未重复发送（如需重发请联系管理员）",
-            }
+        # 复用 draft DB 行（不创新），但**继续走 render + send 路径**，重新发钉钉
+        # docx。
+        #
+        # 钉钉实测 task=A1ytGjLE 17:39（user 发"现在给翼蓝做合同 H5/F1/K5..."）
+        # 触发的 bug：之前同样输入已生成 → fingerprint 命中 status=sent → short-circuit
+        # 直接 return，bot 说"合同已生成"但用户实际**没收到 docx**(本轮没发)。
+        #
+        # 旧 v8 review #23 担心"LLM 把用户的'是'理解成再生成一次"导致重复发文件 —
+        # 现 GraphAgent contract subgraph 不通过"是"触发（"是"走 confirm 节点），
+        # 是通过 LLM router 识别用户主动 "做合同" 消息触发，且 cleanup_after_contract
+        # 跑完会清 active_subgraph,不会因 LLM 误解触发重发。
+        #
+        # 用户主动连续发 2 次"做翼蓝合同 H5..." 应该收到 2 次 docx — 这是预期行为。
     else:
         # v8 review #18：DB 已加 partial UNIQUE index 防 race；
         # create 抛 IntegrityError 时回查 first() 拿对端 race winner 的 draft 复用
