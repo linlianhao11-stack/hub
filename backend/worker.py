@@ -20,12 +20,11 @@ async def main():
 
     from hub.adapters.channel.dingtalk_sender import DingTalkSender
     from hub.adapters.downstream.erp4 import Erp4Adapter
-    from hub.agent.graph.agent import GraphAgent
-    from hub.agent.llm_client import DeepSeekLLMClient
-    from hub.agent.memory.session import SessionMemory
-    from hub.agent.tools import analyze_tools, draft_tools, erp_tools, generate_tools
+    from hub.agent.react.agent import ReActAgent
+    from hub.agent.react.llm import build_chat_model
+    from hub.agent.react.tools import ALL_TOOLS
+    from hub.agent.react.tools._confirm_helper import set_confirm_gate
     from hub.agent.tools.confirm_gate import ConfirmGate
-    from hub.agent.tools.registry import ToolRegistry
     from hub.agent.types import AgentResult
     from hub.capabilities.factory import load_active_ai_provider
     from hub.crypto import decrypt_secret
@@ -87,7 +86,7 @@ async def main():
     # 业务依赖（Plan 4）：多轮上下文 + 价格策略 + 业务用例（pending_choice/confirm 路径保留）
     ai_provider = await load_active_ai_provider()
     if ai_provider is None:
-        logger.warning("ai_provider 表为空，GraphAgent 将无法调用 LLM（仅 RuleParser fallback 有效）")
+        logger.warning("ai_provider 表为空，ReActAgent 将无法调用 LLM（仅 RuleParser fallback 有效）")
     conversation_state = ConversationStateRepository(redis=redis_client, ttl_seconds=300)
     pricing = DefaultPricingStrategy(erp_adapter=erp_adapter)
     query_product = QueryProductUseCase(
@@ -97,68 +96,15 @@ async def main():
         erp=erp_adapter, pricing=pricing, sender=sender, state=conversation_state,
     )
 
-    # Plan 6 v9 Task 7.2：构造 GraphAgent（替代 ChainAgent）
+    # Plan 6 v10 Task 4.3：构造 ReActAgent（替代 GraphAgent）
     # 1. ConfirmGate（写门禁 pending/confirmed 状态）
     confirm_gate = ConfirmGate(redis_client)
+    set_confirm_gate(confirm_gate)
 
-    # 2. SessionMemory（对话历史 + entity refs）
-    session_memory = SessionMemory(redis_client)
+    # 2. chat model（ReActAgent 使用 LangChain ChatOpenAI 接口）
+    agent_base_url = ai_provider.base_url if ai_provider else ""
 
-    # 3. ToolRegistry + 注册所有 tool（read / generate / write_draft / analyze）
-    tool_registry = ToolRegistry(
-        confirm_gate=confirm_gate,
-        session_memory=session_memory,
-    )
-    erp_tools.set_erp_adapter(erp_adapter)
-    erp_tools.register_all(tool_registry)
-    analyze_tools.register_all(tool_registry)
-    generate_tools.set_dependencies(sender=sender, erp=erp_adapter)
-    generate_tools.register_all(tool_registry)
-    draft_tools.set_erp_adapter(erp_adapter)
-    draft_tools.register_all(tool_registry)
-
-    # 4. DeepSeekLLMClient（GraphAgent 使用 DeepSeek beta endpoint）
-    # Plan 6 v9：GraphAgent router / chat / extract_context 都用 prefix completion +
-    # strict mode + thinking 控制 — 这些是 DeepSeek **beta** endpoint 才支持的特性。
-    # admin 后台配的 base_url 若是 main（https://api.deepseek.com）会让所有调用 400。
-    # 策略：admin 配的 url 含 /beta 就照用（允许自建代理），否则强制升级到 BETA_URL。
-    from hub.agent.llm_client import DEEPSEEK_BETA_URL
-    admin_base_url = ai_provider.base_url if ai_provider else ""
-    if admin_base_url and "/beta" in admin_base_url:
-        agent_base_url = admin_base_url
-    else:
-        agent_base_url = DEEPSEEK_BETA_URL
-        if admin_base_url:
-            logger.info(
-                "GraphAgent 将 base_url 从 %r 升级到 beta endpoint %r"
-                "（router/strict/thinking 需 beta 支持）",
-                admin_base_url, DEEPSEEK_BETA_URL,
-            )
-    agent_llm = DeepSeekLLMClient(
-        api_key=ai_provider.api_key if ai_provider else "",
-        base_url=agent_base_url,
-        model=ai_provider.model if ai_provider else "deepseek-v4-flash",
-    )
-
-    # 5. tool_executor 闭包：将 GraphAgent 的两参数调用转换为 ToolRegistry.call
-    #    hub_user_id / acting_as / conversation_id 从调用上下文中由 contextvars 注入，
-    #    避免 GraphAgent 实例绑定单个用户上下文（多用户共享同一 worker 实例）。
-    import contextvars
-    _tool_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar(
-        "tool_ctx", default={}
-    )
-
-    async def tool_executor(name: str, args: dict) -> object:
-        ctx = _tool_ctx.get()
-        return await tool_registry.call(
-            name, args,
-            hub_user_id=ctx.get("hub_user_id", 0),
-            acting_as=ctx.get("acting_as", 0),
-            conversation_id=ctx.get("conversation_id", ""),
-            round_idx=ctx.get("round_idx", 0),
-        )
-
-    # 6. GraphAgent（Plan 6 v9 主 agent）
+    # 4. ReActAgent checkpointer
     # Plan 6 v9：用 AsyncPostgresSaver 让 LangGraph state 跨 worker 重启持久化，
     # 取代默认 in-process MemorySaver（重启即丢上下文，钉钉对话"前面说的事 bot 忘了"）。
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -180,19 +126,23 @@ async def main():
     except Exception as e:
         logger.exception("AsyncPostgresSaver.setup 失败 — checkpoint 仍可工作但跨重启 hydrate 不保证: %s", e)
 
-    graph_agent_inner = GraphAgent(
-        llm=agent_llm,
-        registry=tool_registry,
-        confirm_gate=confirm_gate,
-        session_memory=session_memory,
-        tool_executor=tool_executor,
+    chat_model = build_chat_model(
+        api_key=ai_provider.api_key if ai_provider else "",
+        base_url=agent_base_url,
+        model=ai_provider.model if ai_provider else "deepseek-v4-flash",
+        temperature=0.0,
+        max_tokens=4096,
+    )
+    graph_agent_inner = ReActAgent(
+        chat_model=chat_model,
+        tools=ALL_TOOLS,
         checkpointer=_checkpointer,
+        recursion_limit=15,
     )
 
-    # 7. GraphAgentAdapter：包装 GraphAgent，让其接口与 handler 期望的 AgentResult 兼容，
-    #    并在调用前设置 tool_ctx contextvar（注入 hub_user_id / acting_as / conversation_id）
+    # 7. GraphAgentAdapter：包装 ReActAgent，让其接口与 handler 期望的 AgentResult 兼容
     class GraphAgentAdapter:
-        """将 GraphAgent.run(str|None) 包装为 AgentResult，同时注入 tool_ctx。"""
+        """v10 简化版：只透传 user_message → ReActAgent.run() → text reply。"""
 
         async def run(
             self,
@@ -203,83 +153,22 @@ async def main():
             acting_as: int | None = None,
             channel_userid: str | None = None,
         ) -> AgentResult:
-            # Plan 6 v9 debug：每条消息进出都 log，方便排查"上下文不连贯"问题
             cid_short = (conversation_id or "")[-12:]
             logger.info(
                 "[GA-IN] cid=...%s user=%d msg=%r",
                 cid_short, hub_user_id, user_message[:200],
             )
-            # peek 上轮 state（cross-turn checkpoint hydrate 验证）
-            try:
-                from hub.agent.graph.config import build_langgraph_config
-                cfg = build_langgraph_config(
-                    conversation_id=conversation_id, hub_user_id=hub_user_id,
-                )
-                snap = await graph_agent_inner.compiled_graph.aget_state(cfg)
-                if snap and snap.values:
-                    s = snap.values
-
-                    # LangGraph state values 里 Pydantic 对象保留为对象（不是 dict），
-                    # 用 getattr 而非 .get() 兼容两种形态（旧 hub_user_id 没存的对话也能 read）。
-                    def _peek(obj, attr):
-                        if obj is None:
-                            return None
-                        if isinstance(obj, dict):
-                            return obj.get(attr)
-                        return getattr(obj, attr, None)
-
-                    logger.info(
-                        "[GA-PRE-STATE] cid=...%s active_subgraph=%r "
-                        "candidate_customers=%d candidate_products=%s "
-                        "customer=%s products=%d items=%d shipping_addr=%r",
-                        cid_short,
-                        s.get("active_subgraph"),
-                        len(s.get("candidate_customers") or []),
-                        list((s.get("candidate_products") or {}).keys()),
-                        _peek(s.get("customer"), "name"),
-                        len(s.get("products") or []),
-                        len(s.get("items") or []),
-                        _peek(s.get("shipping"), "address"),
-                    )
-                else:
-                    logger.info("[GA-PRE-STATE] cid=...%s (无上轮 state，新会话)", cid_short)
-            except Exception as e:
-                logger.warning("[GA-PRE-STATE] peek failed: %s", e)
-
-            token = _tool_ctx.set({
-                "hub_user_id": hub_user_id,
-                "acting_as": acting_as or 0,
-                "conversation_id": conversation_id,
-                "round_idx": 0,
-            })
-            try:
-                result = await graph_agent_inner.run(
-                    user_message=user_message,
-                    hub_user_id=hub_user_id,
-                    conversation_id=conversation_id,
-                    acting_as=acting_as,
-                    channel_userid=channel_userid,
-                )
-            finally:
-                _tool_ctx.reset(token)
-
-            # 出口 log + post-state
-            try:
-                cfg = build_langgraph_config(
-                    conversation_id=conversation_id, hub_user_id=hub_user_id,
-                )
-                snap = await graph_agent_inner.compiled_graph.aget_state(cfg)
-                post_intent = None
-                if snap and snap.values:
-                    intent_obj = snap.values.get("intent")
-                    post_intent = intent_obj.value if hasattr(intent_obj, "value") else intent_obj
-                logger.info(
-                    "[GA-OUT] cid=...%s intent=%s reply=%r",
-                    cid_short, post_intent, (result or "")[:200],
-                )
-            except Exception as e:
-                logger.warning("[GA-OUT] state read failed: %s; reply=%r", e, (result or "")[:200])
-
+            result = await graph_agent_inner.run(
+                user_message=user_message,
+                hub_user_id=hub_user_id,
+                conversation_id=conversation_id,
+                acting_as=acting_as,
+                channel_userid=channel_userid or "",
+            )
+            logger.info(
+                "[GA-OUT] cid=...%s reply=%r",
+                cid_short, (result or "")[:200],
+            )
             if result is None:
                 return AgentResult.text_result("（无回复）")
             return AgentResult.text_result(result)
@@ -315,8 +204,7 @@ async def main():
     try:
         await runtime.run()
     finally:
-        # close 顺序：先关 agent_llm（Plan 6 Task 6 自建 httpx client），再关其他
-        await agent_llm.aclose()
+        # close 顺序：先关 ai_provider，再关其他
         if ai_provider is not None:
             await ai_provider.aclose()
         await erp_adapter.aclose()
