@@ -2,6 +2,7 @@
 """resolve_customer — 强制调 search_customers，把结果写入 state.customer。"""
 from __future__ import annotations
 import json
+import re
 from typing import Awaitable, Callable
 from hub.agent.graph.state import ContractState, CustomerInfo
 from hub.agent.llm_client import DeepSeekLLMClient, ToolClass, disable_thinking
@@ -11,6 +12,53 @@ from hub.agent.tools.erp_tools import SEARCH_CUSTOMERS_SCHEMA
 RESOLVE_CUSTOMER_PROMPT = """根据用户消息找客户。强制调 search_customers，参数用提取到的客户名 / 关键词。
 若用户没明确客户，留 query 字段为关键词候选。
 """
+
+
+def _generate_fallback_hints(hint: str) -> list[str]:
+    """ERP `customers.name ILIKE '%hint%'` 子串不匹配时的备选短 hint。
+
+    场景：用户输 "广州得帆"，ERP 客户全名是 "广州市得帆计算机科技有限公司"，
+    "广州得帆" 不是子串（中间隔了 "市"），但 "得帆" 是子串能命中。
+
+    策略：仅对 ≥3 字的纯 CJK hint 生成 4 种切短候选（按命中概率从高到低）：
+      1. 去前 2 字 "广州得帆" → "得帆"（去 2 字地名）
+      2. 去前 3 字 "广州市得帆" → "得帆"（去 3 字地名）
+      3. 后 3 字（保留主体后段）
+      4. 后 2 字
+    含数字/英文的 hint（如"X1 系列"）不切，避免误命中。
+    """
+    if not hint or len(hint) < 3:
+        return []
+    # 仅对纯 CJK 段处理
+    if not re.fullmatch(r"[一-鿿]+", hint):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for cand in (hint[2:], hint[3:], hint[-3:], hint[-2:]):
+        if cand and cand != hint and cand not in seen and len(cand) >= 2:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+async def _search_with_fallback(
+    args: dict,
+    tool_executor: Callable[[str, dict], Awaitable[object]],
+) -> tuple[list, str]:
+    """search_customers 0 命中时按 _generate_fallback_hints 重搜，返回 (results, used_hint)。"""
+    results = await tool_executor("search_customers", args)
+    if isinstance(results, dict):
+        results = results.get("items", [])
+    if results:
+        return results, args.get("query", "")
+    # 0 命中 → fallback
+    for fb_hint in _generate_fallback_hints(args.get("query") or ""):
+        fb_results = await tool_executor("search_customers", {"query": fb_hint})
+        if isinstance(fb_results, dict):
+            fb_results = fb_results.get("items", [])
+        if fb_results:
+            return fb_results, fb_hint
+    return [], args.get("query", "")
 
 
 def _try_consume_customer_selection(message: str, candidates: list) -> "CustomerInfo | None":
@@ -93,10 +141,8 @@ async def resolve_customer_node(
         state.missing_fields = list(state.missing_fields) + ["customer"]
         return state
     args = json.loads(resp.tool_calls[0]["function"]["arguments"])
-    results = await tool_executor("search_customers", args)
-    # ERP4 返 {"items": [...], "total": N}；统一成 list
-    if isinstance(results, dict):
-        results = results.get("items", [])
+    # 0 命中时自动按拆词 fallback 重搜（"广州得帆" → "得帆" 命中"广州市得帆..."）
+    results, used_hint = await _search_with_fallback(args, tool_executor)
 
     # P1-B 三分支：合同/报价是对外文件，错客户比反问严重得多
     if len(results) == 0:

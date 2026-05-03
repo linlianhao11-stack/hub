@@ -33,6 +33,66 @@ async def test_resolve_customer_zero_match(_llm_mock):
     assert "customer" in out.missing_fields  # 让下游 ask_user 问
 
 
+def test_generate_fallback_hints_strips_location_prefix():
+    """钉钉实测 task=4GKn0Fi 13:18 用户输 '客户就是广州得帆'，ERP 实际名是
+    '广州市得帆计算机科技有限公司' — 中间隔了'市'字 → ILIKE '%广州得帆%' 不命中。
+    fallback 切短策略：去前 2 字（去地名）和后 2/3 字（保留主体）。
+    """
+    from hub.agent.graph.nodes.resolve_customer import _generate_fallback_hints
+    out = _generate_fallback_hints("广州得帆")
+    assert "得帆" in out, f"必须生成 '得帆' 让 ERP 能命中'广州市得帆...'，实际 {out}"
+
+
+def test_generate_fallback_hints_three_char_location():
+    """3 字地名前缀场景 — '广州市XX' 应能去 3 字得到 'XX'。"""
+    from hub.agent.graph.nodes.resolve_customer import _generate_fallback_hints
+    out = _generate_fallback_hints("广州市得帆")
+    assert "得帆" in out
+
+
+def test_generate_fallback_hints_skips_too_short():
+    """≤2 字 hint 不切（避免无意义 fallback）。"""
+    from hub.agent.graph.nodes.resolve_customer import _generate_fallback_hints
+    assert _generate_fallback_hints("阿里") == []
+    assert _generate_fallback_hints("X") == []
+
+
+def test_generate_fallback_hints_skips_mixed_alphanumeric():
+    """含数字/英文不切（'X1 系列' 等不该被拆成 '系列'）。"""
+    from hub.agent.graph.nodes.resolve_customer import _generate_fallback_hints
+    assert _generate_fallback_hints("X1系列") == []
+    assert _generate_fallback_hints("Apple中国") == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_customer_falls_back_to_shorter_hint(_llm_mock):
+    """端到端：原 hint '广州得帆' 0 命中 → fallback 用 '得帆' 重搜命中"广州市得帆..."。"""
+    from hub.agent.graph.state import CustomerInfo
+    llm = _llm_mock("search_customers", {"query": "广州得帆"})
+    state = ContractState(user_message="客户就是广州得帆", hub_user_id=1, conversation_id="c1",
+                            extracted_hints={"customer_name": "广州得帆"})
+
+    call_log: list[str] = []
+    async def fake_executor(name, args):
+        call_log.append(args.get("query", ""))
+        if args.get("query") == "广州得帆":
+            return []  # ERP 子串不命中
+        if args.get("query") == "得帆":
+            return [{"id": 11, "name": "广州市得帆计算机科技有限公司",
+                     "address": "广州市天河区..."}]
+        return []
+
+    out = await resolve_customer_node(state, llm=llm, tool_executor=fake_executor)
+
+    # 必须先用原 hint 搜，再 fallback
+    assert call_log[0] == "广州得帆"
+    assert "得帆" in call_log
+    assert out.customer is not None
+    assert out.customer.id == 11
+    assert "广州市得帆" in out.customer.name
+    assert "customer" not in out.missing_fields
+
+
 @pytest.mark.asyncio
 async def test_candidate_selection_by_number(_llm_mock):
     """P2-C：上轮 candidate_customers + 本轮"选 2" → 直接消费 candidates[1]。"""

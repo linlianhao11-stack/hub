@@ -218,6 +218,16 @@ async def main():
                 snap = await graph_agent_inner.compiled_graph.aget_state(cfg)
                 if snap and snap.values:
                     s = snap.values
+
+                    # LangGraph state values 里 Pydantic 对象保留为对象（不是 dict），
+                    # 用 getattr 而非 .get() 兼容两种形态（旧 hub_user_id 没存的对话也能 read）。
+                    def _peek(obj, attr):
+                        if obj is None:
+                            return None
+                        if isinstance(obj, dict):
+                            return obj.get(attr)
+                        return getattr(obj, attr, None)
+
                     logger.info(
                         "[GA-PRE-STATE] cid=...%s active_subgraph=%r "
                         "candidate_customers=%d candidate_products=%s "
@@ -226,10 +236,10 @@ async def main():
                         s.get("active_subgraph"),
                         len(s.get("candidate_customers") or []),
                         list((s.get("candidate_products") or {}).keys()),
-                        (s.get("customer") or {}).get("name") if s.get("customer") else None,
+                        _peek(s.get("customer"), "name"),
                         len(s.get("products") or []),
                         len(s.get("items") or []),
-                        (s.get("shipping") or {}).get("address") if s.get("shipping") else None,
+                        _peek(s.get("shipping"), "address"),
                     )
                 else:
                     logger.info("[GA-PRE-STATE] cid=...%s (无上轮 state，新会话)", cid_short)
