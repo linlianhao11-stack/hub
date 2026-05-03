@@ -8,6 +8,7 @@ backend/hub/agent/llm_client.py）,让 LangGraph create_react_agent 能直接用
 （admin 决策链审计依赖)。
 """
 from __future__ import annotations
+import json
 import logging
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -41,7 +42,7 @@ def _messages_to_openai_format(messages: list[BaseMessage]) -> list[dict]:
                         "type": "function",
                         "function": {
                             "name": tc["name"],
-                            "arguments": __import__("json").dumps(tc["args"]),
+                            "arguments": json.dumps(tc["args"]),
                         },
                     }
                     for tc in msg.tool_calls
@@ -51,7 +52,7 @@ def _messages_to_openai_format(messages: list[BaseMessage]) -> list[dict]:
             out.append({
                 "role": "tool",
                 "tool_call_id": msg.tool_call_id,
-                "content": msg.content if isinstance(msg.content, str) else __import__("json").dumps(msg.content),
+                "content": msg.content if isinstance(msg.content, str) else json.dumps(msg.content),
             })
         else:
             logger.warning("Unknown message type: %s", type(msg).__name__)
@@ -126,15 +127,30 @@ class DeepSeekChatModel(BaseChatModel):
         # resp.text / resp.tool_calls / resp.finish_reason
         ai_msg_kwargs: dict = {"content": resp.text or ""}
         if resp.tool_calls:
-            import json
-            ai_msg_kwargs["tool_calls"] = [
-                {
-                    "id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "args": json.loads(tc["function"]["arguments"]),
-                }
-                for tc in resp.tool_calls
-            ]
+            valid_calls = []
+            invalid_calls = []
+            for tc in resp.tool_calls:
+                try:
+                    valid_calls.append({
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "args": json.loads(tc["function"]["arguments"]),
+                    })
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(
+                        "DeepSeek 返回 tool_call 解析失败,降级为 invalid_tool_call: %s — tc=%r",
+                        e, tc,
+                    )
+                    invalid_calls.append({
+                        "id": tc.get("id", ""),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "args": tc.get("function", {}).get("arguments", ""),
+                        "error": str(e),
+                    })
+            if valid_calls:
+                ai_msg_kwargs["tool_calls"] = valid_calls
+            if invalid_calls:
+                ai_msg_kwargs["invalid_tool_calls"] = invalid_calls
         ai_msg = AIMessage(**ai_msg_kwargs)
         return ChatResult(generations=[ChatGeneration(message=ai_msg)])
 

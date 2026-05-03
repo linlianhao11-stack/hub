@@ -86,3 +86,42 @@ def test_build_chat_model_configures_retry_and_timeout():
     )
     assert model.deepseek_client.timeout_seconds == 30
     assert model.deepseek_client.max_retries == 7
+
+
+@pytest.mark.asyncio
+async def test_deepseek_chat_model_handles_malformed_tool_call_args():
+    """DeepSeek 偶发返回 tool_calls[*].function.arguments 不是合法 JSON（schema jitter on response side）。
+
+    wrapper 必须降级为 AIMessage.invalid_tool_calls 而不是抛 JSONDecodeError 让 ReAct 图崩。
+    """
+    from hub.agent.react.llm import DeepSeekChatModel
+    from hub.agent.llm_client import DeepSeekLLMClient
+    from langchain_core.messages import HumanMessage
+    from unittest.mock import MagicMock
+
+    async def chat_with_bad_tool_args(*, messages, **kwargs):
+        return type("R", (), {
+            "text": "",
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                # 一个合法 + 一个 args 不是 JSON
+                {"id": "ok-1", "function": {"name": "search_customer", "arguments": '{"query": "X"}'}},
+                {"id": "bad-2", "function": {"name": "search_product", "arguments": "not-valid-json{"}},
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            "cache_hit_rate": 0.0,
+        })()
+
+    fake_client = MagicMock(spec=DeepSeekLLMClient)
+    fake_client.chat = chat_with_bad_tool_args
+
+    model = DeepSeekChatModel(deepseek_client=fake_client)
+    result = await model.ainvoke([HumanMessage(content="hi")])
+
+    # 合法 tool_call 进 tool_calls,坏的进 invalid_tool_calls
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["name"] == "search_customer"
+    assert result.tool_calls[0]["args"] == {"query": "X"}
+    assert len(result.invalid_tool_calls) == 1
+    assert result.invalid_tool_calls[0]["name"] == "search_product"
+    assert "not-valid-json" in result.invalid_tool_calls[0].get("args", "")
