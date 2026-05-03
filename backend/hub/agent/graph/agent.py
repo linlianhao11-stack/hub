@@ -50,19 +50,63 @@ _CONFIRM_KEYWORDS = {"确认", "是", "好的", "ok", "yes", "OK", "嗯"}
 
 _ACTION_ID_RE = re.compile(r"(adj|vch|stk|act|qte|cnt)-[0-9a-f]{8,}", re.IGNORECASE)
 
+# review round 3 / P1：纯数字 / 选 N / 第 N / id=N — **不**含 action_id 前缀，**不**含确认词。
+# action_id 单独通过 _has_action_id 判定（→ CONFIRM 优先）。
+# 这个 regex 与 extract_contract_context._looks_like_pure_selection 中 action_id / 确认词
+# 的子规则刻意分离，避免候选选择路径误吞 action_id。
+_NUMBER_SELECTION_RE = re.compile(
+    r"^\s*[1-9一二三四五六七八九]\s*$"        # 单数字 / 中文一二三...
+    r"|^选\s*[1-9]\s*$"                      # "选 N"
+    r"|^第\s*[一二三四五六七八九1-9]\s*个?\s*$"  # "第 N (个)"
+    r"|^\s*(?:id\s*[=:：]?\s*\d+[\s,，、]*)+\s*$",  # "id=10" / "id=11 id=21" 等
+    re.IGNORECASE,
+)
 
-def _is_confirm_message(msg: str) -> bool:
-    """是确认消息：含"确认"词 / action_id 前缀 / 单个数字（从 pending list 选）。"""
+
+def _is_confirm_keyword(msg: str) -> bool:
+    """**仅**确认词（"确认" / "是" / "好的" / ...）；不含 action_id 也不含数字。"""
+    return msg.strip() in _CONFIRM_KEYWORDS
+
+
+def _has_action_id(msg: str) -> bool:
+    """消息含 action_id 前缀（adj-/vch-/stk-/...32 hex）。
+
+    包括用户复制 "id=adj-aaaa..." 这种情况（_ACTION_ID_RE 用 search 不是 match）。
+    """
+    return bool(_ACTION_ID_RE.search(msg))
+
+
+def _is_pure_number_selection(msg: str) -> bool:
+    """**纯**数字选择：单数字 / "选 N" / "第 N 个" / "id=N"（多 id 也算）。
+
+    review round 3 P1：必须排除 action_id 前缀（否则候选选择分支会吞掉 action_id），
+    也排除确认词（确认词走专门路径）。
+    """
     msg = msg.strip()
+    if not msg:
+        return False
+    if _has_action_id(msg):
+        return False
     if msg in _CONFIRM_KEYWORDS:
+        return False
+    return bool(_NUMBER_SELECTION_RE.match(msg))
+
+
+# 兼容老 import：保留旧名作 alias（_is_confirm_message 含 action_id；_is_selection_message
+# 沿用 extract_context 的宽口径）。pre_router 内部不再用，但其他模块可能 import。
+def _is_confirm_message(msg: str) -> bool:
+    """[deprecated] 旧名：确认词 OR action_id。请用 _is_confirm_keyword + _has_action_id 拆分。"""
+    if _is_confirm_keyword(msg):
         return True
-    if _ACTION_ID_RE.search(msg):
+    if _has_action_id(msg):
         return True
     return False
 
 
 def _is_selection_message(msg: str) -> bool:
-    """是候选选择消息："选 N" / 单数字 / id=N 等 — 沿用 extract_contract_context 的规则。"""
+    """[deprecated] 旧名：宽口径"看起来像选择"——含 action_id 和确认词；
+    pre_router 不再使用（会误吞 action_id 到候选分支）。
+    """
     from hub.agent.graph.nodes.extract_contract_context import _looks_like_pure_selection
     return _looks_like_pure_selection(msg)
 
@@ -300,37 +344,31 @@ class GraphAgent:
 # ─────────────────────────── routing functions ───────────────────────────
 
 async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> AgentState:
-    """P1-A v1.3 pre_router（review round 2 P1 拆分确认词 vs 候选选择）：
+    """P1-A v1.3 pre_router（review round 3 P1：action_id 与纯数字选择再拆开）：
     基于上下文 + 消息类型直接判 intent，跳过 LLM。
 
-    优先级（**严格按顺序**，避免单 pending + 候选选择被误吞）：
+    路由优先级（**严格按顺序**，前一档命中即返）：
 
-    1. **候选选择最优先**：candidate_* 非空 + selection（数字 / "选 N" / "第 N 个" / id=N）
-       → 走 active_subgraph 的 intent。即使有旧 pending 也不抢这条路径，否则用户在
-       合同/报价候选选择流程里回 "选 2" 会被旧 pending 单独 claim 错触写操作。
-    2. **确认词 / action_id 路径**：明确表达确认意图（"确认"/"是"/"好的"/"OK"/"yes"
-       或 action_id 前缀）+ 任意数量 pending（≥1）→ CONFIRM。
-       此路径无歧义，单 pending 也允许直接 claim。
-    3. **数字选择 + 多 pending**：selection（数字 / "选 N" / "第 N 个" / id=N）+
-       **无** candidate_* + pendings **≥ 2** → CONFIRM。confirm_node 内部按编号匹配。
-       单 pending（1 个）+ 数字 + 无 candidate **不**走 CONFIRM —— 用户可能是新发起一个
-       不相关流程，避免误 claim 写操作。
-    4. 否则 intent = None → 交给 LLM router 决定。
+    1. **action_id + pending → CONFIRM**（最高优先）。action_id 是单点引用，含义无歧义；
+       即使存在 candidate_*，也必须进 CONFIRM，绝不被候选选择路由抢走。
+    2. **纯数字选择 + candidate_* → 候选 subgraph**。这是合同/报价候选选择的正常路径；
+       即使存在旧 pending 也不抢，否则单 pending 时 confirm_node 直接 claim 写操作 = 误执行。
+    3. **确认词 + pending → CONFIRM**。"确认"/"是"/"好的" 等明确表达确认意图，单 pending
+       也允许直接 claim。
+    4. **纯数字选择 + 多 pending（≥2）+ 无 candidate → CONFIRM**。多 pending 才允许
+       用编号匹配；单 pending + 数字 + 无 candidate **不**走 CONFIRM（避免误 claim）。
+    5. 都不命中 → intent = None，交 LLM router 决定。
+
+    关键：「action_id」「确认词」「纯数字选择」三类是**独立**判定，不互相吞噬。
     """
     msg = state.user_message
-    is_confirm_word = _is_confirm_message(msg)  # 确认词 / action_id 前缀
-    is_selection = _is_selection_message(msg)  # 数字 / "选 N" / "第 N 个" / id=N
+    has_action_id = _has_action_id(msg)
+    is_confirm_kw = _is_confirm_keyword(msg)
+    is_number_sel = _is_pure_number_selection(msg)
     has_candidates = bool(state.candidate_customers or state.candidate_products)
 
-    # 1. 候选 + 选择 → 候选 subgraph（最优先；不被 pending 抢）
-    if is_selection and has_candidates:
-        intent = _subgraph_to_intent(state.active_subgraph)
-        if intent is not None:
-            state.intent = intent
-            return state
-
-    # 2. 确认词 / action_id + 任意 pending → CONFIRM（无歧义）
-    if gate is not None and is_confirm_word:
+    # 1. action_id + pending → CONFIRM（不被候选抢）
+    if gate is not None and has_action_id:
         try:
             pendings = await gate.list_pending_for_context(
                 conversation_id=state.conversation_id,
@@ -342,9 +380,28 @@ async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> Ag
         except Exception:
             pass
 
-    # 3. 数字选择 + **多** pending + 无 candidate → CONFIRM
-    #    单 pending + 数字 不走 CONFIRM（避免误 claim 单一写操作）
-    if gate is not None and is_selection and not has_candidates:
+    # 2. 纯数字选择 + candidate → 候选 subgraph
+    if is_number_sel and has_candidates:
+        intent = _subgraph_to_intent(state.active_subgraph)
+        if intent is not None:
+            state.intent = intent
+            return state
+
+    # 3. 确认词 + pending → CONFIRM
+    if gate is not None and is_confirm_kw:
+        try:
+            pendings = await gate.list_pending_for_context(
+                conversation_id=state.conversation_id,
+                hub_user_id=state.hub_user_id,
+            )
+            if pendings:
+                state.intent = Intent.CONFIRM
+                return state
+        except Exception:
+            pass
+
+    # 4. 纯数字选择 + 多 pending + 无 candidate → CONFIRM
+    if gate is not None and is_number_sel and not has_candidates:
         try:
             pendings = await gate.list_pending_for_context(
                 conversation_id=state.conversation_id,
@@ -356,7 +413,7 @@ async def _pre_router_node(state: AgentState, *, gate: ConfirmGate | None) -> Ag
         except Exception:
             pass
 
-    # 4. 都不命中 → 交 LLM router
+    # 5. 都不命中 → 交 LLM router
     state.intent = None
     return state
 

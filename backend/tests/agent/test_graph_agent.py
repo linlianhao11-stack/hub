@@ -412,6 +412,47 @@ async def test_pre_router_multi_pending_numeric_no_candidate_routes_to_confirm()
 
 
 @pytest.mark.asyncio
+async def test_pre_router_action_id_with_candidate_routes_to_confirm_not_subgraph():
+    """review round 3 / P1：action_id 是单点引用（指向具体 pending），即使存在
+    candidate_* 也不能被候选选择路由抢走，必须进 CONFIRM。
+
+    旧实现：_is_selection_message 复用 _looks_like_pure_selection，把 action_id 也
+    当作 selection；候选分支优先 → 用户复制 action_id 时被路由回 contract/quote
+    子图，永远进不了 CONFIRM。
+    """
+    from hub.agent.graph.agent import _pre_router_node
+    from hub.agent.graph.state import AgentState, Intent, CustomerInfo
+    from hub.agent.tools.confirm_gate import ConfirmGate, PendingAction
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    aid = "adj-aaaa1111aaaa1111aaaa1111aaaa1111"
+    fake_pendings = [
+        PendingAction(
+            action_id=aid, conversation_id="c1", hub_user_id=1,
+            subgraph="adjust_price", summary="阿里 X1 → 280",
+            payload={"tool_name": "create_price_adjustment_request", "args": {}},
+            created_at=datetime.now(tz=timezone.utc),
+        ),
+    ]
+    gate = AsyncMock(spec=ConfirmGate)
+    gate.list_pending_for_context = AsyncMock(return_value=fake_pendings)
+
+    state = AgentState(user_message=aid, hub_user_id=1, conversation_id="c1")
+    state.candidate_customers = [
+        CustomerInfo(id=10, name="阿里巴巴"),
+        CustomerInfo(id=11, name="阿里云"),
+    ]
+    state.active_subgraph = "contract"
+
+    out = await _pre_router_node(state, gate=gate)
+    assert out.intent == Intent.CONFIRM, (
+        f"action_id 复制粘贴 + pending 命中时必须进 CONFIRM，"
+        f"即使 candidate_* 还有也不能被候选选择路由抢；实际 {out.intent!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_pre_router_confirm_word_with_single_pending_still_routes_confirm():
     """review round 2：确认词路径不变 — 单 pending + "确认" 仍进 CONFIRM（用户明确表达确认意图）。"""
     from hub.agent.graph.agent import _pre_router_node

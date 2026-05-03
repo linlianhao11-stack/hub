@@ -354,6 +354,105 @@ async def test_idempotency_stale_cleanup_uses_cas_and_does_not_clobber_concurren
 
 
 @pytest.mark.asyncio
+async def test_idempotency_create_is_atomic_transaction_post_state_consistent(gate):
+    """review round 3 / P1：idem_key SET 和 pending HSET 必须是同一原子事务（WATCH/MULTI/EXEC）。
+
+    旧实现先 SET NX 再 HSET：T1 SET 后 yield → T2 GET 看到 T1 idem 但 HEXISTS pending 为
+    False（T1 还没 HSET）→ T2 把 T1 当 stale 删掉 → T2 自己 SET 成功 → T1 继续 HSET → 双 pending。
+    新实现：SET + HSET + EXPIRE 在 WATCH/MULTI/EXEC 内原子提交，不存在中间状态。
+
+    本测试验证后置不变量：任意时刻 idem_key 指向的 action_id 必须真在 pending hash 里
+    （即"reservation"和"实际 pending"必须同生同灭）。
+    """
+    # 跑 5 个并发 worker（同 context 同 idempotency_key）
+    async def worker():
+        return await gate.create_pending(
+            hub_user_id=1, conversation_id="c1",
+            subgraph="voucher", summary="x",
+            payload={"tool_name": "create_voucher_draft", "args": {"order_id": 11}},
+            action_prefix="vch",
+            idempotency_key="vch:11:outbound",
+            ttl_seconds=600,
+        )
+
+    results = await asyncio.gather(*[worker() for _ in range(5)])
+
+    # 全部返同一个 action_id
+    action_ids = {p.action_id for p in results}
+    assert len(action_ids) == 1, (
+        f"5 concurrent same-context creates 应该只创建 1 个 action，实际 {action_ids}"
+    )
+
+    # 关键不变量：idem_key 指向的 action_id 必须真在 pending hash 里
+    import json
+    idem_key = gate._idempotency_key("vch:11:outbound")
+    idem_raw = await gate.redis.get(idem_key)
+    assert idem_raw is not None
+    idem_record = json.loads(idem_raw)
+    pending_key = gate._pending_key("c1", 1)
+    assert await gate.redis.hexists(pending_key, idem_record["action_id"]), (
+        "idem_key 指向的 action_id 必须真在 pending hash 里 "
+        "（原子事务保证 reservation 和 pending 同生同灭）"
+    )
+
+    # pending hash 总数必须只有 1 条
+    pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
+    assert len(pendings) == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotency_no_double_pending_when_yield_between_set_and_hset(gate, monkeypatch):
+    """review round 3 / P1：强制 yield 在 idem set 与 pending hset 之间也不能双创。
+
+    旧实现：每个 redis 操作都是独立 await，T1 SET idem 之后 yield → T2 进入 create_pending →
+    T2 SET NX 失败 → GET 见 T1 idem → HEXISTS pending T1.aid 为 False（T1 还没 HSET）→
+    判 stale → DEL idem → T2 SET 成功 → T2 HSET → T1 continues HSET → pending 双条。
+
+    新实现：把 reservation + HSET + EXPIRE 全放 WATCH/MULTI/EXEC，T1 commit 之前 idem
+    根本不可观察；T2 WATCH+GET 要么看到 None（T1 未 commit）要么看到 T1 record（T1 已
+    commit 且 pending HSET 也已生效），不存在中间窗口。
+
+    通过 monkeypatch 在第一次 redis.hset 调用前强制 yield 多轮，给另一个 worker 跑完整
+    create_pending 的机会。新实现下：(a) pipeline 路径根本不调顶层 redis.hset；(b) 即便
+    调到，原子事务内的状态对其他 task 也不可观察。
+    """
+    real_hset = gate.redis.hset
+    hset_yielded = {"done": False}
+
+    async def slow_hset(*args, **kwargs):
+        if not hset_yielded["done"]:
+            hset_yielded["done"] = True
+            # 多次 yield 让另一个 task 完整跑一遍 create_pending
+            for _ in range(8):
+                await asyncio.sleep(0)
+        return await real_hset(*args, **kwargs)
+
+    monkeypatch.setattr(gate.redis, "hset", slow_hset)
+
+    async def worker():
+        return await gate.create_pending(
+            hub_user_id=1, conversation_id="c1",
+            subgraph="voucher", summary="x",
+            payload={"tool_name": "create_voucher_draft", "args": {"order_id": 12}},
+            action_prefix="vch",
+            idempotency_key="vch:12:outbound",
+            ttl_seconds=600,
+        )
+
+    # 双 worker 并发，强制 yield 让交错发生
+    results = await asyncio.gather(worker(), worker())
+    action_ids = {p.action_id for p in results}
+    assert len(action_ids) == 1, (
+        f"强制 yield 后并发双 worker 仍应只产生 1 个 action，实际 {action_ids}"
+    )
+
+    pendings = await gate.list_pending_for_context(conversation_id="c1", hub_user_id=1)
+    assert len(pendings) == 1, (
+        f"pending hash 应只有 1 条（不能有 SET+HSET 中间窗口造成的双 pending），实际 {len(pendings)}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cas_delete_idempotency_key_succeeds_when_value_unchanged(gate):
     """review round 2 / P1：CAS 删除在值未变时正常成功（保证正常 stale 清理路径仍走得通）。"""
     p = await gate.create_pending(

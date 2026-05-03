@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from redis.asyncio import Redis
+from redis.exceptions import WatchError
 
 
 def uuid4_hex() -> str:
@@ -213,10 +214,14 @@ class ConfirmGate:
         - action_id 生产路径：f"{action_prefix}-{uuid4().hex}"（32-hex）
         - idempotency_key 同 (conv, user) 命中 → 复用；跨 context 命中 → raise CrossContextIdempotency
 
-        review issue 2 加固（v9 round 2）：
-          - 用 SET NX EX 做**原子**预占：旧实现 GET → 检查 → SET 在并发下会双 create
-          - 命中已有 idempotency_key 时再做 stale check：HEXISTS pending hash；
-            旧 action_id 已被 claim/手动清/过期 → DEL stale 记录 + 重试一次（避免给用户死 action）
+        review round 2 / round 3 加固：
+          - **原子事务创建**（round 3 P1）：SET idem_key + HSET pending + EXPIRE 全放
+            WATCH/MULTI/EXEC 内一次提交。旧实现先 SET NX 再 HSET 之间有窗口，T1 SET 后
+            yield → T2 GET 见 idem 但 HEXISTS 假阴 → T2 把 T1 当 stale 删除 → 双 pending。
+          - **stale CAS DELETE**（round 2 P1）：删除前用 CAS 校验当前值未被改，避免
+            盲删另一个协程刚 SET 的新 reservation。
+          - **跨 context fail-closed**：idempotency_key 命中跨 (conv, user) → 抛
+            CrossContextIdempotency，绝不返别人的 action_id。
         """
         if idempotency_key is None:
             # 无幂等需求 — 直接走非幂等路径
@@ -228,10 +233,12 @@ class ConfirmGate:
             )
 
         idem_key = self._idempotency_key(idempotency_key)
+        pending_key = self._pending_key(conversation_id, hub_user_id)
+        max_pending_ttl = max(ttl_seconds, self.TTL)
 
-        # 最多重试一次：第一次失败 + stale → DEL + 第二次必须成功（自己再竞争）
-        for attempt in range(2):
-            # 准备候选 record
+        # 最多 4 次 attempt：每次可能因 WATCH 冲突或 stale 清理 retry
+        for attempt in range(4):
+            # 准备本次 attempt 的候选 record
             candidate_action_id = (
                 action_id if (action_id and attempt == 0)
                 else f"{action_prefix}-{uuid4_hex()}"
@@ -256,35 +263,42 @@ class ConfirmGate:
             }
             record_json = json.dumps(record, ensure_ascii=False)
 
-            # 原子预占 idempotency_key（SET NX EX 是 Redis 原生原子操作）
-            reserved = await self.redis.set(
-                idem_key, record_json, nx=True, ex=ttl_seconds,
-            )
-            if reserved:
-                # 我们抢到了 → 写 pending hash
-                pending_key = self._pending_key(conversation_id, hub_user_id)
-                await self.redis.hset(pending_key, candidate_action_id, record_json)
-                await self.redis.expire(pending_key, max(ttl_seconds, self.TTL))
-                return PendingAction(
-                    action_id=candidate_action_id,
-                    conversation_id=conversation_id,
-                    hub_user_id=hub_user_id,
-                    subgraph=subgraph,
-                    summary=summary,
-                    payload=payload,
-                    created_at=now,
-                    ttl_seconds=ttl_seconds,
-                    token=token,
-                    idempotency_key=idempotency_key,
-                )
-
-            # 没抢到 → key 已存在，读出来判断是 reuse / cross-context / stale
-            existing_raw = await self.redis.get(idem_key)
-            if existing_raw is None:
-                # 极端 race：刚才 SET NX 失败 → GET 又拿不到（别人删了/过期）
-                # → 直接重试（attempt 2）
+            # round 3 P1：用 WATCH/MULTI/EXEC 把"检查 idem 不存在 + SET idem +
+            # HSET pending + EXPIRE pending"做成一个原子事务，消除 SET 与 HSET 之间
+            # 的中间窗口。T2 不可能在 T1 commit 之前观察到"idem 已 SET 但 pending 未 HSET"。
+            existing_raw_for_stale = None
+            try:
+                async with self.redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(idem_key)
+                    existing_raw = await pipe.get(idem_key)
+                    if existing_raw is None:
+                        # 原子提交 reservation + pending HSET
+                        pipe.multi()
+                        pipe.set(idem_key, record_json, ex=ttl_seconds)
+                        pipe.hset(pending_key, candidate_action_id, record_json)
+                        pipe.expire(pending_key, max_pending_ttl)
+                        await pipe.execute()
+                        return PendingAction(
+                            action_id=candidate_action_id,
+                            conversation_id=conversation_id,
+                            hub_user_id=hub_user_id,
+                            subgraph=subgraph,
+                            summary=summary,
+                            payload=payload,
+                            created_at=now,
+                            ttl_seconds=ttl_seconds,
+                            token=token,
+                            idempotency_key=idempotency_key,
+                        )
+                    # existing != None → 在 pipeline 外做 reuse / stale / cross-context 处理
+                    await pipe.unwatch()
+                    existing_raw_for_stale = existing_raw
+            except WatchError:
+                # WATCH 期间 idem_key 被改 → 别人抢了 reservation → 下一轮 attempt
+                # 会重新 GET 看到新 record（可能 reuse / 可能 stale）
                 continue
-            existing = json.loads(existing_raw)
+
+            existing = json.loads(existing_raw_for_stale)
 
             # 跨 context → 立即拒绝，绝不返别人的 action_id
             if (existing.get("conversation_id") != conversation_id
@@ -295,10 +309,9 @@ class ConfirmGate:
 
             # 同 context — 验证现存的 action_id 是否还在 pending hash 里
             existing_aid = existing.get("action_id")
-            existing_pending_key = self._pending_key(conversation_id, hub_user_id)
             is_alive = (
                 bool(existing_aid)
-                and await self.redis.hexists(existing_pending_key, existing_aid)
+                and await self.redis.hexists(pending_key, existing_aid)
             )
             if is_alive:
                 # 真复用 — 返回现有 PendingAction
@@ -317,16 +330,16 @@ class ConfirmGate:
 
             # Stale：idempotency_key 还在但 action_id 已不在 pending hash
             # → CAS 清理（仅当当前值仍是我们读到的旧 stale record 才删）；
-            # 下一轮 attempt 会用新 action_id 重新 SET NX。
+            # 下一轮 attempt 会用新 action_id 重新进入 WATCH/MULTI/EXEC。
             #
             # review round 2 / P1 修：旧实现盲目 DEL 在并发下会误删别人刚 SET 的新 reservation：
             #   T1 GET → V1 stale；T2 也 GET → V1 stale；T2 DEL+SET → V2 (alive)；
-            #   T1 DEL 会把 V2 干掉，然后 T1 SET NX → V3 → 同 idempotency_key 双 reservation。
+            #   T1 DEL 会把 V2 干掉，然后 T1 SET → V3 → 同 idempotency_key 双 reservation。
             # CAS 删除（WATCH+MULTI+EXEC）让"被改"的 DEL 失败，T1 的下一轮 attempt 通过
-            # SET NX 也会失败（V2 已存在）→ 走 reuse 路径，避免双创。
-            await self._cas_delete_idempotency_key(idem_key, existing_raw)
+            # WATCH 也会看到 V2，走 reuse 路径，避免双创。
+            await self._cas_delete_idempotency_key(idem_key, existing_raw_for_stale)
             # 继续下一次 attempt（CAS 成功 → 干净了；CAS 失败 → 别人写了新值，
-            # 下一轮 SET NX 会失败、转 reuse 路径，也是正确终态）
+            # 下一轮 WATCH+GET 会看到新值、转 reuse 路径，也是正确终态）
 
         # 不应到这里；safety
         raise RuntimeError(
