@@ -79,3 +79,53 @@ async def get_customer_history(
         args={"product_id": product_id, "customer_id": customer_id, "limit": limit},
         fn=erp_tools.get_customer_history,
     )
+
+
+@tool
+async def get_customer_balance(customer_id: int) -> dict:
+    """客户欠款 / 余额 / 信用额度 / rebate 余额。
+    用户问"还欠多少" / "信用够吗" / "余额怎样"时调。
+    """
+    return await invoke_business_tool(
+        tool_name="get_customer_balance",
+        perm="usecase.query_customer_balance.use",
+        args={"customer_id": customer_id},
+        fn=erp_tools.get_customer_balance,
+    )
+
+
+@tool
+async def search_orders(customer_id: int = 0, since_days: int = 30) -> dict:
+    """搜订单（按客户 + 最近 N 天）。customer_id=0 表示不过滤,看全部用户的订单。
+    用户问"最近订单怎样" / "翼蓝最近买啥"时调。
+    """
+    return await invoke_business_tool(
+        tool_name="search_orders",
+        perm="usecase.query_orders.use",
+        args={"customer_id": customer_id, "since_days": since_days},
+        fn=erp_tools.search_orders,
+    )
+
+
+@tool
+async def get_order_detail(order_id: int) -> dict:
+    """订单详情（含每行商品 / 数量 / 价格）。"""
+    return await invoke_business_tool(
+        tool_name="get_order_detail",
+        perm="usecase.query_orders.use",
+        args={"order_id": order_id},
+        fn=erp_tools.get_order_detail,
+    )
+
+
+@tool
+async def analyze_top_customers(period: str = "近一月", top_n: int = 10) -> dict:
+    """近 N 天客户销售排行。period 取 "近一周" / "近一月" / "近一季" / "近一年" 等中文表达。
+    用户问"哪些大客户" / "本月销售排行"调。返 {items: [...], data_window: ...}。
+    """
+    return await invoke_business_tool(
+        tool_name="analyze_top_customers",
+        perm="usecase.analyze.use",
+        args={"period": period, "top_n": top_n},
+        fn=analyze_tools.analyze_top_customers,
+    )
