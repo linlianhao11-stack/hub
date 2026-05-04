@@ -123,6 +123,10 @@ async def main():
     draft_tools.set_erp_adapter(erp_adapter)
     generate_tools.set_dependencies(sender=sender, erp=erp_adapter)
 
+    # 1c. v11 接通 memory：构建三层 service + SessionMemory，注入 ReAct invoke helper
+    from hub.agent.memory.factory import build_memory_stack
+    memory_stack = build_memory_stack(redis=redis_client)
+
     # 2. chat model（ReActAgent 使用 LangChain ChatOpenAI 接口）
     agent_base_url = ai_provider.base_url if ai_provider else ""
 
@@ -161,6 +165,9 @@ async def main():
         tools=ALL_TOOLS,
         checkpointer=_checkpointer,
         recursion_limit=15,
+        memory_loader=memory_stack.loader,
+        memory_writer=memory_stack.writer,
+        ai_provider=ai_provider,
     )
 
     # 7. GraphAgentAdapter：包装 ReActAgent，让其接口与 handler 期望的 AgentResult 兼容

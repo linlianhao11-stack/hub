@@ -160,6 +160,18 @@ class DeepSeekChatModel(BaseChatModel):
                 ai_msg_kwargs["tool_calls"] = valid_calls
             if invalid_calls:
                 ai_msg_kwargs["invalid_tool_calls"] = invalid_calls
+        # v12: 把 DeepSeek 返的 usage 写到 AIMessage.usage_metadata,
+        # 让 ReActAgent.sum_tokens_used 能聚合 → ConversationLog.tokens_used 有真实数。
+        # DeepSeekLLMClient.chat 返 LLMResponse,usage 是 dict(对应 OpenAI usage 字段)。
+        usage = getattr(resp, "usage", None) or {}
+        prompt_t = int(usage.get("prompt_tokens") or 0)
+        completion_t = int(usage.get("completion_tokens") or 0)
+        if prompt_t or completion_t:
+            ai_msg_kwargs["usage_metadata"] = {
+                "input_tokens": prompt_t,
+                "output_tokens": completion_t,
+                "total_tokens": prompt_t + completion_t,
+            }
         ai_msg = AIMessage(**ai_msg_kwargs)
         return ChatResult(generations=[ChatGeneration(message=ai_msg)])
 

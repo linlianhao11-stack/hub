@@ -102,6 +102,10 @@ import {
   Legend,
   Tooltip,
 } from 'chart.js'
+// v12 bug fix: 之前缺这两个 import 导致 load() 抛 ReferenceError 被 try/catch 吞,
+// 仪表盘永远显示初始值 0(用户报"所有显示都不正常没有数据")。
+import { getDashboard } from '../../api/dashboard'
+import { pickErrorDetail } from '../../api'
 
 Chart.register(LineController, LineElement, PointElement, LinearScale, CategoryScale, Filler, Legend, Tooltip)
 

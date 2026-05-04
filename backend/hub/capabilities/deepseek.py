@@ -22,8 +22,11 @@ class _OpenAICompatibleProvider:
 
     def __init__(
         self, api_key: str, base_url: str, model: str,
-        *, timeout: float = 30.0, transport: httpx.BaseTransport | None = None,
+        *, timeout: float = 60.0, transport: httpx.BaseTransport | None = None,
     ):
+        # timeout=60s: 主对话路径正常 5-15s 完成，60s 对正常调用零影响；
+        # MemoryWriter 抽事实场景 prompt 含 schema + 多条 tool_log 会触发慢调用，
+        # 30s 不够（实测 ReadTimeout）。这里抬到 60s 兼顾两类调用。
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model

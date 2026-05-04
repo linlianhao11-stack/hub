@@ -56,6 +56,73 @@ _BEHAVIOR_RULES = """\
     用户只关心结果。"""
 
 
+def render_memory_section(memory: Memory | None) -> str:
+    """把 Memory 渲染成 prompt 段落（模块级，供 ReActAgent / PromptBuilder 共用）。
+
+    返回空字符串表示无任何可注入的 memory 内容（首次对话 / facts 全空）。
+    lazy header：只在某层确实有合法 fact 时才追加该层 header。
+    """
+    if memory is None:
+        return ""
+
+    parts: list[str] = []
+
+    # 用户层
+    user_facts = memory.user.get("facts", []) if memory.user else []
+    user_prefs = memory.user.get("preferences", {}) if memory.user else {}
+    user_lines: list[str] = []
+    for f in user_facts:
+        if isinstance(f, dict) and f.get("fact"):
+            line = f"  - {f['fact']}"
+            # 决策性 fact 加二次确认警示
+            if f.get("kind") == "decision":
+                line += "（⚠️ 涉及报价/折扣/数量，使用前必须查实时数据二次确认）"
+            user_lines.append(line)
+    if user_prefs:
+        user_lines.append(f"  偏好: {json.dumps(user_prefs, ensure_ascii=False)}")
+    if user_lines:
+        parts.append("[当前用户偏好]")
+        parts.extend(user_lines)
+
+    # 客户层
+    customer_lines: list[str] = []
+    if memory.customers:
+        for cid, m in memory.customers.items():
+            facts = m.get("facts", []) if m else []
+            valid = [f for f in facts if isinstance(f, dict) and f.get("fact")]
+            if valid:
+                customer_lines.append(f"  客户 {cid}:")
+                for f in valid:
+                    line = f"    - {f['fact']}"
+                    if f.get("kind") == "decision":
+                        line += "（⚠️ 涉及报价/折扣/数量，使用前必须查实时数据二次确认）"
+                    customer_lines.append(line)
+    if customer_lines:
+        parts.append("[当前对话提及的客户]")
+        parts.extend(customer_lines)
+
+    # 商品层
+    product_lines: list[str] = []
+    if memory.products:
+        for pid, m in memory.products.items():
+            facts = m.get("facts", []) if m else []
+            valid = [f for f in facts if isinstance(f, dict) and f.get("fact")]
+            if valid:
+                product_lines.append(f"  商品 {pid}:")
+                for f in valid:
+                    line = f"    - {f['fact']}"
+                    if f.get("kind") == "decision":
+                        line += "（⚠️ 涉及报价/折扣/数量，使用前必须查实时数据二次确认）"
+                    product_lines.append(line)
+    if product_lines:
+        parts.append("[当前对话提及的商品]")
+        parts.extend(product_lines)
+
+    if not parts:
+        return ""
+    return "\n".join(parts)
+
+
 class PromptBuilder:
     """LLM system prompt 组装器。
 
@@ -153,54 +220,5 @@ class PromptBuilder:
         return "\n\n".join(sections)
 
     def _render_memory(self, memory: Memory) -> str:
-        """把 Memory dataclass 渲染成 prompt 段落。
-
-        I3+I4: lazy header —— 只在第一条合法 fact 实际入列时才 append header，
-        避免 facts 为空时残留孤立的 section header。
-        """
-        parts: list[str] = []
-
-        # 用户层（lazy header）
-        user_facts = memory.user.get("facts", []) if memory.user else []
-        user_prefs = memory.user.get("preferences", {}) if memory.user else {}
-        user_lines: list[str] = []
-        for f in user_facts:
-            if isinstance(f, dict) and f.get("fact"):
-                user_lines.append(f"  - {f['fact']}")
-        if user_prefs:
-            user_lines.append(f"  偏好: {json.dumps(user_prefs, ensure_ascii=False)}")
-        if user_lines:
-            parts.append("[当前用户偏好]")
-            parts.extend(user_lines)
-
-        # 客户层（lazy header）
-        customer_lines: list[str] = []
-        if memory.customers:
-            for cid, m in memory.customers.items():
-                facts = m.get("facts", []) if m else []
-                valid = [f for f in facts if isinstance(f, dict) and f.get("fact")]
-                if valid:
-                    customer_lines.append(f"  客户 {cid}:")
-                    for f in valid:
-                        customer_lines.append(f"    - {f['fact']}")
-        if customer_lines:
-            parts.append("[当前对话提及的客户]")
-            parts.extend(customer_lines)
-
-        # 商品层（lazy header）
-        product_lines: list[str] = []
-        if memory.products:
-            for pid, m in memory.products.items():
-                facts = m.get("facts", []) if m else []
-                valid = [f for f in facts if isinstance(f, dict) and f.get("fact")]
-                if valid:
-                    product_lines.append(f"  商品 {pid}:")
-                    for f in valid:
-                        product_lines.append(f"    - {f['fact']}")
-        if product_lines:
-            parts.append("[当前对话提及的商品]")
-            parts.extend(product_lines)
-
-        if not parts:
-            return ""
-        return "\n".join(parts)
+        """委托模块级 render_memory_section(决策性 fact 警示统一在那里)。"""
+        return render_memory_section(memory)

@@ -1,9 +1,10 @@
-"""Plan 6 Task 4：MemoryWriter 测试（11 case）。"""
+"""MemoryWriter 测试(v12 - 输入维度从 ToolCallLog 改成 LangGraph messages)。"""
 from __future__ import annotations
 
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from hub.agent.memory.persistent import (
     CustomerMemoryService,
@@ -13,53 +14,87 @@ from hub.agent.memory.persistent import (
 from hub.agent.memory.writer import MemoryWriter
 
 
-def _make_tool_log(tool_name: str, result_json=None, args_json=None):
-    """创建模拟 ToolCallLog 对象（不依赖 DB）。"""
-    log = MagicMock()
-    log.tool_name = tool_name
-    log.args_json = args_json or {}
-    log.result_json = result_json or {}
-    return log
+# ─────────────────────── helper: 构造 LangGraph messages ───────────────────────
+
+
+def _ai_msg_with_tool_calls(*tool_calls: dict, content: str = "") -> AIMessage:
+    """tool_calls=[{"name": ..., "args": {...}}, ...]"""
+    return AIMessage(content=content, tool_calls=[
+        {"id": f"call-{i}", "name": tc["name"], "args": tc.get("args", {})}
+        for i, tc in enumerate(tool_calls)
+    ])
+
+
+def _tool_msg(name: str, content) -> ToolMessage:
+    """ToolMessage.content 可以是 dict / str(json) / 任意 str。"""
+    import json
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    return ToolMessage(content=content, name=name, tool_call_id="call-0")
+
+
+# ─────────────────────── should_extract gate ───────────────────────
 
 
 @pytest.mark.asyncio
 async def test_should_extract_returns_false_for_chitchat():
-    """tool_call_logs 空 + rounds < 4 → False。"""
-    assert MemoryWriter.should_extract(tool_call_logs=[], rounds_count=0) is False
-    assert MemoryWriter.should_extract(tool_call_logs=[], rounds_count=3) is False
+    assert MemoryWriter.should_extract(messages=[], rounds_count=0) is False
+    assert MemoryWriter.should_extract(messages=[], rounds_count=3) is False
 
 
 @pytest.mark.asyncio
 async def test_should_extract_returns_true_for_write_tool():
-    """tool_call_log 含 create_voucher_draft → True。"""
-    logs = [_make_tool_log("create_voucher_draft")]
-    assert MemoryWriter.should_extract(tool_call_logs=logs, rounds_count=1) is True
+    msgs = [_ai_msg_with_tool_calls({"name": "create_voucher_draft"})]
+    assert MemoryWriter.should_extract(messages=msgs, rounds_count=1) is True
 
 
 @pytest.mark.asyncio
 async def test_should_extract_returns_true_for_generate_tool():
-    """含 generate_contract_draft → True。"""
-    logs = [_make_tool_log("generate_contract_draft")]
-    assert MemoryWriter.should_extract(tool_call_logs=logs, rounds_count=1) is True
+    msgs = [_ai_msg_with_tool_calls({"name": "generate_contract_draft"})]
+    assert MemoryWriter.should_extract(messages=msgs, rounds_count=1) is True
 
 
 @pytest.mark.asyncio
 async def test_should_extract_returns_true_for_long_conversation():
-    """rounds=5 + 无特殊 tool → True（因为 rounds >= 4）。"""
-    logs = [_make_tool_log("search_something")]
-    assert MemoryWriter.should_extract(tool_call_logs=logs, rounds_count=5) is True
+    """rounds=5 且无写类 tool → True(rounds_count gate 单独触发)。"""
+    msgs = [_ai_msg_with_tool_calls({"name": "search_anything"})]
+    assert MemoryWriter.should_extract(messages=msgs, rounds_count=5) is True
 
 
 @pytest.mark.asyncio
-async def test_should_extract_returns_true_when_result_has_customer_id():
-    """search_customers 返 customer_id → True（I2: EntityExtractor 结构化判断）。"""
-    logs = [_make_tool_log("search_customers", result_json={"customer_id": 42, "name": "某客户"})]
-    assert MemoryWriter.should_extract(tool_call_logs=logs, rounds_count=1) is True
+async def test_should_extract_returns_true_when_tool_result_has_customer_id():
+    """ToolMessage.content json 含 customer_id → 实体抽取触发 True。"""
+    msgs = [
+        _ai_msg_with_tool_calls({"name": "search_customers"}),
+        _tool_msg("search_customers", {"customer_id": 42, "name": "某客户"}),
+    ]
+    assert MemoryWriter.should_extract(messages=msgs, rounds_count=1) is True
+
+
+# ─────────────────────── extract_and_write ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extract_and_write_short_circuits_when_should_extract_false():
+    user_svc = AsyncMock(spec=UserMemoryService)
+    customer_svc = AsyncMock(spec=CustomerMemoryService)
+    product_svc = AsyncMock(spec=ProductMemoryService)
+    ai_provider = AsyncMock()
+    writer = MemoryWriter(user_svc, customer_svc, product_svc)
+    stats = await writer.extract_and_write(
+        conversation_id="c1",
+        hub_user_id=1,
+        messages=[],   # 空 + rounds=1 → gate fail
+        rounds_count=1,
+        ai_provider=ai_provider,
+    )
+    ai_provider.parse_intent.assert_not_called()
+    assert stats["skip_reason"] == "gate_failed"
 
 
 @pytest.mark.asyncio
 async def test_extract_and_write_skips_low_confidence_facts():
-    """mock LLM 返 confidence 0.3 → user upsert_facts 不调。"""
+    """confidence < 0.6 全部不写。"""
     user_svc = AsyncMock(spec=UserMemoryService)
     customer_svc = AsyncMock(spec=CustomerMemoryService)
     product_svc = AsyncMock(spec=ProductMemoryService)
@@ -68,172 +103,246 @@ async def test_extract_and_write_skips_low_confidence_facts():
     ai_provider = MagicMock()
     ai_provider.parse_intent = AsyncMock(return_value={
         "user_facts": [
-            {"fact": "低置信事实", "confidence": 0.3},  # 低于 0.6，不写
-            {"fact": "另一低置信", "confidence": 0.5},  # 低于 0.6，不写
+            {"fact": "低置信", "confidence": 0.3},
+            {"fact": "低置信2", "confidence": 0.5},
         ],
-        "customer_facts": [],
-        "product_facts": [],
+        "customer_facts": [], "product_facts": [],
     })
 
-    logs = [_make_tool_log("create_something")]  # 触发 gate
-    await writer.extract_and_write(
-        conversation_id="test-conv-1",
-        hub_user_id=1,
-        tool_call_logs=logs,
-        rounds_count=1,
-        ai_provider=ai_provider,
+    msgs = [_ai_msg_with_tool_calls({"name": "create_something"})]
+    stats = await writer.extract_and_write(
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=1, ai_provider=ai_provider,
     )
-
-    # 因为全部 confidence < 0.6，user upsert_facts 不应被调用
     user_svc.upsert_facts.assert_not_called()
     customer_svc.upsert_facts.assert_not_called()
     product_svc.upsert_facts.assert_not_called()
-
-
-# ─────────────────────────── I4: 新增 5 个测试 case ───────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_extract_and_write_short_circuits_when_should_extract_false():
-    """I4: should_extract=False 时不调 LLM。"""
-    user_svc = AsyncMock()
-    customer_svc = AsyncMock()
-    product_svc = AsyncMock()
-    ai_provider = AsyncMock()
-
-    writer = MemoryWriter(user_svc, customer_svc, product_svc)
-    await writer.extract_and_write(
-        conversation_id="c1",
-        hub_user_id=1,
-        tool_call_logs=[],  # 空 → should_extract=False
-        rounds_count=1,
-        ai_provider=ai_provider,
-    )
-    ai_provider.parse_intent.assert_not_called()
+    assert stats["new_user_facts"] == 0
+    assert stats["dedup_skipped"] >= 2  # 2 条都被低置信过滤
 
 
 @pytest.mark.asyncio
 async def test_extract_and_write_calls_upsert_with_correct_facts():
-    """I4: 高 confidence user fact → user_svc.upsert_facts 被调，customer_svc 也对。"""
     user_svc = AsyncMock()
     customer_svc = AsyncMock()
     product_svc = AsyncMock()
     ai_provider = AsyncMock()
     ai_provider.parse_intent.return_value = {
-        "user_facts": [{"fact": "用户偏好分期付款", "confidence": 0.9}],
+        "user_facts": [{"fact": "用户偏好分期", "confidence": 0.9}],
         "customer_facts": [{"customer_id": 100, "fact": "对方主营华东", "confidence": 0.8}],
         "product_facts": [],
     }
-
     writer = MemoryWriter(user_svc, customer_svc, product_svc)
-    await writer.extract_and_write(
-        conversation_id="c1",
-        hub_user_id=1,
-        tool_call_logs=[_make_tool_log("create_voucher_draft")],
-        rounds_count=2,
-        ai_provider=ai_provider,
+    msgs = [_ai_msg_with_tool_calls({"name": "create_voucher_draft"})]
+    stats = await writer.extract_and_write(
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=2, ai_provider=ai_provider,
     )
     user_svc.upsert_facts.assert_awaited_once()
     customer_svc.upsert_facts.assert_awaited_once_with(100, new_facts=ANY)
+    assert stats["new_user_facts"] == 1
+    assert stats["new_customer_facts"] == 1
+    assert "duration_ms" in stats
+    assert stats["input_chars"] > 0
 
 
 @pytest.mark.asyncio
 async def test_extract_and_write_fail_soft_on_llm_error():
-    """I4 / C2: LLM parse_intent 抛错 → logger.exception，不 raise。"""
     user_svc = AsyncMock()
     ai_provider = AsyncMock()
     ai_provider.parse_intent.side_effect = RuntimeError("LLM 503")
-
     writer = MemoryWriter(user_svc, AsyncMock(), AsyncMock())
-    # 不应抛
-    await writer.extract_and_write(
-        conversation_id="c1",
-        hub_user_id=1,
-        tool_call_logs=[_make_tool_log("generate_contract")],
-        rounds_count=2,
-        ai_provider=ai_provider,
+    msgs = [_ai_msg_with_tool_calls({"name": "generate_contract"})]
+    stats = await writer.extract_and_write(
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=2, ai_provider=ai_provider,
     )
     user_svc.upsert_facts.assert_not_called()
+    assert stats["skip_reason"] == "llm_failed"
 
 
 @pytest.mark.asyncio
 async def test_extract_and_write_fail_soft_on_db_error():
-    """I4 / C2: _upsert_all DB 抛错 → logger.exception，不 raise（不阻塞 asyncio.create_task）。"""
     user_svc = AsyncMock()
     user_svc.upsert_facts.side_effect = RuntimeError("DB pool exhausted")
     ai_provider = AsyncMock()
     ai_provider.parse_intent.return_value = {
-        "user_facts": [{"fact": "某偏好", "confidence": 0.9}],
-        "customer_facts": [],
-        "product_facts": [],
+        "user_facts": [{"fact": "x", "confidence": 0.9}],
+        "customer_facts": [], "product_facts": [],
     }
-
     writer = MemoryWriter(user_svc, AsyncMock(), AsyncMock())
-    # 不应抛
-    await writer.extract_and_write(
-        conversation_id="c1",
-        hub_user_id=1,
-        tool_call_logs=[_make_tool_log("create_voucher_draft")],
-        rounds_count=2,
-        ai_provider=ai_provider,
+    msgs = [_ai_msg_with_tool_calls({"name": "create_voucher_draft"})]
+    stats = await writer.extract_and_write(
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=2, ai_provider=ai_provider,
     )
+    assert stats["skip_reason"] == "db_failed"
 
 
 @pytest.mark.asyncio
 async def test_extract_and_write_handles_malformed_result():
-    """I4 / C2: parse_intent 返回非 list / 类型错 → 不挂，不调 upsert。"""
     user_svc = AsyncMock()
     ai_provider = AsyncMock()
     ai_provider.parse_intent.return_value = {
-        "user_facts": "not-a-list",            # 格式错：string 而非 list
-        "customer_facts": None,                 # 格式错：None
+        "user_facts": "not-a-list",
+        "customer_facts": None,
         "product_facts": [
-            {"product_id": "not-int", "fact": "x", "confidence": 0.9},  # cid 类型错
+            {"product_id": "not-int", "fact": "x", "confidence": 0.9},
         ],
     }
-
     writer = MemoryWriter(user_svc, AsyncMock(), AsyncMock())
+    msgs = [
+        _ai_msg_with_tool_calls({"name": "search_customers"}),
+        _tool_msg("search_customers", {"customer_id": 1}),
+    ]
     await writer.extract_and_write(
-        conversation_id="c1",
-        hub_user_id=1,
-        tool_call_logs=[_make_tool_log("search_customers",
-                                       result_json={"customer_id": 1})],
-        rounds_count=2,
-        ai_provider=ai_provider,
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=2, ai_provider=ai_provider,
     )
-    # user_facts 是 string → _safe_list 返 []，不调
     user_svc.upsert_facts.assert_not_called()
 
 
-# ─────────────────────── C3: upsert_facts select_for_update 路径测试 ───────────────────────
+# ─────────────────────── v12: messages-based extraction input ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extraction_input_contains_user_assistant_dialog():
+    """v12 关键:抽取输入必须含 HumanMessage / AIMessage 原文,而不只是 tool 调用。"""
+    user_svc = AsyncMock()
+    customer_svc = AsyncMock()
+    product_svc = AsyncMock()
+    ai_provider = AsyncMock()
+    ai_provider.parse_intent.return_value = {
+        "user_facts": [], "customer_facts": [], "product_facts": [],
+    }
+
+    msgs = [
+        HumanMessage(content="翼蓝以后都用现款付款,记一下"),
+        AIMessage(content="好的,记下了"),
+    ]
+    writer = MemoryWriter(user_svc, customer_svc, product_svc)
+    await writer.extract_and_write(
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=4,  # rounds gate 触发
+        ai_provider=ai_provider,
+    )
+
+    # parse_intent 被调,验证传给 LLM 的 text 含用户原话(对比旧实现完全抓不到)
+    sent_text = ai_provider.parse_intent.await_args.kwargs["text"]
+    assert "翼蓝以后都用现款" in sent_text
+    assert "用户:" in sent_text  # 我们加的"用户:"前缀
+
+
+@pytest.mark.asyncio
+async def test_extraction_input_includes_tool_calls_and_results():
+    """messages 含 tool_calls 和 ToolMessage 时,extraction input 都要包含。"""
+    user_svc = AsyncMock()
+    ai_provider = AsyncMock()
+    ai_provider.parse_intent.return_value = {
+        "user_facts": [], "customer_facts": [], "product_facts": [],
+    }
+    msgs = [
+        HumanMessage(content="查阿里订单"),
+        _ai_msg_with_tool_calls({"name": "search_orders", "args": {"customer_id": 10}}),
+        _tool_msg("search_orders", {"items": [], "summary": {"total_sales": 0}}),
+        AIMessage(content="阿里近期无订单"),
+    ]
+    writer = MemoryWriter(user_svc, AsyncMock(), AsyncMock())
+    await writer.extract_and_write(
+        conversation_id="c1", hub_user_id=1,
+        messages=msgs, rounds_count=4, ai_provider=ai_provider,
+    )
+    sent = ai_provider.parse_intent.await_args.kwargs["text"]
+    assert "search_orders" in sent
+    assert "customer_id" in sent
+    assert "阿里近期无订单" in sent
+
+
+# ─────────────────────── v11: customer/product 保留 kind 字段 ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_upsert_preserves_kind_for_customer_and_product_facts():
+    """v11 bug fix 仍然有效:customer/product fact 入库必须保留 kind 字段。"""
+    user_svc = AsyncMock()
+    customer_svc = AsyncMock()
+    product_svc = AsyncMock()
+    ai_provider = AsyncMock()
+    ai_provider.parse_intent.return_value = {
+        "user_facts": [],
+        "customer_facts": [
+            {"customer_id": 7, "fact": "翼蓝享 95 折", "kind": "decision", "confidence": 0.85},
+            {"customer_id": 7, "fact": "翼蓝偏现款", "kind": "reference", "confidence": 0.8},
+        ],
+        "product_facts": [
+            {"product_id": 200, "fact": "X5 春节断货 2 周", "kind": "reference", "confidence": 0.9},
+        ],
+    }
+    writer = MemoryWriter(user_svc, customer_svc, product_svc)
+    msgs = [_ai_msg_with_tool_calls({"name": "create_voucher_draft"})]
+    await writer.extract_and_write(
+        conversation_id="c-kind", hub_user_id=1,
+        messages=msgs, rounds_count=2, ai_provider=ai_provider,
+    )
+    assert customer_svc.upsert_facts.await_count == 2
+    persisted = []
+    for call in customer_svc.upsert_facts.await_args_list:
+        persisted.extend(call.kwargs["new_facts"])
+    decision = [f for f in persisted if f.get("fact") == "翼蓝享 95 折"]
+    assert decision[0]["kind"] == "decision"
+    ref = [f for f in persisted if f.get("fact") == "翼蓝偏现款"]
+    assert ref[0]["kind"] == "reference"
+    product_call = product_svc.upsert_facts.await_args_list[0]
+    assert product_call.kwargs["new_facts"][0]["kind"] == "reference"
+
+
+@pytest.mark.asyncio
+async def test_upsert_defaults_kind_to_reference_when_missing_or_invalid():
+    user_svc = AsyncMock()
+    customer_svc = AsyncMock()
+    product_svc = AsyncMock()
+    ai_provider = AsyncMock()
+    ai_provider.parse_intent.return_value = {
+        "user_facts": [],
+        "customer_facts": [
+            {"customer_id": 7, "fact": "无 kind", "confidence": 0.8},
+            {"customer_id": 7, "fact": "非法 kind", "kind": "garbage", "confidence": 0.7},
+        ],
+        "product_facts": [],
+    }
+    writer = MemoryWriter(user_svc, customer_svc, product_svc)
+    msgs = [_ai_msg_with_tool_calls({"name": "create_voucher_draft"})]
+    await writer.extract_and_write(
+        conversation_id="c-default-kind", hub_user_id=1,
+        messages=msgs, rounds_count=2, ai_provider=ai_provider,
+    )
+    persisted = []
+    for call in customer_svc.upsert_facts.await_args_list:
+        persisted.extend(call.kwargs["new_facts"])
+    assert all(f["kind"] == "reference" for f in persisted)
+
+
+# ─────────────────────── select_for_update 路径仍然有效 ───────────────────────
 
 
 @pytest.mark.asyncio
 async def test_upsert_uses_select_for_update(monkeypatch):
-    """C3: UserMemoryService.upsert_facts 在写时确实经过 in_transaction + select_for_update 路径。
-
-    用 monkeypatch 计数 select_for_update 调用，验证 lock 路径被走过。
-    """
-    from hub.agent.memory import persistent as _p
-
+    """select_for_update lock 路径被走过(防并发覆盖)。"""
     select_for_update_calls = []
 
     class _FakeQS:
         def select_for_update(self):
             select_for_update_calls.append(1)
             return self
-
         def using_db(self, conn):
             return self
-
         async def all(self):
-            return []  # 空 → 走 create 分支
+            return []
 
     class _FakeModel:
         @staticmethod
         def filter(**_kwargs):
             return _FakeQS()
-
         @staticmethod
         async def create(**kwargs):
             obj = MagicMock()
@@ -243,17 +352,22 @@ async def test_upsert_uses_select_for_update(monkeypatch):
             obj.save = AsyncMock()
             return obj
 
-    # 用假 context manager 替代 in_transaction
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def _fake_transaction(db_name):
-        yield "fake_conn"
+    async def _fake_in_transaction(_alias):
+        yield None
 
-    monkeypatch.setattr(_p, "UserMemoryModel", _FakeModel)
-    monkeypatch.setattr(_p, "in_transaction", _fake_transaction)
+    monkeypatch.setattr(
+        "hub.agent.memory.persistent.UserMemoryModel", _FakeModel,
+    )
+    monkeypatch.setattr(
+        "hub.agent.memory.persistent.in_transaction", _fake_in_transaction,
+    )
 
-    svc = _p.UserMemoryService()
-    await svc.upsert_facts(1, new_facts=[{"fact": "测试", "confidence": 0.9}])
-
-    assert len(select_for_update_calls) >= 1, "select_for_update 未被调用，C3 锁路径未走"
+    from hub.agent.memory.persistent import UserMemoryService
+    svc = UserMemoryService()
+    await svc.upsert_facts(1, new_facts=[
+        {"fact": "x", "confidence": 0.9},
+    ])
+    assert len(select_for_update_calls) >= 1
