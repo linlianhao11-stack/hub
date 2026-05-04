@@ -12,6 +12,7 @@ from hub.agent.react.tools._invoke import invoke_business_tool
 # 模块级 import — 让测试 monkeypatch 能命中 read.* 路径
 from hub.agent.react.context import tool_ctx
 from hub.agent.tools.erp_tools import current_erp_adapter
+from hub.error_codes import BizError
 from hub.models.contract import ContractDraft
 from hub.permissions import require_permissions
 from hub.observability.tool_logger import log_tool_call
@@ -217,7 +218,12 @@ async def get_recent_drafts(limit: int = 5) -> list[dict]:
     if c is None:
         raise RuntimeError("tool_ctx 未 set")
 
-    await require_permissions(c["hub_user_id"], ["usecase.query_recent_drafts.use"])
+    # BizError 必须转 dict（不能 raise,详见 _invoke.py "关键设计"注释）
+    try:
+        await require_permissions(c["hub_user_id"], ["usecase.query_recent_drafts.use"])
+    except BizError as e:
+        # 本 tool 返 list[dict],error 也包成单元素 list 让 LLM 看到
+        return [{"error": f"权限不足: {e}"}]
 
     async with log_tool_call(
         conversation_id=c["conversation_id"],

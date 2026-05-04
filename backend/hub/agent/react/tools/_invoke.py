@@ -2,9 +2,18 @@
 
 ReAct @tool 函数都通过本 helper 调 erp_tools / analyze_tools / generate_tools /
 draft_tools 真业务函数。统一做：
-  1. require_permissions(perm) — 权限 fail-closed（无权限直接抛 `BizError(BizErrorCode.PERM_NO_*)`，dingtalk_inbound 已有 `except BizError → 翻译中文给用户`）
+  1. require_permissions(perm) — 权限 fail-closed（无权限抛 BizError → 本 helper 捕获,
+     转中文 error dict 返给 LLM,LLM 自然语言告诉用户"权限不足: ..."）
   2. log_tool_call — 写 tool_call_log（admin 决策链审计）
   3. 注入 ctx kwargs — acting_as_user_id 来自 ContextVar tool_ctx
+
+⚠️ **关键设计**：BizError 必须由 wrapper 捕获,转 error dict。
+原因：ReAct LangGraph ToolNode 默认 `handle_tool_errors=True`,会把任何 raise 出 @tool
+的异常吃掉,生成英文 ToolMessage `"Error: BizError(...) Please fix your mistakes."`。
+这样 dingtalk_inbound 层的 `except BizError → 中文翻译` 路径**永远走不到** —
+LLM 看到英文 ToolMessage 会胡乱回 / retry / 假装权限够,而不是中文友好告知用户。
+fix：本 helper 主动捕获 BizError 转 dict,LLM 看到 {"error": "权限不足: ..."} 自然
+转给用户。
 
 不通过 ToolRegistry.call 是因为：
   - ReAct write tool 的 confirm 流程跟 ToolRegistry 内置的两步协议不兼容
@@ -14,6 +23,7 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from hub.agent.react.context import tool_ctx
+from hub.error_codes import BizError
 from hub.observability.tool_logger import log_tool_call
 from hub.permissions import require_permissions
 
@@ -38,14 +48,17 @@ async def invoke_business_tool(
             conversation_id / confirmation_action_id）。read 类一般为 None。
 
     Returns:
-        fn 的返值。
+        fn 的返值;权限/业务异常时返 {"error": "..."} dict。
     """
     c = tool_ctx.get()
     if c is None:
         raise RuntimeError("tool_ctx 未 set — react agent 入口必须先 set 才能调 tool")
 
-    # 1. 权限 fail-closed
-    await require_permissions(c["hub_user_id"], [perm])
+    # 1. 权限 fail-closed — BizError 必须捕获转 dict（详见模块 docstring "关键设计"）
+    try:
+        await require_permissions(c["hub_user_id"], [perm])
+    except BizError as e:
+        return {"error": f"权限不足: {e}"}
 
     # 2. 审计 log + 调 fn
     async with log_tool_call(
@@ -61,6 +74,10 @@ async def invoke_business_tool(
         }
         if extra_ctx_kwargs:
             kwargs.update(extra_ctx_kwargs)
-        result = await fn(**kwargs)
+        try:
+            result = await fn(**kwargs)
+        except BizError as e:
+            # 业务级 BizError（如 ERP 拒访问） — 同样转 dict 让 LLM 友好返
+            result = {"error": str(e)}
         log_ctx.set_result(result)
         return result

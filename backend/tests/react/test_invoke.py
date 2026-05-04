@@ -24,11 +24,13 @@ async def test_invoke_business_tool_runs_perm_check_and_calls_fn(fake_ctx):
 
 
 @pytest.mark.asyncio
-async def test_invoke_business_tool_perm_denied_raises(fake_ctx):
-    """权限校验 fail → require_permissions 抛 BizError → invoke 透传抛（fail-closed）。
+async def test_invoke_business_tool_perm_denied_returns_error_dict(fake_ctx):
+    """权限校验 fail → require_permissions 抛 BizError → invoke **必须捕获转 error dict**。
 
-    注：hub 的 `require_permissions` 抛 `BizError(BizErrorCode.PERM_NO_*)`，**没有**单独的
-    PermissionDenied class（hub.permissions:36 实际抛的是 BizError）。
+    跟原始设计（透传 BizError）不同：LangGraph ToolNode 默认 handle_tool_errors=True
+    会吃掉 raise 出 @tool 的异常,生成英文 ToolMessage "Please fix your mistakes",
+    LLM 看到英文不知道是权限问题,胡乱回 / retry / 假装成功。
+    所以 _invoke 必须主动捕获 BizError 转中文 error dict 让 LLM 自然语言告知用户。
     """
     from hub.error_codes import BizError, BizErrorCode
 
@@ -37,11 +39,18 @@ async def test_invoke_business_tool_perm_denied_raises(fake_ctx):
         "hub.agent.react.tools._invoke.require_permissions",
         new=AsyncMock(side_effect=BizError(BizErrorCode.PERM_NO_PRODUCT_QUERY)),
     ):
-        with pytest.raises(BizError):
-            await invoke_business_tool(
-                tool_name="search_customers", perm="usecase.x.use",
-                args={"query": "x"}, fn=fake_fn,
-            )
+        result = await invoke_business_tool(
+            tool_name="search_customers", perm="usecase.x.use",
+            args={"query": "x"}, fn=fake_fn,
+        )
+
+    # 关键断言：返 error dict 不抛
+    assert isinstance(result, dict) and "error" in result, (
+        f"BizError 必须转 error dict,实际 {result!r}"
+    )
+    assert "权限不足" in result["error"], (
+        f"中文 error 必须含'权限不足',实际 {result['error']!r}"
+    )
     fake_fn.assert_not_awaited()  # 权限挂掉不应该调 fn
 
 

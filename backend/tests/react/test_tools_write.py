@@ -247,3 +247,36 @@ async def test_voucher_cross_context_idempotency_returns_friendly_error(fake_ctx
     )
     assert "status" not in result  # 不能误返 pending_confirmation
 
+
+
+@pytest.mark.asyncio
+async def test_voucher_perm_denied_returns_error_dict(fake_ctx, monkeypatch):
+    """write tool 权限校验 fail → 必须返中文 error dict（不能 raise BizError）。
+
+    背景：LangGraph ToolNode 默认 handle_tool_errors=True 会吃掉 raise 出 @tool 的异常,
+    生成英文 ToolMessage,LLM 看到不知道是权限问题。修：write.py:_check_perm 主动捕获
+    BizError 转 dict,让 LLM 看到 {"error": "权限不足: ..."} 自然语言告诉用户。
+    """
+    from hub.agent.react.tools.write import create_voucher_draft
+    from hub.error_codes import BizError, BizErrorCode
+
+    monkeypatch.setattr(
+        "hub.agent.react.tools.write.require_permissions",
+        AsyncMock(side_effect=BizError(BizErrorCode.PERM_NO_PRODUCT_QUERY)),
+    )
+
+    result = await create_voucher_draft.ainvoke({
+        "voucher_data": {"entries": [], "total_amount": 1000, "summary": "test"},
+        "rule_matched": "sales_template",
+    })
+
+    # 关键断言：返 error dict 不抛
+    assert isinstance(result, dict) and "error" in result, (
+        f"BizError 必须转 error dict,实际 {result!r}"
+    )
+    err_text = result["error"]
+    assert "权限不足" in err_text, (
+        f"中文 error 应明确包含权限不足提示,实际 {err_text!r}"
+    )
+    # 不能误返 pending_confirmation
+    assert result.get("status") != "pending_confirmation"

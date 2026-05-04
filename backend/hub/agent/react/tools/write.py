@@ -24,8 +24,22 @@ from langchain_core.tools import tool
 from hub.agent.react.context import tool_ctx
 from hub.agent.react.tools._confirm_helper import create_pending_action
 from hub.agent.tools.confirm_gate import CrossContextIdempotency
+from hub.error_codes import BizError
 from hub.observability.tool_logger import log_tool_call
 from hub.permissions import require_permissions
+
+
+async def _check_perm(hub_user_id: int, perm: str) -> dict | None:
+    """权限校验 wrapper —— 命中返 None,不命中返中文 error dict 给 LLM。
+
+    跟 invoke_business_tool 保持一致：BizError 必须转 dict 不能 raise,否则 LangGraph
+    ToolNode handle_tool_errors 会吃异常,LLM 看到英文 "Please fix your mistakes"。
+    """
+    try:
+        await require_permissions(hub_user_id, [perm])
+        return None
+    except BizError as e:
+        return {"error": f"权限不足: {e}"}
 
 
 async def _resolve_default_template_id() -> int | None:
@@ -123,7 +137,8 @@ async def create_contract_draft(
     if c is None:
         return {"error": "tool_ctx 未 set"}
 
-    await require_permissions(c["hub_user_id"], ["usecase.generate_contract.use"])
+    if (err := await _check_perm(c["hub_user_id"], "usecase.generate_contract.use")):
+        return err
 
     react_args = {
         "customer_id": customer_id,
@@ -165,6 +180,9 @@ async def create_contract_draft(
         )
         pending = await create_pending_action(
             subgraph="contract", summary=summary, payload=payload,
+            use_idempotency=True,  # 同 args 重发复用同一 PendingAction,防 LLM 误调
+                                    # create_contract_draft 而不是 confirm_action 时
+                                    # 创建多条 stale pending
         )
         return {
             "status": "pending_confirmation",
@@ -193,7 +211,8 @@ async def create_quote_draft(
     c = tool_ctx.get()
     if c is None:
         return {"error": "tool_ctx 未 set"}
-    await require_permissions(c["hub_user_id"], ["usecase.generate_quote.use"])
+    if (err := await _check_perm(c["hub_user_id"], "usecase.generate_quote.use")):
+        return err
 
     react_args = {
         "customer_id": customer_id,
@@ -231,6 +250,7 @@ async def create_quote_draft(
         )
         pending = await create_pending_action(
             subgraph="quote", summary=summary, payload=payload,
+            use_idempotency=True,  # 同 args 重发复用同一 PendingAction（同 contract 理由）
         )
         return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
 
@@ -260,7 +280,8 @@ async def create_voucher_draft(
     c = tool_ctx.get()
     if c is None:
         return {"error": "tool_ctx 未 set"}
-    await require_permissions(c["hub_user_id"], ["usecase.create_voucher.use"])
+    if (err := await _check_perm(c["hub_user_id"], "usecase.create_voucher.use")):
+        return err
 
     react_args = {"voucher_data": voucher_data, "rule_matched": rule_matched}
 
@@ -299,7 +320,8 @@ async def request_price_adjustment(
     c = tool_ctx.get()
     if c is None:
         return {"error": "tool_ctx 未 set"}
-    await require_permissions(c["hub_user_id"], ["usecase.adjust_price.use"])
+    if (err := await _check_perm(c["hub_user_id"], "usecase.adjust_price.use")):
+        return err
 
     react_args = {
         "customer_id": customer_id, "product_id": product_id,
@@ -351,7 +373,8 @@ async def request_stock_adjustment(
     c = tool_ctx.get()
     if c is None:
         return {"error": "tool_ctx 未 set"}
-    await require_permissions(c["hub_user_id"], ["usecase.adjust_stock.use"])
+    if (err := await _check_perm(c["hub_user_id"], "usecase.adjust_stock.use")):
+        return err
 
     react_args = {
         "product_id": product_id, "adjustment_qty": adjustment_qty,

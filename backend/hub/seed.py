@@ -194,6 +194,8 @@ ROLES["bot_user_sales_lead"] = {
         "usecase.export.use",
         "usecase.adjust_price.use",
         "usecase.adjust_price.approve",  # 主管才有的审批权
+        # Plan 6 v10 Task 2.4 新加权限,sales_lead 必须包含 sales 全集（test_seed_plan6 invariant）
+        "usecase.query_recent_drafts.use",
     ],
 }
 

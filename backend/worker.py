@@ -117,9 +117,10 @@ async def main():
     # 取代默认 in-process MemorySaver（重启即丢上下文，钉钉对话"前面说的事 bot 忘了"）。
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
     from psycopg_pool import AsyncConnectionPool
-    import os
 
-    pg_url = os.environ.get("HUB_DATABASE_URL", "")
+    # 用 Pydantic settings 而非 os.environ —— `.env` 文件加载场景下后者可能拿不到值,
+    # AsyncConnectionPool("") 启动会炸。settings.database_url 在 init_db 已校验过非空。
+    pg_url = settings.database_url
     if pg_url.startswith("postgres://"):  # psycopg 要求 postgresql://
         pg_url = "postgresql://" + pg_url[len("postgres://"):]
     _checkpoint_pool = AsyncConnectionPool(
