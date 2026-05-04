@@ -40,6 +40,71 @@ _VALID_TYPES = {"sales", "purchase", "framework", "quote", "other"}
 _MAX_FILE_SIZE = 5 * 1024 * 1024
 
 
+# 默认占位符中文显示名映射 — 上传时自动填,admin 后台可改。
+# 设计原则：用户在钉钉 / admin UI 看到的是中文标签（"客户名"）,docx 模板里写的还是英文 code。
+# 漏在字典里的 code → label 默认 = code 本身,admin 自己给中文名。
+_DEFAULT_LABELS: dict[str, str] = {
+    # 客户类
+    "customer_id": "客户 ID",
+    "customer_name": "客户名",
+    "customer_address": "客户地址",
+    "customer_phone": "客户电话",
+    "customer_tax_id": "客户税号",
+    # 收货 / 联系人
+    "shipping_address": "收货地址",
+    "shipping_contact": "联系人",
+    "shipping_phone": "联系电话",
+    # 商品 / 金额
+    "items": "商品明细",
+    "products": "商品明细",
+    "total_amount": "总金额",
+    "total": "总金额",
+    "subtotal": "小计",
+    "tax_rate": "税率",
+    "tax_amount": "税额",
+    # 合同元信息
+    "contract_no": "合同号",
+    "contract_number": "合同号",
+    "contract_date": "签订日期",
+    "sign_date": "签订日期",
+    "effective_date": "生效日期",
+    "payment_terms": "付款方式",
+    "payment_method": "付款方式",
+    # 销售方（卖方）
+    "seller_name": "卖方名称",
+    "seller_address": "卖方地址",
+    "seller_phone": "卖方电话",
+    "seller_tax_id": "卖方税号",
+    # 报价单
+    "quote_no": "报价单号",
+    "quote_date": "报价日期",
+    "valid_until": "有效期至",
+    # 备注
+    "remarks": "备注",
+    "notes": "备注",
+}
+
+
+def _label_for(name: str) -> str:
+    """name → 中文显示名。优先字典命中,否则原样返（admin 在 UI 改成中文）。"""
+    return _DEFAULT_LABELS.get(name, name)
+
+
+def _enrich_placeholders(placeholders: list[dict] | None) -> list[dict]:
+    """老模板 placeholders 字段没 label 字段(v1 版本上传的) → 懒填默认 label。
+    新模板 upload 时已经写好 label,这里幂等通过。
+    """
+    out = []
+    for ph in placeholders or []:
+        if not isinstance(ph, dict):
+            continue
+        item = dict(ph)  # 不 mutate 原 dict
+        if not item.get("label"):
+            item["label"] = _label_for(item.get("name", ""))
+        out.append(item)
+    return out
+
+
 class ContractTemplateRow(BaseModel):
     id: int
     name: str
@@ -67,7 +132,12 @@ def _scan_cell(cell, found: dict, pattern) -> None:
         for m in pattern.finditer(para.text):
             name = m.group(1)
             if name not in found:
-                found[name] = {"name": name, "type": "string", "required": True}
+                found[name] = {
+                    "name": name,
+                    "label": _label_for(name),
+                    "type": "string",
+                    "required": True,
+                }
     for nested_table in cell.tables:
         for row in nested_table.rows:
             for nested_cell in row.cells:
@@ -98,7 +168,12 @@ def _extract_placeholders(docx_bytes: bytes) -> list[dict]:
         for m in pattern.finditer(para.text):
             name = m.group(1)
             if name not in found:
-                found[name] = {"name": name, "type": "string", "required": True}
+                found[name] = {
+                    "name": name,
+                    "label": _label_for(name),  # 中文显示名（admin 可改）
+                    "type": "string",
+                    "required": True,
+                }
 
     # 表格内段落（含嵌套表格，递归）
     for table in doc.tables:
@@ -228,7 +303,7 @@ async def list_templates(
                 name=r.name,
                 template_type=r.template_type,
                 description=r.description,
-                placeholders=r.placeholders or [],
+                placeholders=_enrich_placeholders(r.placeholders),
                 is_active=r.is_active,
                 created_by_hub_user_id=r.created_by_hub_user_id,
                 created_at=r.created_at.isoformat(),
@@ -259,7 +334,80 @@ async def get_placeholders(template_id: int):
     template = await ContractTemplate.filter(id=template_id).first()
     if not template:
         raise HTTPException(status_code=404, detail=f"模板 {template_id} 不存在")
-    return {"placeholders": template.placeholders or []}
+    # _enrich_placeholders 处理 v1 老模板 placeholders 字段缺 label 字段的情况,
+    # 用 _DEFAULT_LABELS 字典懒填中文显示名（admin 之后可改）。
+    return {"placeholders": _enrich_placeholders(template.placeholders)}
+
+
+@router.put(
+    "/{template_id}/placeholders",
+    dependencies=[Depends(require_hub_perm(_PERM_WRITE))],
+    summary="保存占位符 label / type / required（admin 编辑后调）",
+)
+async def update_placeholders(
+    request: Request,
+    template_id: int,
+    body: dict = None,  # noqa: B008  — pydantic 严格 schema 见下面校验
+):
+    """保存 admin 编辑后的占位符列表。
+
+    Body schema: `{"placeholders": [{"name": str, "label": str, "type": str, "required": bool}, ...]}`
+
+    安全校验:
+    - 不允许新增/删除占位符（占位符列表由 docx 解析得出,只能改 metadata）
+    - 只允许改 label / type / required;name 不可改（动 name 等于改 docx 里的 {{xxx}},不一致）
+    - 必须给齐 placeholders 列表（保留原 set 即可,不允许漏报）
+    """
+    template = await ContractTemplate.filter(id=template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail=f"模板 {template_id} 不存在")
+
+    incoming = (body or {}).get("placeholders")
+    if not isinstance(incoming, list):
+        raise HTTPException(status_code=400, detail="placeholders 必须是列表")
+
+    existing = _enrich_placeholders(template.placeholders)
+    existing_names = {p["name"] for p in existing}
+    incoming_names = {p.get("name") for p in incoming if isinstance(p, dict)}
+    if existing_names != incoming_names:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"占位符 name 集合必须跟模板原始解析结果一致。"
+                f"缺失: {sorted(existing_names - incoming_names)};"
+                f"多余: {sorted(incoming_names - existing_names)}"
+            ),
+        )
+
+    # 校验后规范化（防 admin 漏 / 乱传字段）
+    valid_types = {"string", "number", "date", "money", "phone"}
+    cleaned = []
+    for p in incoming:
+        name = p.get("name") or ""
+        label = (p.get("label") or "").strip() or _label_for(name)
+        ptype = p.get("type") or "string"
+        if ptype not in valid_types:
+            ptype = "string"
+        required = bool(p.get("required", True))
+        cleaned.append({
+            "name": name,
+            "label": label,
+            "type": ptype,
+            "required": required,
+        })
+
+    template.placeholders = cleaned
+    await template.save()
+
+    actor = request.state.hub_user
+    await AuditLog.create(
+        who_hub_user_id=actor.id,
+        action="update_template_placeholders",
+        target_type="contract_template",
+        target_id=str(template_id),
+        detail={"count": len(cleaned)},
+    )
+    return {"success": True, "placeholders": cleaned}
 
 
 @router.get(

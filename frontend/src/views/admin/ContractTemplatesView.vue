@@ -152,25 +152,53 @@
       </template>
     </AppModal>
 
-    <!-- 占位符查看弹窗 -->
+    <!-- 占位符编辑弹窗（admin 给每个 {{xxx}} 起中文显示名）-->
     <AppModal
       :visible="showPlaceholdersModal"
-      :title="`「${currentTpl?.name || ''}」占位符列表`"
-      size="sm"
+      :title="`「${currentTpl?.name || ''}」占位符设置`"
+      size="lg"
       @update:visible="(v) => { if (!v) showPlaceholdersModal = false }"
     >
-      <div v-if="!currentPlaceholders.length" class="text-muted text-sm">该模板未识别到占位符</div>
-      <ul v-else class="placeholder-list">
-        <li v-for="ph in currentPlaceholders" :key="ph.name" class="placeholder-item">
-          <code class="placeholder-code">{{ phLabel(ph.name) }}</code>
-          <span class="placeholder-meta">
-            <span class="ph-type">{{ ph.type }}</span>
-            <span v-if="ph.required" class="ph-required">必填</span>
-          </span>
-        </li>
-      </ul>
+      <div v-if="!editPlaceholders.length" class="text-muted text-sm">该模板未识别到占位符</div>
+      <div v-else>
+        <p class="form-hint" style="margin-bottom: 12px;">
+          给每个占位符起一个中文显示名 — 用户在钉钉 / 预览页看到的是中文名,合同 docx 里仍然写 {{xxx}}。漏起名的会回退用代码。
+        </p>
+        <table class="ph-edit-table">
+          <thead>
+            <tr>
+              <th>代码</th>
+              <th>中文显示名</th>
+              <th>类型</th>
+              <th>必填</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(ph, idx) in editPlaceholders" :key="ph.name">
+              <td><code class="placeholder-code">{{ phLabel(ph.name) }}</code></td>
+              <td>
+                <AppInput v-model="editPlaceholders[idx].label" size="sm" placeholder="如：客户名" />
+              </td>
+              <td>
+                <AppSelect v-model="editPlaceholders[idx].type" size="sm" :options="phTypeOptions" />
+              </td>
+              <td style="text-align: center;">
+                <input type="checkbox" v-model="editPlaceholders[idx].required" />
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="phEditError" class="form-error" style="margin-top: 8px;">{{ phEditError }}</div>
+      </div>
       <template #footer>
-        <AppButton variant="secondary" size="sm" @click="showPlaceholdersModal = false">关闭</AppButton>
+        <AppButton variant="secondary" size="sm" @click="showPlaceholdersModal = false">取消</AppButton>
+        <AppButton
+          v-if="editPlaceholders.length"
+          variant="primary"
+          size="sm"
+          :loading="phSaving"
+          @click="handleSavePlaceholders"
+        >保存</AppButton>
       </template>
     </AppModal>
 
@@ -264,6 +292,17 @@ const uploadForm = ref({ name: '', template_type: 'sales', description: '', file
 const showPlaceholdersModal = ref(false)
 const currentTpl = ref(null)
 const currentPlaceholders = ref([])
+// 占位符编辑（深拷贝 currentPlaceholders 给 admin 改 label / type / required）
+const editPlaceholders = ref([])
+const phSaving = ref(false)
+const phEditError = ref('')
+const phTypeOptions = [
+  { value: 'string', label: '文本' },
+  { value: 'number', label: '数字' },
+  { value: 'date', label: '日期' },
+  { value: 'money', label: '金额' },
+  { value: 'phone', label: '电话' },
+]
 
 // docx 可视化预览弹窗（mammoth.js 转 HTML）
 const showPreviewModal = ref(false)
@@ -389,22 +428,55 @@ async function handleUpload() {
 function openPlaceholders(tpl) {
   currentTpl.value = tpl
   currentPlaceholders.value = tpl.placeholders || []
+  // 深拷贝 — 编辑时不脏 list 数据,取消时直接关 modal 即可
+  editPlaceholders.value = (tpl.placeholders || []).map((p) => ({
+    name: p.name,
+    label: p.label || p.name,  // 后端 _enrich_placeholders 应该已经填了,这里兜底
+    type: p.type || 'string',
+    required: p.required !== false,
+  }))
+  phEditError.value = ''
   showPlaceholdersModal.value = true
+}
+
+async function handleSavePlaceholders() {
+  if (!currentTpl.value) return
+  phEditError.value = ''
+  phSaving.value = true
+  try {
+    const res = await contractTemplatesApi.updatePlaceholders(
+      currentTpl.value.id,
+      editPlaceholders.value,
+    )
+    // 同步 currentPlaceholders + 列表里这条记录的 placeholders
+    const updated = res.data?.placeholders || editPlaceholders.value
+    currentPlaceholders.value = updated
+    const idx = items.value.findIndex((it) => it.id === currentTpl.value.id)
+    if (idx >= 0) items.value[idx].placeholders = updated
+    showPlaceholdersModal.value = false
+  } catch (e) {
+    phEditError.value = pickErrorDetail(e, '保存失败')
+  } finally {
+    phSaving.value = false
+  }
 }
 
 // ──────────────────────────────────────────────
 // docx 可视化预览（mammoth.js 转 HTML，占位符高亮）
 // ──────────────────────────────────────────────
 
-/** 把渲染后的 HTML 中所有 `{{xxx}}` 文本节点替换为高亮 span（保留位置上下文）。 */
-function _highlightPlaceholders(html) {
-  // ｛/｝ 是中文全角 {} ;有些 docx 可能误打成全角,这里也兼容。
-  // 用非贪婪匹配防同段多个占位符被吞。\w+ + re.UNICODE 等价 — JS 默认 \w 不含中文,
-  // 用 [\w一-龥]+ 兼容中文占位符（跟后端 _extract_placeholders 对齐）。
+/** 把渲染后的 HTML 中所有 `{{xxx}}` 文本节点替换为高亮 span。
+ *  span 显示**中文 label**（admin 起的中文显示名）,鼠标 hover 在 title 里显示原代码。
+ *  `labels` 是 `{name → label}` 查表,缺则回退到代码 `{{name}}`。
+ */
+function _highlightPlaceholders(html, labels = {}) {
   return html.replace(
     /\{\{([\w一-龥]+)\}\}/g,
-    (match, name) =>
-      `<span class="ph-highlight" data-name="${name}" title="占位符: ${name}">${match}</span>`,
+    (match, name) => {
+      const label = labels[name] || name  // 没 label 用 name
+      // 显示中文 label（不带 {{ }}）;hover 显示代码,方便 admin 核对
+      return `<span class="ph-highlight" data-name="${name}" title="占位符代码: ${match}">${label}</span>`
+    },
   )
 }
 
@@ -422,7 +494,12 @@ async function openPreview(tpl) {
     // 懒加载 mammoth（避免初始 bundle 加 ~200KB）
     const mammoth = (await import('mammoth')).default || (await import('mammoth'))
     const result = await mammoth.convertToHtml({ arrayBuffer })
-    previewHtml.value = _highlightPlaceholders(result.value || '')
+    // 构造 name→label 查表,占位符高亮显示中文 label 而不是代码
+    const labels = {}
+    for (const ph of currentPlaceholders.value) {
+      if (ph.name) labels[ph.name] = ph.label || ph.name
+    }
+    previewHtml.value = _highlightPlaceholders(result.value || '', labels)
     if (result.messages?.length) {
       console.warn('mammoth 转换警告:', result.messages)
     }
@@ -569,6 +646,28 @@ onMounted(load)
   border-radius: 3px;
   font-weight: 500;
 }
+
+/* 占位符编辑表格 */
+.ph-edit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ph-edit-table th {
+  background: var(--bg-secondary, #f7f7f8);
+  text-align: left;
+  padding: 8px 10px;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.ph-edit-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #f0f0f0);
+  vertical-align: middle;
+}
+.ph-edit-table tr:last-child td { border-bottom: none; }
 
 /* docx 可视化预览 */
 .preview-toolbar {

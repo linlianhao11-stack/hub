@@ -29,9 +29,14 @@ export const contractTemplatesApi = {
     })
   },
 
-  /** 获取模板已解析的占位符列表。 */
+  /** 获取模板已解析的占位符列表（含 label 中文显示名）。 */
   getPlaceholders(id) {
     return api.get(`/admin/contract-templates/${id}/placeholders`)
+  },
+
+  /** 保存编辑后的占位符 label / type / required 列表。 */
+  updatePlaceholders(id, placeholders) {
+    return api.put(`/admin/contract-templates/${id}/placeholders`, { placeholders })
   },
 
   /** 更新模板元信息（name / template_type / description，不重传文件）。 */
