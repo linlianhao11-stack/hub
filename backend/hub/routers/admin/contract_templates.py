@@ -262,6 +262,38 @@ async def get_placeholders(template_id: int):
     return {"placeholders": template.placeholders or []}
 
 
+@router.get(
+    "/{template_id}/file",
+    dependencies=[Depends(require_hub_perm(_PERM_READ))],
+    summary="下载模板 docx 原文件",
+)
+async def get_template_file(template_id: int):
+    """返回 docx 原文件字节流,前端用 mammoth.js 转 HTML 做可视化预览。
+
+    file_storage_key 当前是 base64 编码的 docx,decode 后用 StreamingResponse
+    返。前端 fetch 这个 endpoint 拿 ArrayBuffer → mammoth.convertToHtml() → 渲染。
+    """
+    from fastapi.responses import Response
+
+    template = await ContractTemplate.filter(id=template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail=f"模板 {template_id} 不存在")
+    if not template.file_storage_key:
+        raise HTTPException(status_code=404, detail="模板文件内容为空")
+    try:
+        content = base64.b64decode(template.file_storage_key)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"模板文件 base64 解码失败：{exc}") from exc
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            # 用 Content-Disposition 给文件名,但 inline 而非 attachment（前端 fetch 不下载）
+            "Content-Disposition": f'inline; filename="template-{template_id}.docx"',
+        },
+    )
+
+
 @router.put(
     "/{template_id}",
     dependencies=[Depends(require_hub_perm(_PERM_WRITE))],

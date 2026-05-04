@@ -48,4 +48,9 @@ export const contractTemplatesApi = {
   enable(id) {
     return api.post(`/admin/contract-templates/${id}/enable`)
   },
+
+  /** 拿模板 docx 原文件 ArrayBuffer（前端用 mammoth.js 转 HTML 预览）。 */
+  getFile(id) {
+    return api.get(`/admin/contract-templates/${id}/file`, { responseType: 'arraybuffer' })
+  },
 }
