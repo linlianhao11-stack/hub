@@ -1,3 +1,4 @@
+from __future__ import annotations
 """ReAct agent system prompt。
 
 设计原则：

@@ -66,6 +66,20 @@
         <AppButton variant="primary" size="sm" :loading="saving" @click="onEdit">保存</AppButton>
       </template>
     </AppModal>
+
+    <!-- M15: 停用二次确认 modal（替换 confirm()） -->
+    <AppModal
+      :visible="showConfirmModal"
+      title="确认操作"
+      size="sm"
+      @update:visible="(v) => { if (!v) showConfirmModal = false }"
+    >
+      <p>{{ confirmMessage }}</p>
+      <template #footer>
+        <AppButton variant="ghost" size="sm" @click="showConfirmModal = false">取消</AppButton>
+        <AppButton variant="danger" size="sm" @click="confirmAction?.()">确认停用</AppButton>
+      </template>
+    </AppModal>
   </div>
 </template>
 
@@ -92,6 +106,9 @@ const showCreate = ref(false)
 const editing = ref(null)
 const saving = ref(false)
 const modalError = ref('')
+const showConfirmModal = ref(false)
+const confirmAction = ref(null)
+const confirmMessage = ref('')
 
 const channelOptions = [
   { value: 'dingtalk', label: '钉钉' },
@@ -170,14 +187,19 @@ async function onEdit() {
 }
 
 async function onDisable(c) {
-  if (!confirm(`确认停用「${c.name}」吗？`)) return
-  try {
-    await disableChannel(c.id)
-    appStore.showToast('已停用')
-    load()
-  } catch (e) {
-    appStore.showToast(pickErrorDetail(e, '停用失败'), 'error')
+  confirmMessage.value = `确认停用「${c.name}」吗？停用后相关功能将不可用。`
+  confirmAction.value = async () => {
+    try {
+      await disableChannel(c.id)
+      appStore.showToast('已停用')
+      showConfirmModal.value = false
+      load()
+    } catch (e) {
+      showConfirmModal.value = false
+      appStore.showToast(pickErrorDetail(e, '停用失败'), 'error')
+    }
   }
+  showConfirmModal.value = true
 }
 
 onMounted(load)

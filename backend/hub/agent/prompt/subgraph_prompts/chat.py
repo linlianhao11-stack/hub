@@ -1,3 +1,4 @@
+from __future__ import annotations
 # backend/hub/agent/prompt/subgraph_prompts/chat.py
 """Chat 子图 system prompt — 完全静态。spec §1.1 KV cache。"""
 CHAT_SYSTEM_PROMPT = """你是一个 ERP 业务助手，名字叫"小邦"。当前是闲聊场景：

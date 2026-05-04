@@ -1,3 +1,4 @@
+from __future__ import annotations
 # hub/agent/tools/entity_extractor.py
 # I1: EntityRefs 已移到 hub.agent.memory.types，这里重新导出保持兼容。
 from hub.agent.memory.types import EntityRefs  # noqa: F401 — 重新导出

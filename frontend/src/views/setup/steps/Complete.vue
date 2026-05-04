@@ -17,7 +17,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { setupComplete } from '../../../api/setup'
 import { pickErrorDetail } from '../../../api'
@@ -29,6 +29,15 @@ const router = useRouter()
 const submitting = ref(false)
 const error = ref('')
 const success = ref(false)
+// M16 修：timer 引用提到 setup 顶层;onBeforeUnmount 必须同步注册,
+// 不能放 async function 内（Vue 3 lifecycle hooks 必须在 setup 阶段同步调）。
+const redirectTimer = ref(null)
+onBeforeUnmount(() => {
+  if (redirectTimer.value) {
+    clearTimeout(redirectTimer.value)
+    redirectTimer.value = null
+  }
+})
 
 async function onSubmit() {
   error.value = ''
@@ -37,7 +46,7 @@ async function onSubmit() {
     await setupComplete(props.session)
     success.value = true
     sessionStorage.removeItem('hub_setup_session')
-    setTimeout(() => router.replace('/login'), 2000)
+    redirectTimer.value = setTimeout(() => router.replace('/login'), 2000)
   } catch (e) {
     error.value = pickErrorDetail(e, '完成初始化失败')
   } finally {

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # backend/hub/agent/prompt/subgraph_prompts/query.py
 """Query 子图 system prompt — 完全静态。
 

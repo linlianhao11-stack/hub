@@ -220,7 +220,7 @@
       <div
         v-else-if="previewHtml"
         class="preview-content"
-        v-html="previewHtml"
+        v-html="sanitizedPreviewHtml"
       ></div>
       <div v-else class="preview-empty">没有内容</div>
       <template #footer>
@@ -259,7 +259,8 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import DOMPurify from 'dompurify'
 import { Plus } from 'lucide-vue-next'
 import { contractTemplatesApi } from '../../api/contract_templates'
 import { pickErrorDetail } from '../../api'
@@ -309,6 +310,16 @@ const showPreviewModal = ref(false)
 const previewLoading = ref(false)
 const previewError = ref('')
 const previewHtml = ref('')
+
+// DOMPurify 过滤 mammoth 输出，防止恶意 docx 注入 HTML/JS。
+// title/data-name 必须保留 — 占位符高亮 span 需要 title 显示原代码,data-name 给 JS 反查。
+const sanitizedPreviewHtml = computed(() => {
+  if (!previewHtml.value) return ''
+  return DOMPurify.sanitize(previewHtml.value, {
+    ALLOWED_TAGS: ['p', 'br', 'b', 'i', 'u', 'strong', 'em', 'span', 'table', 'tr', 'td', 'th', 'thead', 'tbody', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'a', 'div', 'mark'],
+    ALLOWED_ATTR: ['class', 'style', 'href', 'target', 'title', 'data-name'],
+  })
+})
 
 // 编辑弹窗
 const showEditModal = ref(false)

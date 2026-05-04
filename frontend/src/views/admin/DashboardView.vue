@@ -91,11 +91,19 @@
 
 <script setup>
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { Chart, registerables } from 'chart.js'
-import { getDashboard } from '../../api/dashboard'
-import { pickErrorDetail } from '../../api'
+import {
+  Chart,
+  LineController,
+  LineElement,
+  PointElement,
+  LinearScale,
+  CategoryScale,
+  Filler,
+  Legend,
+  Tooltip,
+} from 'chart.js'
 
-Chart.register(...registerables)
+Chart.register(LineController, LineElement, PointElement, LinearScale, CategoryScale, Filler, Legend, Tooltip)
 
 const error = ref('')
 const data = ref({ health: {}, today: {}, hourly: [], llm_cost: null })

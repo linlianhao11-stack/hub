@@ -1,3 +1,4 @@
+from __future__ import annotations
 # hub/agent/tools/types.py
 from collections.abc import Callable
 from dataclasses import dataclass

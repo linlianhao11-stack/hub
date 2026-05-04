@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 
@@ -34,6 +35,11 @@ from hub.observability.task_logger import log_inbound_task
 from hub.ports import ParsedIntent
 
 logger = logging.getLogger("hub.handler.dingtalk_inbound")
+
+# ContextVar 替代 monkey-patch：并发 handler 各自持有自己的 wrapper，不会互相污染
+_current_response_wrapper: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "_current_response_wrapper", default=None,
+)
 
 
 RE_BIND = re.compile(r"^/?绑定\s+(\S+)\s*$")
@@ -77,8 +83,6 @@ async def handle_inbound(
         conversation_id=conversation_id,
         live_publisher=live_publisher,
     ) as record:
-        # 包装 sender.send_text 抓取回复内容到 record["response"]，
-        # finally 必须还原（worker 持续运行，sender 是共享实例，避免下次任务串包装）
         original_send_text = sender.send_text
 
         async def _wrapped_send_text(*, dingtalk_userid, text, **kwargs):
@@ -87,162 +91,156 @@ async def handle_inbound(
                 dingtalk_userid=dingtalk_userid, text=text, **kwargs,
             )
 
-        sender.send_text = _wrapped_send_text
-        try:
-            # ====== 第一层：Rule 命令路由（不需要 IdentityService）======
-            m_bind = RE_BIND.match(content)
-            if m_bind:
-                result = await binding_service.initiate_binding(
-                    dingtalk_userid=channel_userid, erp_username=m_bind.group(1),
-                )
-                await _send_text(sender, channel_userid, result.reply_text)
-                record["final_status"] = "success"
-                return
+        _current_response_wrapper.set(_wrapped_send_text)
+        # ====== 第一层：Rule 命令路由（不需要 IdentityService）======
+        m_bind = RE_BIND.match(content)
+        if m_bind:
+            result = await binding_service.initiate_binding(
+                dingtalk_userid=channel_userid, erp_username=m_bind.group(1),
+            )
+            await _send_text(sender, channel_userid, result.reply_text)
+            record["final_status"] = "success"
+            return
 
-            if RE_UNBIND.match(content):
-                result = await binding_service.unbind_self(dingtalk_userid=channel_userid)
-                await _send_text(sender, channel_userid, result.reply_text)
-                record["final_status"] = "success"
-                return
+        if RE_UNBIND.match(content):
+            result = await binding_service.unbind_self(dingtalk_userid=channel_userid)
+            await _send_text(sender, channel_userid, result.reply_text)
+            record["final_status"] = "success"
+            return
 
-            if RE_HELP.match(content):
-                cmds = [
-                    "/绑定 你的ERP用户名 — 绑定 ERP 账号",
-                    "/解绑 — 解绑当前账号",
-                    "查 SKU100 — 查商品",
-                    "查 SKU100 给阿里 — 查客户历史价",
-                ]
-                await _send_text(sender, channel_userid, messages.help_message(cmds))
-                record["final_status"] = "success"
-                return
+        if RE_HELP.match(content):
+            cmds = [
+                "/绑定 你的ERP用户名 — 绑定 ERP 账号",
+                "/解绑 — 解绑当前账号",
+                "查 SKU100 — 查商品",
+                "查 SKU100 给阿里 — 查客户历史价",
+            ]
+            await _send_text(sender, channel_userid, messages.help_message(cmds))
+            record["final_status"] = "success"
+            return
 
-            # ====== 第二层：身份解析 + ERP 状态检查 ======
-            resolution = await identity_service.resolve(dingtalk_userid=channel_userid)
-            if not resolution.found:
-                await _send_text(sender, channel_userid,
-                                 build_user_message(BizErrorCode.USER_NOT_BOUND))
-                record["final_status"] = "failed_user"
-                return
-            if not resolution.erp_active:
-                await _send_text(sender, channel_userid,
-                                 build_user_message(BizErrorCode.USER_ERP_DISABLED))
-                record["final_status"] = "failed_user"
-                return
+        # ====== 第二层：身份解析 + ERP 状态检查 ======
+        resolution = await identity_service.resolve(dingtalk_userid=channel_userid)
+        if not resolution.found:
+            await _send_text(sender, channel_userid,
+                             build_user_message(BizErrorCode.USER_NOT_BOUND))
+            record["final_status"] = "failed_user"
+            return
+        if not resolution.erp_active:
+            await _send_text(sender, channel_userid,
+                             build_user_message(BizErrorCode.USER_ERP_DISABLED))
+            record["final_status"] = "failed_user"
+            return
 
-            # ====== 第三层：Plan 4 pending_choice / pending_confirm 多轮回路（保留不动）======
-            # 取多轮上下文（仅在 conversation_state 注入时有效）
-            state = await conversation_state.load(channel_userid) if conversation_state else None
-            parser_context: dict = {}
-            if state:
-                if state.get("pending_choice"):
-                    parser_context["pending_choice"] = "yes"
-                if state.get("pending_confirm"):
-                    parser_context["pending_confirm"] = "yes"
+        # ====== 第三层：Plan 4 pending_choice / pending_confirm 多轮回路（保留不动）======
+        # 取多轮上下文（仅在 conversation_state 注入时有效）
+        state = await conversation_state.load(channel_userid) if conversation_state else None
+        parser_context: dict = {}
+        if state:
+            if state.get("pending_choice"):
+                parser_context["pending_choice"] = "yes"
+            if state.get("pending_confirm"):
+                parser_context["pending_confirm"] = "yes"
 
-            # 优先处理 pending_choice（数字编号回路）
-            # M4：复用 rule_parser.RE_NUMBER（r"^\s*(\d{1,3})\s*$"）保证一致性
-            from hub.intent.rule_parser import RE_NUMBER
-            if state and state.get("pending_choice") and RE_NUMBER.match(content):
-                try:
-                    # 构造一个 select_choice intent 交给既有 _handle_select_choice
-                    choice_intent = ParsedIntent(
-                        intent_type="select_choice",
-                        fields={"choice": int(content)},
-                        confidence=1.0, parser="pending_choice",
-                    )
-                    await _handle_select_choice(
-                        choice_intent, state, channel_userid, sender,
-                        conversation_state, resolution,
-                        query_product_usecase, query_customer_history_usecase,
-                        require_permissions,
-                    )
-                    record["final_status"] = "success"
-                except BizError as e:
-                    await _send_text(sender, channel_userid, str(e))
-                    record["final_status"] = "failed_user"
-                return
-
-            # pending_confirm 路由：仅在有 state.pending_confirm 且内容匹配确认词时触发
-            # 注意：这个路径是绑定二次确认（Plan 3/4），与 RE_CONFIRM（Plan 6 写门禁确认）独立
-            if state and state.get("pending_confirm") and RE_CONFIRM.match(content):
-                try:
-                    await _execute_confirmed(
-                        state, channel_userid, sender, conversation_state, resolution,
-                        query_product_usecase, query_customer_history_usecase,
-                        require_permissions,
-                    )
-                    record["final_status"] = "success"
-                except BizError as e:
-                    await _send_text(sender, channel_userid, str(e))
-                    record["final_status"] = "failed_user"
-                return
-
-            # ====== 第四层：GraphAgent 业务主路径（Plan 6 v9 Task 7.2）======
-            if chain_agent is None:
-                # 没有 GraphAgent 时降级为友好提示（兼容测试 / 未配置场景）
-                await _send_text(sender, channel_userid,
-                                 "我没听懂，请发送「帮助」查看可用功能。")
-                record["final_status"] = "failed_user"
-                return
-
-            # 标注解析器（落 task_log.intent_parser，admin UI 用来区分 agent vs rule fallback 路径）
-            # GraphAgent 不再有"discrete intent"概念，confidence 留 null
-            record["intent_parser"] = "agent"
-
-            # GraphAgent.run 签名：user_message / hub_user_id / conversation_id /
-            # acting_as / channel_userid — 无 user_just_confirmed。
-            # 确认词识别由 GraphAgent 内部 pre_router 处理（检测 pending actions + 确认类消息）。
+        # 优先处理 pending_choice（数字编号回路）
+        # M4：复用 rule_parser.RE_NUMBER（r"^\s*(\d{1,3})\s*$"）保证一致性
+        from hub.intent.rule_parser import RE_NUMBER
+        if state and state.get("pending_choice") and RE_NUMBER.match(content):
             try:
-                agent_result = await chain_agent.run(
-                    user_message=content,
-                    hub_user_id=resolution.hub_user_id,
-                    conversation_id=conversation_id,
-                    acting_as=resolution.erp_user_id,
-                    channel_userid=channel_userid,
+                # 构造一个 select_choice intent 交给既有 _handle_select_choice
+                choice_intent = ParsedIntent(
+                    intent_type="select_choice",
+                    fields={"choice": int(content)},
+                    confidence=1.0, parser="pending_choice",
                 )
+                await _handle_select_choice(
+                    choice_intent, state, channel_userid, sender,
+                    conversation_state, resolution,
+                    query_product_usecase, query_customer_history_usecase,
+                    require_permissions,
+                )
+                record["final_status"] = "success"
             except BizError as e:
-                # BizError（权限拒绝等）：翻译成中文给用户
                 await _send_text(sender, channel_userid, str(e))
                 record["final_status"] = "failed_user"
-                return
-            except Exception:
-                # GraphAgent 未预期异常（Redis 死 / 网络超时未被 agent 内部 catch 等）
-                # → 降级 RuleParser
-                logger.exception(
-                    "GraphAgent 抛出未预期异常，降级 RuleParser conv=%s", conversation_id,
+            return
+
+        # pending_confirm 路由：仅在有 state.pending_confirm 且内容匹配确认词时触发
+        # 注意：这个路径是绑定二次确认（Plan 3/4），与 RE_CONFIRM（Plan 6 写门禁确认）独立
+        if state and state.get("pending_confirm") and RE_CONFIRM.match(content):
+            try:
+                await _execute_confirmed(
+                    state, channel_userid, sender, conversation_state, resolution,
+                    query_product_usecase, query_customer_history_usecase,
+                    require_permissions,
                 )
-                await _fallback_to_rule_parser(
-                    content=content, rule_parser=rule_parser,
-                    sender=sender, channel_userid=channel_userid,
-                    record=record, parser_context=parser_context,
-                    resolution=resolution,
-                    query_product=query_product_usecase,
-                    query_customer=query_customer_history_usecase,
-                    require_permissions=require_permissions,
-                )
-                return
+                record["final_status"] = "success"
+            except BizError as e:
+                await _send_text(sender, channel_userid, str(e))
+                record["final_status"] = "failed_user"
+            return
 
-            # agent_result 可能是 AgentResult（ChainAgent 兼容）或 str | None（GraphAgent 原生）
-            # GraphAgentAdapter（worker.py 构建）统一包装成 AgentResult
-            if agent_result.kind == "error":
-                # 已翻译过的友好错误（"AI 响应超时" 之类）→ 直接发给用户
-                await _send_text(
-                    sender, channel_userid,
-                    agent_result.error or "AI 处理出了点问题",
-                )
-                record["final_status"] = "failed_system_final"
-                return
+        # ====== 第四层：GraphAgent 业务主路径（Plan 6 v9 Task 7.2）======
+        if chain_agent is None:
+            # 没有 GraphAgent 时降级为友好提示（兼容测试 / 未配置场景）
+            await _send_text(sender, channel_userid,
+                             "我没听懂，请发送「帮助」查看可用功能。")
+            record["final_status"] = "failed_user"
+            return
 
-            # success 路径：text 或 clarification 都直接发文本
-            final_text = agent_result.text or "（无回复）"
-            await _send_text(sender, channel_userid, final_text)
-            record["final_status"] = "success"
-            record["agent_kind"] = agent_result.kind
+        # 标注解析器（落 task_log.intent_parser，admin UI 用来区分 agent vs rule fallback 路径）
+        # GraphAgent 不再有"discrete intent"概念，confidence 留 null
+        record["intent_parser"] = "agent"
 
-        finally:
-            # 还原 sender.send_text，避免共享实例上累积包装
-            sender.send_text = original_send_text
+        # GraphAgent.run 签名：user_message / hub_user_id / conversation_id /
+        # acting_as / channel_userid — 无 user_just_confirmed。
+        # 确认词识别由 GraphAgent 内部 pre_router 处理（检测 pending actions + 确认类消息）。
+        try:
+            agent_result = await chain_agent.run(
+                user_message=content,
+                hub_user_id=resolution.hub_user_id,
+                conversation_id=conversation_id,
+                acting_as=resolution.erp_user_id,
+                channel_userid=channel_userid,
+            )
+        except BizError as e:
+            # BizError（权限拒绝等）：翻译成中文给用户
+            await _send_text(sender, channel_userid, str(e))
+            record["final_status"] = "failed_user"
+            return
+        except Exception:
+            # GraphAgent 未预期异常（Redis 死 / 网络超时未被 agent 内部 catch 等）
+            # → 降级 RuleParser
+            logger.exception(
+                "GraphAgent 抛出未预期异常，降级 RuleParser conv=%s", conversation_id,
+            )
+            await _fallback_to_rule_parser(
+                content=content, rule_parser=rule_parser,
+                sender=sender, channel_userid=channel_userid,
+                record=record, parser_context=parser_context,
+                resolution=resolution,
+                query_product=query_product_usecase,
+                query_customer=query_customer_history_usecase,
+                require_permissions=require_permissions,
+            )
+            return
 
+        # agent_result 可能是 AgentResult（ChainAgent 兼容）或 str | None（GraphAgent 原生）
+        # GraphAgentAdapter（worker.py 构建）统一包装成 AgentResult
+        if agent_result.kind == "error":
+            # 已翻译过的友好错误（"AI 响应超时" 之类）→ 直接发给用户
+            await _send_text(
+                sender, channel_userid,
+                agent_result.error or "AI 处理出了点问题",
+            )
+            record["final_status"] = "failed_system_final"
+            return
+
+        # success 路径：text 或 clarification 都直接发文本
+        final_text = agent_result.text or "（无回复）"
+        await _send_text(sender, channel_userid, final_text)
+        record["final_status"] = "success"
+        record["agent_kind"] = agent_result.kind
 
 async def _fallback_to_rule_parser(
     *, content: str, rule_parser,
@@ -398,4 +396,8 @@ async def _execute_confirmed(
 
 async def _send_text(sender, userid: str, text: str) -> None:
     """发送失败让异常上抛，由 WorkerRuntime 转入死信流，不静默 ACK。"""
-    await sender.send_text(dingtalk_userid=userid, text=text)
+    wrapper = _current_response_wrapper.get()
+    if wrapper is not None:
+        await wrapper(dingtalk_userid=userid, text=text)
+    else:
+        await sender.send_text(dingtalk_userid=userid, text=text)

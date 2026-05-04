@@ -11,8 +11,8 @@
 
     <div class="hub-toolbar">
       <AppInput v-model.number="filter.actor_id" size="toolbar" type="number" placeholder="操作人 ID" />
-      <AppInput v-if="tab === 'main'" v-model="filter.action" size="toolbar" placeholder="action（如 create_downstream）" />
-      <AppInput v-if="tab === 'main'" v-model="filter.target_type" size="toolbar" placeholder="target_type" />
+      <AppInput v-if="tab === 'main'" v-model="filter.action" size="toolbar" placeholder="操作类型（如 创建、删除、修改）" />
+      <AppInput v-if="tab === 'main'" v-model="filter.target_type" size="toolbar" placeholder="对象类型（如 渠道、下游系统）" />
       <AppSelect v-model.number="filter.since_hours" size="toolbar" :options="hoursOptions" />
       <AppButton variant="secondary" size="sm" @click="onSearch">查询</AppButton>
     </div>
@@ -41,7 +41,7 @@
           <td class="app-td">{{ row.actor_name || '?' }} <span class="text-muted">#{{ row.actor_id }}</span></td>
           <template v-if="tab === 'main'">
             <td class="app-td">{{ actionLabel(row.action) }}</td>
-            <td class="app-td">{{ row.target_type }}</td>
+            <td class="app-td">{{ targetTypeLabel(row.target_type) }}</td>
             <td class="app-td std-num">{{ row.target_id }}</td>
             <td class="app-td hub-truncate"><code class="hub-detail-json">{{ formatDetail(row.detail) }}</code></td>
             <td class="app-td text-muted std-num">{{ row.ip || '-' }}</td>
@@ -115,6 +115,20 @@ const ACTION_LABEL = {
 }
 function actionLabel(a) {
   return ACTION_LABEL[a] || a
+}
+
+const TARGET_TYPE_LABEL = {
+  downstream_system: '下游系统',
+  channel_app: '渠道应用',
+  ai_provider: 'AI 提供商',
+  system_config: '系统配置',
+  hub_user: '用户',
+  hub_role: '角色',
+  downstream_identity: 'ERP 账号关联',
+  channel_user_binding: '渠道用户绑定',
+}
+function targetTypeLabel(t) {
+  return TARGET_TYPE_LABEL[t] || t
 }
 
 const hasMeta = computed(() => auth.hasPerm('platform.audit.system_read'))

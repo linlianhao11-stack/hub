@@ -50,10 +50,19 @@ class ErpSessionAuth:
             "user": resp.get("user", {}),
         })
 
+    def _evict_expired(self) -> None:
+        now = time.time()
+        expired = [k for k, (expires_at, _) in self._cache.items() if now >= expires_at]
+        for k in expired:
+            del self._cache[k]
+
     async def verify_cookie(self, cookie: str | None) -> dict | None:
         """校验 cookie 合法性。返回 ERP user dict（含 permissions）或 None。"""
         if not cookie:
             return None
+
+        if len(self._cache) > 500:
+            self._evict_expired()
 
         # 缓存命中
         cached = self._cache.get(cookie)

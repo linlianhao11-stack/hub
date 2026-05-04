@@ -51,6 +51,11 @@ async def main():
     # WorkerRuntime 会 ACK 掉消息，**用户消息被静默丢弃**。
     channel_app: ChannelApp | None = None
     ds: DownstreamSystem | None = None
+    # B6 修：加最大重试上限,避免 setup 没走完 worker 永久挂起占连接当僵尸。
+    # 60 次 × 30s = 30 分钟,过后 sys.exit(1) 让 docker compose restart 策略接管
+    # （docker-compose.yml 已加 healthcheck,工程师 / supervisor 能感知）。
+    _MAX_INIT_WAIT_RETRIES = 60
+    init_retries = 0
     while channel_app is None or ds is None:
         if channel_app is None:
             channel_app = await ChannelApp.filter(
@@ -66,8 +71,17 @@ async def main():
         if ds is None:
             missing.append("ERP 下游")
         if missing:
+            init_retries += 1
+            if init_retries >= _MAX_INIT_WAIT_RETRIES:
+                logger.error(
+                    f"等待初始化向导超时 [{', '.join(missing)}] 配置仍未就绪 "
+                    f"（{_MAX_INIT_WAIT_RETRIES} 次 × 30s = 30 分钟）— worker 退出,"
+                    f"由 docker compose restart 策略接管",
+                )
+                import sys
+                sys.exit(1)
             logger.info(
-                f"等待初始化向导完成 [{', '.join(missing)}] 配置 ...（30 秒后重试）",
+                f"等待初始化向导完成 [{', '.join(missing)}] 配置 ...({init_retries}/{_MAX_INIT_WAIT_RETRIES},30 秒后重试)",
             )
             await asyncio.sleep(30)
 

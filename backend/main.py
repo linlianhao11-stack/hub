@@ -248,10 +248,13 @@ app = FastAPI(
     docs_url="/docs",  # Plan 5 加 admin 鉴权
 )
 
-# CORS（仅内网访问，宽松配置即可）
+# CORS（仅允许本地网关端口访问）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 内网部署，安全靠 ApiKey + ERP session
+    allow_origins=[
+        f"http://localhost:{get_settings().gateway_port}",
+        f"http://127.0.0.1:{get_settings().gateway_port}",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

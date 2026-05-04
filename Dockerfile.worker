@@ -3,4 +3,9 @@ WORKDIR /app
 COPY backend/ ./
 RUN pip install --no-cache-dir -e .
 ENV PYTHONUNBUFFERED=1 TZ=Asia/Shanghai
+
+RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+RUN chown -R app:app /app
+USER app
+
 CMD ["python", "worker.py"]

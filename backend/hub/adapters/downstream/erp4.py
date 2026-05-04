@@ -56,11 +56,12 @@ class Erp4Adapter:
         self._client = httpx.AsyncClient(
             base_url=self.base_url, timeout=timeout, transport=transport,
         )
-        # 熔断器：只统计 ErpSystemError，4xx 业务错不计入
-        self._breaker = CircuitBreaker(
+        breaker_config = dict(
             threshold=5, window_seconds=30, open_seconds=60,
             countable_exceptions=(ErpSystemError,),
         )
+        self._system_breaker = CircuitBreaker(**breaker_config)
+        self._business_breaker = CircuitBreaker(**breaker_config)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -200,7 +201,7 @@ class Erp4Adapter:
             except httpx.RequestError as e:
                 raise ErpSystemError(f"网络错误: {e}") from e
 
-        return await self._breaker.call(_do)
+        return await self._business_breaker.call(_do)
 
     async def search_orders(
         self, *,
@@ -311,7 +312,7 @@ class Erp4Adapter:
                 return r.json()
             except httpx.RequestError as e:
                 raise ErpSystemError(f"网络错误: {e}") from e
-        return await self._breaker.call(_do)
+        return await self._system_breaker.call(_do)
 
     async def _system_post(self, path: str, json: dict) -> dict:
         async def _do():
@@ -321,7 +322,7 @@ class Erp4Adapter:
                 return r.json()
             except httpx.RequestError as e:
                 raise ErpSystemError(f"网络错误: {e}") from e
-        return await self._breaker.call(_do)
+        return await self._system_breaker.call(_do)
 
     async def _act_as_post(
         self, path: str, *, json: dict, acting_as_user_id: int,
@@ -340,7 +341,7 @@ class Erp4Adapter:
                 return r.json()
             except httpx.RequestError as e:
                 raise ErpSystemError(f"网络错误: {e}") from e
-        return await self._breaker.call(_do)
+        return await self._business_breaker.call(_do)
 
     async def _act_as_get(
         self, path: str, acting_as_user_id: int | None, params: dict | None = None,
@@ -359,7 +360,7 @@ class Erp4Adapter:
                 return r.json()
             except httpx.RequestError as e:
                 raise ErpSystemError(f"网络错误: {e}") from e
-        return await self._breaker.call(_do)
+        return await self._business_breaker.call(_do)
 
     def _raise_for_status(self, r: httpx.Response) -> None:
         if r.status_code in (401, 403):

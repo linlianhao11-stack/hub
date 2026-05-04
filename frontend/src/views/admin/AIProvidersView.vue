@@ -80,6 +80,20 @@
         <AppButton variant="primary" size="sm" :loading="updating" @click="onUpdate">保存</AppButton>
       </template>
     </AppModal>
+
+    <!-- M15: 停用二次确认 modal（替换 confirm()） -->
+    <AppModal
+      :visible="showConfirmModal"
+      title="确认操作"
+      size="sm"
+      @update:visible="(v) => { if (!v) showConfirmModal = false }"
+    >
+      <p>{{ confirmMessage }}</p>
+      <template #footer>
+        <AppButton variant="ghost" size="sm" @click="showConfirmModal = false">取消</AppButton>
+        <AppButton variant="danger" size="sm" @click="confirmAction?.()">确认停用</AppButton>
+      </template>
+    </AppModal>
   </div>
 </template>
 
@@ -108,6 +122,9 @@ const testing = ref(null)
 const disabling = ref(null)
 const modalError = ref('')
 const defaults = ref({})
+const showConfirmModal = ref(false)
+const confirmAction = ref(null)
+const confirmMessage = ref('')
 
 // 编辑 modal 状态
 const showEdit = ref(false)
@@ -215,19 +232,22 @@ async function onActive(a) {
 }
 
 async function onDisable(a) {
-  if (!confirm(`确定停用「${a.name}」？停用后 worker 重启将无 active provider,LLM 路径会降级到 RuleParser。`)) {
-    return
+  confirmMessage.value = `确定停用「${a.name}」？停用后 worker 重启将无 active provider，LLM 路径会降级到 RuleParser。`
+  confirmAction.value = async () => {
+    disabling.value = a.id
+    try {
+      await disableAi(a.id)
+      appStore.showToast('已停用')
+      showConfirmModal.value = false
+      load()
+    } catch (e) {
+      showConfirmModal.value = false
+      appStore.showToast(pickErrorDetail(e, '停用失败'), 'error')
+    } finally {
+      disabling.value = null
+    }
   }
-  disabling.value = a.id
-  try {
-    await disableAi(a.id)
-    appStore.showToast('已停用')
-    load()
-  } catch (e) {
-    appStore.showToast(pickErrorDetail(e, '停用失败'), 'error')
-  } finally {
-    disabling.value = null
-  }
+  showConfirmModal.value = true
 }
 
 function onEdit(a) {

@@ -21,4 +21,8 @@ COPY --from=frontend-builder /frontend/dist ./static
 ENV PYTHONUNBUFFERED=1 TZ=Asia/Shanghai
 EXPOSE 8091
 
+RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+RUN chown -R app:app /app
+USER app
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8091"]

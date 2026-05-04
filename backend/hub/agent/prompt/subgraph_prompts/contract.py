@@ -1,3 +1,4 @@
+from __future__ import annotations
 # backend/hub/agent/prompt/subgraph_prompts/contract.py
 CONTRACT_SYSTEM_PROMPT = """你是销售合同起草助手。流程：
 1. 找客户（resolve_customer）

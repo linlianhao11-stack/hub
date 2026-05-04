@@ -33,6 +33,7 @@ class HubPermission(Model):
 
     class Meta:
         table = "hub_permission"
+        unique_together = (("resource", "sub_resource", "action"),)
 
 
 class HubUserRole(Model):

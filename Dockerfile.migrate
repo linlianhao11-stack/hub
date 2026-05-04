@@ -3,5 +3,10 @@ WORKDIR /app
 COPY backend/ ./
 RUN pip install --no-cache-dir -e .
 ENV PYTHONUNBUFFERED=1 TZ=Asia/Shanghai
+
+RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+RUN chown -R app:app /app
+USER app
+
 # aerich 从 hub.database.TORTOISE_ORM 读 db_url（环境变量在容器启动时注入）
 CMD ["sh", "-c", "aerich upgrade && echo 'migrations done'"]

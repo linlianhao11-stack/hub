@@ -1,3 +1,4 @@
+from __future__ import annotations
 # backend/hub/agent/prompt/subgraph_prompts/quote.py
 """quote 子图 system prompt — 完全静态。"""
 QUOTE_SYSTEM_PROMPT = """你是销售报价单生成助手。流程：

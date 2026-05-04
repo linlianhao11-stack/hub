@@ -118,7 +118,10 @@ class BindingService:
                         erp_token_id=token_id, hub_user_id=0,
                     )
                 except IntegrityError as e:
-                    raise _AlreadyConsumedError() from e
+                    error_msg = str(e).lower()
+                    if 'erp_token_id' in error_msg or 'consumed_binding_token' in error_msg:
+                        raise _AlreadyConsumedError() from e
+                    raise
 
                 # 冲突检查：dingtalk → 不同 ERP
                 existing_binding = await ChannelUserBinding.filter(
@@ -218,7 +221,11 @@ class BindingService:
                         note = "reactivated_with_new_erp"
 
                 # 默认角色
-                role = await HubRole.get(code=self.DEFAULT_ROLE_CODE)
+                role = await HubRole.get_or_none(code=self.DEFAULT_ROLE_CODE)
+                if role is None:
+                    raise ValueError(
+                        f"预设角色 '{self.DEFAULT_ROLE_CODE}' 不存在，请确认数据库迁移和种子数据已执行",
+                    )
                 await HubUserRole.get_or_create(hub_user_id=hub_user.id, role_id=role.id)
 
                 # 把 consumed token 的 hub_user_id 更新为真实值（同事务内）

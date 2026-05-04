@@ -1,3 +1,4 @@
+from __future__ import annotations
 # backend/hub/agent/prompt/subgraph_prompts/voucher.py
 """voucher 子图 system prompt — 完全静态。spec §6.3。"""
 VOUCHER_SYSTEM_PROMPT = """凭证流程：
