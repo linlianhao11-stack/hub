@@ -27,6 +27,26 @@ def test_system_prompt_does_not_teach_nonexistent_tool_args():
     )
 
 
+def test_system_prompt_forbids_markdown_explicitly():
+    """钉钉手机端不渲染 markdown — prompt 必须显式禁用 ** / # / - / | / ` 等符号。
+
+    背景：钉钉测试发现 LLM 自带 markdown 输出习惯（** 加粗 / - 列表）,在手机上是
+    字面字符显示,用户看着很烦。修法：在 prompt 最显眼位置 + 末尾各禁一次。
+
+    本测试锁住:prompt 必须有"禁用 markdown"的明确反例 + 替代写法说明。
+    """
+    # 必须明确提钉钉不渲染 markdown
+    assert "钉钉" in SYSTEM_PROMPT and "markdown" in SYSTEM_PROMPT
+    # 必须列具体禁用符号（至少包含核心几个）
+    assert "**" in SYSTEM_PROMPT, "prompt 必须示范禁用 ** 加粗符号"
+    # 必须有"纯文本"或"普通文本"等明确指令
+    assert "纯文本" in SYSTEM_PROMPT
+    # 必须有正反例对比
+    assert "错误" in SYSTEM_PROMPT and "正确" in SYSTEM_PROMPT, (
+        "prompt 必须有 markdown 错误/正确 写法的对比示例"
+    )
+
+
 def test_system_prompt_size_reasonable():
     """token 控制 — DeepSeek 中文 tokenizer 约 1 char ≈ 1 token。
     控制在 6000 char 以内（约 6K token,DeepSeek prompt cache 友好）。
