@@ -172,3 +172,25 @@ async def test_customer_prices_timeout_raises_system_error():
         await adapter.get_product_customer_prices(
             product_id=1, customer_id=2, acting_as_user_id=42,
         )
+
+
+@pytest.mark.asyncio
+async def test_adapter_get_customer_url(erp_url):
+    """get_customer 调 /api/v1/customers/{id} + acting_as header。"""
+    from hub.adapters.downstream.erp4 import Erp4Adapter
+
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> Response:
+        captured["url"] = str(req.url)
+        captured["acting_as"] = req.headers.get("x-acting-as-user-id")
+        return Response(200, json={"id": 100, "name": "测试客户", "address": "上海"})
+
+    adapter = Erp4Adapter(
+        base_url=erp_url, api_key="test-key", transport=MockTransport(handler),
+    )
+    result = await adapter.get_customer(customer_id=100, acting_as_user_id=42)
+
+    assert "/api/v1/customers/100" in captured["url"]
+    assert captured["acting_as"] == "42"
+    assert result["name"] == "测试客户"

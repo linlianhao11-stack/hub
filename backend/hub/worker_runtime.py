@@ -91,8 +91,22 @@ class WorkerRuntime:
             while not self._stop:
                 try:
                     await self._process_one(runner)
-                except Exception:
-                    logger.exception("worker loop 错误，1 秒后重试")
+                except Exception as e:
+                    # v8 review #24：Redis 被 FLUSHDB / 重启 / stream key TTL 过期等场景下
+                    # consumer group 会消失，触发 NOGROUP 错误 → worker 死循环。
+                    # 自愈：检测 NOGROUP 关键字时主动重建 stream + group，1s 重试。
+                    if "NOGROUP" in str(e) or "consumer group" in str(e).lower():
+                        logger.warning(
+                            "检测到 consumer group 缺失（Redis 可能被 FLUSHDB 或重启），"
+                            "自动重建 group=%s",
+                            self.group,
+                        )
+                        try:
+                            await runner.ensure_consumer_group(self.group)
+                        except Exception:
+                            logger.exception("自动重建 consumer group 失败")
+                    else:
+                        logger.exception("worker loop 错误，1 秒后重试")
                     await asyncio.sleep(1)
         finally:
             if self._owns_redis:

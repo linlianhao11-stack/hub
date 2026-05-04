@@ -1,0 +1,10 @@
+name: 闲聊场景（不调任何 tool）
+turns:
+  - input: "在吗"
+    expected_tool_calls_zero:
+      - search_customer
+      - search_product
+      - create_contract_draft
+      - create_quote_draft
+      - confirm_action
+    final_message_contains_any: ["在", "你好", "需要"]

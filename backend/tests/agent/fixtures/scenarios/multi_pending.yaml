@@ -1,0 +1,17 @@
+# backend/tests/agent/fixtures/scenarios/multi_pending.yaml
+# Plan 6 v9 Task 5.6 — 多 pending 行为 fixture
+# Phase 8 Task 8.1 yaml driver 完整跑端到端
+name: 多 pending 不自动 claim
+setup:
+  - create_pending: {action_id: "adj-1", subgraph: "adjust_price", summary: "阿里 X1 → 280"}
+  - create_pending: {action_id: "vch-1", subgraph: "voucher", summary: "SO-001 出库"}
+turns:
+  - input: "确认"
+    expected_intent: confirm
+    must_contain: ["1)", "2)", "adj-1", "vch-1"]
+    pending_state: {adj-1: still_pending, vch-1: still_pending}
+  - input: "1"
+    expected_intent: confirm
+    tool_caps:
+      create_price_adjustment_request: 1
+    pending_state: {adj-1: claimed, vch-1: still_pending}

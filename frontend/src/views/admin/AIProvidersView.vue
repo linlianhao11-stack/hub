@@ -34,8 +34,10 @@
           <td class="app-td"><span class="std-num">{{ a.model }}</span></td>
           <td class="app-td"><AppBadge :variant="statusVariant(a.status)">{{ statusLabel(a.status) }}</AppBadge></td>
           <td class="app-td text-right">
+            <AppButton variant="secondary" size="xs" class="mr-1" @click="onEdit(a)">编辑</AppButton>
             <AppButton variant="secondary" size="xs" class="mr-1" @click="onTest(a)" :loading="testing === a.id">测试 chat</AppButton>
-            <AppButton v-if="a.status !== 'active'" variant="primary" size="xs" @click="onActive(a)">设为 active</AppButton>
+            <AppButton v-if="a.status !== 'active'" variant="primary" size="xs" class="mr-1" @click="onActive(a)">启用</AppButton>
+            <AppButton v-if="a.status === 'active'" variant="danger" size="xs" @click="onDisable(a)" :loading="disabling === a.id">停用</AppButton>
           </td>
         </tr>
       </AppTable>
@@ -57,13 +59,34 @@
         <AppButton variant="primary" size="sm" :loading="saving" @click="onCreate">保存</AppButton>
       </template>
     </AppModal>
+
+    <AppModal :visible="showEdit" title="编辑 AI 提供商" size="md" @update:visible="(v) => { if (!v) showEdit = false }">
+      <div v-if="editError" class="hub-page__error">{{ editError }}</div>
+      <div class="hub-form">
+        <label class="hub-form__field"><span>提供商类型</span>
+          <AppInput :model-value="providerLabel(editForm.provider_type)" disabled />
+          <span class="hub-form__hint">类型不可改 — 要换种类请新建一个再设为 active</span>
+        </label>
+        <label class="hub-form__field"><span>名称</span><AppInput v-model="editForm.name" /></label>
+        <label class="hub-form__field"><span>API Key</span>
+          <AppInput v-model="editForm.api_key" type="password" placeholder="留空表示沿用旧 key" />
+          <span class="hub-form__hint">出于安全,旧 key 不会回显;留空提交不会改 key</span>
+        </label>
+        <label class="hub-form__field"><span>Base URL</span><AppInput v-model="editForm.base_url" /></label>
+        <label class="hub-form__field"><span>模型</span><AppInput v-model="editForm.model" /></label>
+      </div>
+      <template #footer>
+        <AppButton variant="secondary" size="sm" @click="showEdit = false">取消</AppButton>
+        <AppButton variant="primary" size="sm" :loading="updating" @click="onUpdate">保存</AppButton>
+      </template>
+    </AppModal>
   </div>
 </template>
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
 import {
-  listAi, createAi, testAiChat, setAiActive, getAiDefaults,
+  listAi, createAi, updateAi, testAiChat, setAiActive, disableAi, getAiDefaults,
 } from '../../api/ai'
 import { pickErrorDetail } from '../../api'
 import { statusLabel, statusVariant } from '../../utils/format'
@@ -82,8 +105,22 @@ const error = ref('')
 const showCreate = ref(false)
 const saving = ref(false)
 const testing = ref(null)
+const disabling = ref(null)
 const modalError = ref('')
 const defaults = ref({})
+
+// 编辑 modal 状态
+const showEdit = ref(false)
+const updating = ref(false)
+const editError = ref('')
+const editForm = reactive({
+  id: null,
+  provider_type: '',
+  name: '',
+  api_key: '',  // 留空 = 不改
+  base_url: '',
+  model: '',
+})
 
 const providerOptions = [
   { value: 'deepseek', label: 'DeepSeek' },
@@ -170,10 +207,60 @@ async function onTest(a) {
 async function onActive(a) {
   try {
     await setAiActive(a.id)
-    appStore.showToast('已切换 active')
+    appStore.showToast('已启用（其他已自动停用）')
     load()
   } catch (e) {
-    appStore.showToast(pickErrorDetail(e, '切换失败'), 'error')
+    appStore.showToast(pickErrorDetail(e, '启用失败'), 'error')
+  }
+}
+
+async function onDisable(a) {
+  if (!confirm(`确定停用「${a.name}」？停用后 worker 重启将无 active provider,LLM 路径会降级到 RuleParser。`)) {
+    return
+  }
+  disabling.value = a.id
+  try {
+    await disableAi(a.id)
+    appStore.showToast('已停用')
+    load()
+  } catch (e) {
+    appStore.showToast(pickErrorDetail(e, '停用失败'), 'error')
+  } finally {
+    disabling.value = null
+  }
+}
+
+function onEdit(a) {
+  Object.assign(editForm, {
+    id: a.id,
+    provider_type: a.provider_type,
+    name: a.name || '',
+    api_key: '',  // 留空 — 提示用户旧 key 沿用
+    base_url: a.base_url || '',
+    model: a.model || '',
+  })
+  editError.value = ''
+  showEdit.value = true
+}
+
+async function onUpdate() {
+  editError.value = ''
+  updating.value = true
+  try {
+    // 仅传非空字段（api_key 留空 → 不发字段，避免后端 None 误清空）
+    const body = {}
+    if (editForm.name && editForm.name.trim()) body.name = editForm.name.trim()
+    if (editForm.base_url && editForm.base_url.trim()) body.base_url = editForm.base_url.trim()
+    if (editForm.model && editForm.model.trim()) body.model = editForm.model.trim()
+    if (editForm.api_key && editForm.api_key.trim()) body.api_key = editForm.api_key.trim()
+    await updateAi(editForm.id, body)
+    appStore.showToast('已保存')
+    showEdit.value = false
+    load()
+  } catch (e) {
+    editError.value = pickErrorDetail(e, '保存失败')
+  } finally {
+    updating.value = false
   }
 }
 
@@ -216,4 +303,5 @@ onMounted(() => {
 .hub-toolbar__spacer { flex: 1; }
 .hub-form { display: flex; flex-direction: column; gap: 12px; }
 .hub-form__field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--text-muted); }
+.hub-form__hint { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 </style>

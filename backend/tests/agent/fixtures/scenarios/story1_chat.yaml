@@ -1,0 +1,7 @@
+# backend/tests/agent/fixtures/scenarios/story1_chat.yaml
+name: 故事 1：闲聊
+turns:
+  - input: "你好，最近怎样"
+    expected_intent: chat
+    tool_caps: {}
+    forbid: ["请问", "您要", "查询什么", "做什么"]

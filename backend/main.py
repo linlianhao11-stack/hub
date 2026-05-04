@@ -16,8 +16,10 @@ from hub.config import get_settings
 from hub.database import close_db, init_db
 from hub.routers import health, internal_callbacks, setup, setup_full
 from hub.routers.admin import ai_providers as admin_ai_providers
+from hub.routers.admin import approvals as admin_approvals
 from hub.routers.admin import audit as admin_audit
 from hub.routers.admin import channels as admin_channels
+from hub.routers.admin import contract_templates as admin_contract_templates
 from hub.routers.admin import conversation as admin_conversation
 from hub.routers.admin import dashboard as admin_dashboard
 from hub.routers.admin import downstreams as admin_downstreams
@@ -51,6 +53,9 @@ async def lifespan(app: FastAPI):
     ds_for_session = await DownstreamSystem.filter(
         downstream_type="erp", status="active",
     ).first()
+    # C2: 提前 import agent tool 模块，startup 时统一 wire
+    from hub.agent.tools import draft_tools, erp_tools, generate_tools
+
     if ds_for_session is not None:
         erp_api_key_for_session = decrypt_secret(
             ds_for_session.encrypted_apikey, purpose="config_secrets",
@@ -60,8 +65,19 @@ async def lifespan(app: FastAPI):
         )
         app.state.session_auth = ErpSessionAuth(erp_adapter=erp_for_session)
         app.state._session_erp_adapter = erp_for_session  # 留引用方便 shutdown 关闭
+        # 注入 approvals router + agent tool 模块所需的 ERP adapter
+        admin_approvals.set_erp_adapter(erp_for_session)
+        draft_tools.set_erp_adapter(erp_for_session)   # C2: agent 写草稿 tool
+        erp_tools.set_erp_adapter(erp_for_session)     # C2: agent 读 ERP tool
+        # C2: generate_tools 需要 sender（钉钉主动 push），gateway 进程不构建 sender，传 None
+        # sender 由 worker.py 注入（worker 才持有 DingTalkSender 长连接凭据）
+        generate_tools.set_dependencies(sender=None, erp=erp_for_session)
     else:
         app.state.session_auth = None
+        admin_approvals.set_erp_adapter(None)
+        draft_tools.set_erp_adapter(None)
+        erp_tools.set_erp_adapter(None)
+        generate_tools.set_dependencies(sender=None, erp=None)
 
     # 3. 首启动检测：未初始化（system_initialized=false）且无未使用 token → 生成并打印
     from datetime import datetime
@@ -124,6 +140,7 @@ async def lifespan(app: FastAPI):
     app.state.dingtalk_connect_task = connect_task
 
     # 6. cron 调度器（Plan 5 Task 10）：每天 03:00 巡检 + 04:00 清理 payload
+    #    Plan 6 Task 14：09:00 月度 LLM 预算告警
     from hub.cron.jobs import run_daily_audit, run_payload_cleanup
     from hub.cron.scheduler import CronScheduler
     scheduler = CronScheduler()
@@ -136,6 +153,62 @@ async def lifespan(app: FastAPI):
     async def _job_cleanup():
         await run_payload_cleanup()
 
+    async def _build_dingtalk_sender_for_cron(job_name: str):
+        """为 cron job 构造一个 DingTalkSender；无 active ChannelApp 时返 None。
+
+        M9 加固（review M9）：抽出共享逻辑减少 budget_alert / draft_reminder 重复代码。
+        """
+        from hub.adapters.channel.dingtalk_sender import DingTalkSender
+        from hub.crypto import decrypt_secret
+        from hub.models import ChannelApp
+
+        app_rec = await ChannelApp.filter(
+            channel_type="dingtalk", status="active",
+        ).first()
+        if app_rec is None:
+            logger.warning("%s cron 跳过：没有 active 状态的 dingtalk ChannelApp", job_name)
+            return None
+        try:
+            app_key = decrypt_secret(app_rec.encrypted_app_key, purpose="config_secrets")
+            app_secret = decrypt_secret(app_rec.encrypted_app_secret, purpose="config_secrets")
+            robot_id = app_rec.robot_id or ""
+        except Exception:
+            logger.exception("%s cron 跳过：ChannelApp 解密失败", job_name)
+            return None
+        return DingTalkSender(
+            app_key=app_key, app_secret=app_secret, robot_code=robot_id,
+        )
+
+    # Plan 6 Task 14：每天 09:00 检查月度 LLM 预算，超 80% 发钉钉告警
+    # 注意：sender 依赖 ChannelApp 配置，若未配置则 cron 内部跳过并记 WARNING
+    @scheduler.at_hour(9)
+    async def _job_budget_alert():
+        from hub.cron.budget_alert import run_budget_alert
+
+        sender = await _build_dingtalk_sender_for_cron("budget_alert")
+        if sender is None:
+            return
+        try:
+            result = await run_budget_alert(sender=sender)
+            logger.info("budget_alert cron 完成: %s", result)
+        finally:
+            await sender.aclose()
+
+    # Plan 6 Task 15：每天 09:00 检查超 7 天未审批的草稿，钉钉提醒请求人
+    # 注意：sender 依赖 ChannelApp 配置，若未配置则跳过并记 WARNING
+    @scheduler.at_hour(9)
+    async def _job_draft_reminder():
+        from hub.cron.draft_reminder import run_draft_reminder
+
+        sender = await _build_dingtalk_sender_for_cron("draft_reminder")
+        if sender is None:
+            return
+        try:
+            result = await run_draft_reminder(sender=sender)
+            logger.info("draft_reminder cron 结果: %s", result)
+        finally:
+            await sender.aclose()
+
     scheduler.start()
     app.state.scheduler = scheduler
 
@@ -143,6 +216,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("HUB Gateway 关闭")
     # 关闭顺序：先停 scheduler、再取消连接 task、最后 redis / db
+    admin_approvals.set_erp_adapter(None)
+    draft_tools.set_erp_adapter(None)     # C2: 清除 stale 引用
+    erp_tools.set_erp_adapter(None)       # C2: 清除 stale 引用
+    generate_tools.set_dependencies(sender=None, erp=None)  # C2: 清除 stale 引用
     if hasattr(app.state, "scheduler"):
         try:
             await app.state.scheduler.stop()
@@ -195,6 +272,8 @@ app.include_router(admin_tasks.router)
 app.include_router(admin_conversation.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_dashboard.router)
+app.include_router(admin_approvals.router)
+app.include_router(admin_contract_templates.router)
 
 
 # ============================================================

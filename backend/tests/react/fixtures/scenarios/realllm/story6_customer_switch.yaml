@@ -1,0 +1,8 @@
+name: 中途切换客户 — 别用旧 customer 生成新合同
+turns:
+  - input: "给翼蓝做合同 X1 10 个 300, 北京海淀, 张三, 13800001111"
+    expected_tool_calls_at_least: [search_customer, create_contract_draft]
+  - input: "算了,改成得帆"
+    expected_tool_calls_at_least:
+      - search_customer
+      - create_contract_draft

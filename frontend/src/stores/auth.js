@@ -50,6 +50,10 @@ export const useAuthStore = defineStore('hub-auth', () => {
 
   function hasPerm(code) {
     if (!code) return true
+    // 支持 | OR 语法：code 含 | 时，任一权限满足即返回 true
+    if (code.includes('|')) {
+      return code.split('|').some((c) => permissions.value.includes(c.trim()))
+    }
     return permissions.value.includes(code)
   }
 

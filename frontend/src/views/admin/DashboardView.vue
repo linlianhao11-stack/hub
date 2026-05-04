@@ -1,3 +1,7 @@
+<!--
+  Plan 6 Task 14 加 LLM 成本 section 后已 ~390 行；
+  follow-up：抽出 DashboardLlmCostSection.vue 子组件让本 view 回到 ~250 行。
+-->
 <template>
   <div class="hub-page">
     <h1 class="hub-page__title">仪表盘</h1>
@@ -43,6 +47,45 @@
         <canvas ref="chartCanvas"></canvas>
       </div>
     </section>
+
+    <!-- Plan 6 Task 14：LLM 成本指标 -->
+    <section v-if="data.llm_cost" class="hub-dashboard__llm-section">
+      <h2 class="hub-dashboard__section-title">LLM 成本</h2>
+      <div class="hub-dashboard__llm-grid">
+        <div class="hub-dashboard__llm-card">
+          <div class="hub-dashboard__llm-label">今日调用次数</div>
+          <div class="hub-dashboard__llm-value">{{ formatNumber(data.llm_cost.today_llm_calls) }}</div>
+        </div>
+        <div class="hub-dashboard__llm-card">
+          <div class="hub-dashboard__llm-label">今日 Token 消耗</div>
+          <div class="hub-dashboard__llm-value">{{ formatNumber(data.llm_cost.today_total_tokens) }}</div>
+        </div>
+        <div class="hub-dashboard__llm-card">
+          <div class="hub-dashboard__llm-label">今日成本</div>
+          <div class="hub-dashboard__llm-value">¥{{ formatCost(data.llm_cost.today_cost_yuan) }}</div>
+        </div>
+        <div class="hub-dashboard__llm-card">
+          <div class="hub-dashboard__llm-label">本月累计</div>
+          <div class="hub-dashboard__llm-value">¥{{ formatCost(data.llm_cost.month_to_date_cost_yuan) }}</div>
+        </div>
+      </div>
+
+      <div class="hub-dashboard__budget" :class="{ 'hub-dashboard__budget--alert': data.llm_cost.budget_alert }">
+        <div class="hub-dashboard__budget-header">
+          <span>本月预算 ¥{{ formatCost(data.llm_cost.month_budget_yuan) }}</span>
+          <span class="hub-dashboard__budget-pct">{{ data.llm_cost.budget_used_pct.toFixed(2) }}%</span>
+        </div>
+        <div class="hub-dashboard__progress-bar">
+          <div
+            class="hub-dashboard__progress-fill"
+            :style="{ width: Math.min(data.llm_cost.budget_used_pct, 100) + '%' }"
+          ></div>
+        </div>
+        <div v-if="data.llm_cost.budget_alert" class="hub-dashboard__budget-alert-msg">
+          已超 80% 预算，请关注
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -55,7 +98,7 @@ import { pickErrorDetail } from '../../api'
 Chart.register(...registerables)
 
 const error = ref('')
-const data = ref({ health: {}, today: {}, hourly: [] })
+const data = ref({ health: {}, today: {}, hourly: [], llm_cost: null })
 const today = computed(() => ({
   total: data.value.today.total ?? 0,
   success_rate: data.value.today.success_rate ?? 0,
@@ -125,6 +168,16 @@ function renderChart() {
       },
     },
   })
+}
+
+function formatNumber(n) {
+  if (n === null || n === undefined) return '0'
+  return Number(n).toLocaleString('zh-CN')
+}
+
+function formatCost(yuan) {
+  if (yuan === null || yuan === undefined) return '0.00'
+  return Number(yuan).toFixed(2)
 }
 
 async function load() {
@@ -251,5 +304,91 @@ onBeforeUnmount(() => {
 @media (max-width: 1100px) {
   .hub-dashboard__health { grid-template-columns: repeat(2, 1fr); }
   .hub-dashboard__stats { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Plan 6 Task 14：LLM 成本指标 */
+.hub-dashboard__llm-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.hub-dashboard__section-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+.hub-dashboard__llm-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.hub-dashboard__llm-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hub-dashboard__llm-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.hub-dashboard__llm-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.hub-dashboard__budget {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hub-dashboard__budget--alert {
+  border-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+}
+.hub-dashboard__budget-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--text);
+}
+.hub-dashboard__budget-pct {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.hub-dashboard__progress-bar {
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.hub-dashboard__progress-fill {
+  height: 100%;
+  background: var(--success);
+  border-radius: 4px;
+  transition: width 0.3s ease-out;
+}
+.hub-dashboard__budget--alert .hub-dashboard__progress-fill {
+  background: var(--warning);
+}
+.hub-dashboard__budget-alert-msg {
+  font-size: 13px;
+  color: var(--warning);
+  font-weight: 500;
+}
+@media (max-width: 1100px) {
+  .hub-dashboard__llm-grid { grid-template-columns: repeat(2, 1fr); }
 }
 </style>

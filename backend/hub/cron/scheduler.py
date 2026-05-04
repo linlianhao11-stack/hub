@@ -47,7 +47,7 @@ class CronScheduler:
         return decorator
 
     async def _run(self):
-        """主循环：算最近触发时刻 → 睡到那时 → 调 job → 重复。"""
+        """主循环：算最近触发时刻 → 睡到那时 → 调所有 due job → 重复。"""
         while not self._stop:
             if not self._jobs:
                 # 没注册 job，每分钟醒一次看看
@@ -67,17 +67,25 @@ class CronScheduler:
                     target += timedelta(days=1)
                 next_runs.append((target, fn))
             next_runs.sort(key=lambda x: x[0])
-            target, fn = next_runs[0]
-            sleep_seconds = (target - now).total_seconds()
+            earliest = next_runs[0][0]
+            sleep_seconds = (earliest - now).total_seconds()
             try:
-                await asyncio.sleep(sleep_seconds)
+                if sleep_seconds > 0:
+                    await asyncio.sleep(sleep_seconds)
                 if self._stop:
                     break
-                logger.info(f"cron 触发: {fn.__name__}")
-                try:
-                    await fn()
-                except Exception:
-                    logger.exception(f"cron job {fn.__name__} 失败")
+                # v2 加固（review C1）：同时刻所有 due job 都跑（不只 next_runs[0]）
+                # 原实现：只跑 next_runs[0]，导致同小时第 2+ 个注册的 job 永不触发
+                due = [(target, fn) for target, fn in next_runs if target == earliest]
+                for target, fn in due:
+                    logger.info("cron 触发: %s", fn.__name__)
+                    try:
+                        await fn()
+                    except Exception:
+                        logger.exception(
+                            "cron job %s 抛错，跳过本轮（其他 job 不受影响）",
+                            fn.__name__,
+                        )
             except asyncio.CancelledError:
                 break
 

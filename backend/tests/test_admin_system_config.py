@@ -138,3 +138,43 @@ async def test_set_writes_audit_log(admin_client):
     assert audit.target_type == "system_config"
     assert audit.target_id == "daily_audit_hour"
     assert audit.detail == {"value": 9}
+
+
+@pytest.mark.asyncio
+async def test_admin_can_update_business_dict(admin_client):
+    """v2 加固（review I2）：admin 通过 system_config UI 可编辑业务词典。"""
+    from hub.models import SystemConfig
+
+    custom = {"自定义术语": "管理员加的", "压货": "改了的描述"}
+    ac, _ = admin_client
+    resp = await ac.put(
+        "/hub/v1/admin/config/business_dict",
+        json={"value": custom},
+    )
+    assert resp.status_code == 200
+
+    # 验证写入
+    rec = await SystemConfig.filter(key="business_dict").first()
+    assert rec.value == custom
+
+
+@pytest.mark.asyncio
+async def test_admin_can_update_month_llm_budget(admin_client):
+    """v2 加固（review I1）：admin 可通过 system_config UI 配置月预算。"""
+    from hub.models import SystemConfig
+
+    ac, _ = admin_client
+    resp = await ac.put(
+        "/hub/v1/admin/config/month_llm_budget_yuan",
+        json={"value": 5000},
+    )
+    assert resp.status_code == 200
+
+    # 验证值已写入 DB
+    rec = await SystemConfig.get(key="month_llm_budget_yuan")
+    assert float(rec.value) == 5000.0
+
+    # 验证 dashboard 读到新值
+    resp2 = await ac.get("/hub/v1/admin/dashboard")
+    assert resp2.status_code == 200
+    assert resp2.json()["llm_cost"]["month_budget_yuan"] == 5000.0

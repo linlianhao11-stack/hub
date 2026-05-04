@@ -1,0 +1,22 @@
+name: 复用上份合同（"同样给 X 也来一份"）
+turns:
+  # T1: 先做翼蓝合同
+  - input: "给翼蓝做合同 X1 10 个 300，地址北京海淀，张三 13800001111"
+    expected_tool_calls_at_least: [search_customer, create_contract_draft]
+  # T2: confirm
+  - input: "是"
+    expected_tool_calls_at_least: [confirm_action]
+  # T3: 复用 — 给得帆同样内容（LLM 先查历史 + 找新客户;可能问"地址也用同样吗"）
+  - input: "同样的内容给得帆也做一份"
+    expected_tool_calls_at_least:
+      - get_recent_drafts        # ← 关键 tool: 查上份
+      - search_customer          # 找得帆 id
+    # 注：LLM 可能立即提交,也可能先问"地址用同样吗"再提交（都是合理 UX）
+    # 不强求 create_contract_draft 在本轮 — 由 T4 兜底
+  # T4: 用户明确回复"地址用同样的"→ bot 提交新合同
+  - input: "地址用同样的"
+    expected_tool_calls_at_least:
+      - create_contract_draft    # 提交新 pending（不论 T3 已提还是 T4 才提）
+  # T5: confirm 第二份
+  - input: "是"
+    expected_tool_calls_at_least: [confirm_action]

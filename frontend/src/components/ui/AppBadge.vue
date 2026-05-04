@@ -1,5 +1,5 @@
 <template>
-  <span :class="['badge', colorClass]">{{ label }}</span>
+  <span :class="['badge', colorClass]"><slot>{{ label }}</slot></span>
 </template>
 
 <script setup>

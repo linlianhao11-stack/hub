@@ -1,0 +1,133 @@
+# backend/tests/agent/fixtures/router_50_cases.yaml
+# 每个 case：input -> expected_intent
+# 用于 Router 准确率测试，要求 ≥ 95% PASS
+
+# --- chat (6 cases) ---
+- input: "你好"
+  intent: chat
+- input: "最近怎样"
+  intent: chat
+- input: "辛苦了"
+  intent: chat
+- input: "谢谢你"
+  intent: chat
+- input: "早安"
+  intent: chat
+- input: "今天天气真好"
+  intent: chat
+
+# --- query (8 cases) ---
+- input: "查 SKG 有哪些产品有库存"
+  intent: query
+- input: "看看阿里上个月订单"
+  intent: query
+- input: "X1 现在多少钱"
+  intent: query
+- input: "翼蓝最近欠了多少钱"
+  intent: query
+- input: "H5 现在库存还剩多少"
+  intent: query
+- input: "本月销售报表给我看看"
+  intent: query
+- input: "F1 的出货记录查一下"
+  intent: query
+- input: "帮我查一下客户阿里的信用额度"
+  intent: query
+
+# --- contract (6 cases) ---
+- input: "给阿里做合同 X1 10 个 300，地址北京"
+  intent: contract
+- input: "给翼蓝做合同 H5 10 个 300，F1 10 个 500"
+  intent: contract
+- input: "帮我给 SKG 起草合同，X1 20 个，单价 280"
+  intent: contract
+- input: "给阿里开单 F1 五件 500 块"
+  intent: contract
+- input: "给翼蓝做销售合同，产品 H5，数量 50"
+  intent: contract
+- input: "合同：客户阿里，X1×15 件，单价 300，发货地上海"
+  intent: contract
+
+# --- quote (6 cases) ---
+- input: "给阿里报 X1 50 个的价"
+  intent: quote
+- input: "给翼蓝报一下 H5 的价格"
+  intent: quote
+- input: "帮我出 SKG 要买 F1 100 个的报价单"
+  intent: quote
+- input: "做一张报价单，产品 X1，客户阿里"
+  intent: quote
+- input: "翼蓝问 H5 和 F1 各 30 个多少钱，帮我报个价"
+  intent: quote
+- input: "给阿里报 X1 的价，他要 200 个"
+  intent: quote
+
+# --- voucher (6 cases) ---
+- input: "出库 SO-202404-0001"
+  intent: voucher
+- input: "SO-202405-0012 出库"
+  intent: voucher
+- input: "帮我做 X1 20 个的出库凭证"
+  intent: voucher
+- input: "入库 PO-202404-0033"
+  intent: voucher
+- input: "H5 入库 50 件，做凭证"
+  intent: voucher
+- input: "生成出库单，产品 F1，数量 30"
+  intent: voucher
+
+# --- adjust_price (6 cases) ---
+- input: "把阿里的 X1 价格调到 280"
+  intent: adjust_price
+- input: "X1 给翼蓝的价格改成 260"
+  intent: adjust_price
+- input: "阿里那边 H5 单价降到 150"
+  intent: adjust_price
+- input: "把 F1 对 SKG 的价格调整一下，调到 400"
+  intent: adjust_price
+- input: "翼蓝的 X1 定价改 270"
+  intent: adjust_price
+- input: "X1 价格改成 295，客户是阿里"
+  intent: adjust_price
+
+# --- adjust_stock (6 cases) ---
+- input: "X1 库存调到 100"
+  intent: adjust_stock
+- input: "H5 库存减 20 个"
+  intent: adjust_stock
+- input: "F1 的库存增加 50"
+  intent: adjust_stock
+- input: "把 X1 库存设置为 200"
+  intent: adjust_stock
+- input: "SKG 的 H5 库存调高 30%"
+  intent: adjust_stock
+- input: "X1 现有库存不对，帮我改成 80"
+  intent: adjust_stock
+
+# --- confirm (6 cases) ---
+- input: "确认"
+  intent: confirm
+- input: "是"
+  intent: confirm
+- input: "好的"
+  intent: confirm
+- input: "yes"
+  intent: confirm
+- input: "是的"
+  intent: confirm
+- input: "可以"
+  intent: confirm
+
+# --- unknown (6 cases) ---
+- input: "嗯"
+  intent: unknown
+- input: "。。。"
+  intent: unknown
+- input: ""
+  intent: unknown
+- input: "😂😂😂"
+  intent: unknown
+- input: "???"
+  intent: unknown
+- input: "啊这"
+  intent: unknown

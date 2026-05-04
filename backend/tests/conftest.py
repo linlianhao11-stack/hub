@@ -6,6 +6,42 @@ from pathlib import Path
 import pytest
 from tortoise import Tortoise
 
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "eval: 真实 LLM eval 测试（CI 默认跳过；Task 19 单独跑 pytest -m eval）",
+    )
+    _load_dotenv_for_realllm_tests()
+
+
+def _load_dotenv_for_realllm_tests() -> None:
+    """Plan 6 v9 realllm 测试支持：从项目根 .env 加载 DEEPSEEK_API_KEY。
+
+    .env 已经在 .gitignore 里（包含 HUB_MASTER_KEY 等本地 secret）。
+    Plan 6 v9 跑真 LLM 测试需要 DEEPSEEK_API_KEY，统一从 .env 读，
+    不必每次 export。如果 env 里已显式 export，优先用 export 的值。
+    """
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return  # 已显式 export，优先
+    # 项目根 .env：backend/.. → 仓库根
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            # 只 setdefault，不覆盖已 export 的
+            if key and value:
+                os.environ.setdefault(key, value)
+    except OSError:
+        return  # 读不动就算，realllm 测试按 skipif 自动 SKIP
+
 # 让测试能 import backend/main.py（不在 hub/ 包内）
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(_BACKEND_ROOT) not in sys.path:
@@ -18,7 +54,20 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 TABLES_TO_TRUNCATE = [
-    # 顺序：FK 依赖逆序
+    # 顺序：FK 依赖逆序（子表先 truncate）
+    # Plan 6 子表（先 truncate）
+    "tool_call_log",
+    "contract_draft",
+    "voucher_draft",
+    "price_adjustment_request",
+    "stock_adjustment_request",
+    # Plan 6 父表 / 独立表
+    "conversation_log",
+    "contract_template",
+    "user_memory",
+    "customer_memory",
+    "product_memory",
+    # Plan 1-5 原有表
     "consumed_binding_token",  # Plan 3 新增
     "meta_audit_log", "audit_log", "task_payload", "task_log",
     "erp_user_state_cache",
@@ -48,6 +97,17 @@ async def setup_db():
         use_tz=True,
         timezone="Asia/Shanghai",
     )
+    # v8 staging review #20：模型新增字段 / 改约束的表，drop 后让 generate_schemas
+    # 用最新 schema 重建（safe=True 不会 ALTER 已存在表加新列，会导致 INDEX 引用
+    # 不存在的列报错）。
+    from tortoise import connections as _bootconns
+    _bootconn = _bootconns.get("default")
+    for _t in ("tool_call_log", "conversation_log", "contract_draft"):
+        try:
+            await _bootconn.execute_query(f'DROP TABLE IF EXISTS "{_t}" CASCADE')
+        except Exception:
+            pass
+
     await Tortoise.generate_schemas(safe=True)
 
     # generate_schemas(safe=True) 不会给已有表添加新的 unique_together 约束。
@@ -63,6 +123,84 @@ async def setup_db():
         )
     except Exception:
         pass  # 索引可能已存在或表还没建
+
+    # Plan 6 Task 1：generate_schemas(safe=True) 不会同步迁移里加的 CHECK 约束
+    # 和部分唯一索引；这里手工补齐让测试 DB 跟生产 DB 行为一致
+    try:
+        await _conn.execute_query(
+            "ALTER TABLE voucher_draft ADD CONSTRAINT chk_voucher_draft_status "
+            "CHECK (status IN ('pending','creating','created','approved','rejected'))"
+        )
+    except Exception:
+        pass  # 已存在则忽略
+
+    # Plan 6 Task 11：contract_template.file_storage_key 在生产迁移中是 TEXT，
+    # 但 generate_schemas(safe=True) 可能根据 ORM 旧模型生成 VARCHAR(500)。
+    # 手工 ALTER 确保测试 DB 与生产 DB 对齐（第一版 base64 存储需要 TEXT 无限制）
+    try:
+        await _conn.execute_query(
+            "ALTER TABLE contract_template "
+            "ALTER COLUMN file_storage_key TYPE TEXT"
+        )
+    except Exception:
+        pass  # 已是 TEXT 或表不存在则忽略
+
+    # 三张写草稿表的部分唯一索引
+    for _stmt in (
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_voucher_draft_action_id_unique '
+        'ON voucher_draft (requester_hub_user_id, confirmation_action_id) '
+        'WHERE confirmation_action_id IS NOT NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_price_adj_action_id_unique '
+        'ON price_adjustment_request (requester_hub_user_id, confirmation_action_id) '
+        'WHERE confirmation_action_id IS NOT NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_adj_action_id_unique '
+        'ON stock_adjustment_request (requester_hub_user_id, confirmation_action_id) '
+        'WHERE confirmation_action_id IS NOT NULL',
+    ):
+        try:
+            await _conn.execute_query(_stmt)
+        except Exception:
+            pass
+
+    # v8 staging review #17/#18：ContractDraft 加 extras + fingerprint + partial UNIQUE
+    for _stmt in (
+        'ALTER TABLE contract_draft ADD COLUMN IF NOT EXISTS extras JSONB NULL',
+        'ALTER TABLE contract_draft ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64) NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_draft_fingerprint '
+        'ON contract_draft (conversation_id, requester_hub_user_id, fingerprint) '
+        'WHERE fingerprint IS NOT NULL',
+    ):
+        try:
+            await _conn.execute_query(_stmt)
+        except Exception:
+            pass
+
+    # v8 staging review #20：ConversationLog 复合 unique + ToolCallLog 加 hub_user_id
+    # 旧测试 DB 可能残留单字段 unique，必须先 drop 再加复合
+    try:
+        await _conn.execute_query(
+            'ALTER TABLE conversation_log '
+            'DROP CONSTRAINT IF EXISTS conversation_log_conversation_id_key'
+        )
+    except Exception:
+        pass
+    try:
+        await _conn.execute_query(
+            'ALTER TABLE conversation_log '
+            'ADD CONSTRAINT uniq_conv_log_per_user '
+            'UNIQUE (conversation_id, hub_user_id)'
+        )
+    except Exception:
+        pass
+    for _stmt in (
+        'ALTER TABLE tool_call_log ADD COLUMN IF NOT EXISTS hub_user_id INTEGER NULL',
+        'CREATE INDEX IF NOT EXISTS idx_tool_call_log_conv_user '
+        'ON tool_call_log (conversation_id, hub_user_id)',
+    ):
+        try:
+            await _conn.execute_query(_stmt)
+        except Exception:
+            pass
 
     from tortoise import connections
     conn = connections.get("default")

@@ -1,0 +1,14 @@
+# backend/tests/agent/fixtures/scenarios/story5_quote.yaml
+# Plan 6 v9 Task 6.2 — 故事 5 报价 fixture
+# 完整真 LLM 跑要等 Phase 7 GraphAgent 顶层接入后 Task 8.1 yaml driver 跑
+name: 故事 5：报价
+turns:
+  - input: "给阿里报 X1 50 个的价"
+    expected_intent: quote
+    tool_caps:
+      search_customers: 1
+      search_products: 1
+      generate_price_quote: 1
+      check_inventory: 0
+    sent_files_min: 1
+    must_contain: ["报价单已生成"]

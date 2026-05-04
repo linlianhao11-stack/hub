@@ -1,0 +1,19 @@
+# backend/tests/agent/fixtures/scenarios/story6_adjust_price_confirm.yaml
+# Plan 6 v9 Task 5.5 — 故事 6 acceptance fixture
+# 完整真 LLM 跑要等 Phase 7 GraphAgent 顶层接入后 Task 8.1 yaml driver 跑
+name: 故事 6：调价 + ConfirmGate
+turns:
+  - input: "把阿里的 X1 价格调到 280"
+    expected_intent: adjust_price
+    tool_caps:
+      search_customers: 1
+      search_products: 1
+      get_customer_history: 1
+      create_price_adjustment_request: 0
+    must_contain: ["调价预览", "回复\"确认\""]
+    creates_pending_action: true
+  - input: "确认"
+    expected_intent: confirm
+    tool_caps:
+      create_price_adjustment_request: 1
+    must_contain: ["调价已申请"]

@@ -15,8 +15,8 @@
           <div><span>类型</span><strong>{{ detail.task_log.task_type }}</strong></div>
           <div><span>状态</span><strong><AppBadge :variant="statusVariant(detail.task_log.status)">{{ statusLabel(detail.task_log.status) }}</AppBadge></strong></div>
           <div><span>渠道用户</span><strong class="std-num">{{ detail.task_log.channel_userid }}</strong></div>
-          <div><span>解析器</span><strong>{{ detail.task_log.intent_parser || '-' }}</strong></div>
-          <div><span>置信度</span><strong class="std-num">{{ detail.task_log.intent_confidence != null ? detail.task_log.intent_confidence.toFixed(2) : '-' }}</strong></div>
+          <div><span>解析器</span><strong>{{ parserLabel(detail.task_log.intent_parser) }}</strong></div>
+          <div><span>置信度</span><strong class="std-num">{{ confidenceLabel(detail.task_log.intent_confidence) }}</strong></div>
           <div><span>创建时间</span><strong>{{ fmtDateTime(detail.task_log.created_at) }}</strong></div>
           <div><span>结束时间</span><strong>{{ fmtDateTime(detail.task_log.finished_at) }}</strong></div>
           <div><span>耗时</span><strong class="std-num">{{ detail.task_log.duration_ms ?? '-' }} ms</strong></div>
@@ -53,6 +53,13 @@
           </div>
         </template>
       </section>
+
+      <!-- Plan 6 Task 13：对话决策记录（仅当 conversation_log 非空时显示）-->
+      <AgentDecisionChain
+        v-if="detail.conversation_log"
+        :conversation-log="detail.conversation_log"
+        :tool-calls="detail.tool_calls || []"
+      />
     </template>
   </div>
 </template>
@@ -62,9 +69,10 @@ import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getTaskDetail } from '../../api/tasks'
 import { pickErrorDetail } from '../../api'
-import { fmtDateTime, statusLabel, statusVariant } from '../../utils/format'
+import { fmtDateTime, statusLabel, statusVariant, parserLabel, confidenceLabel } from '../../utils/format'
 import AppButton from '../../components/ui/AppButton.vue'
 import AppBadge from '../../components/ui/AppBadge.vue'
+import AgentDecisionChain from '../../components/admin/AgentDecisionChain.vue'
 
 const route = useRoute()
 const router = useRouter()

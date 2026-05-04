@@ -27,6 +27,8 @@ _KNOWN_KEYS = {
     "task_log_ttl_days": int,
     "daily_audit_hour": int,            # 0-23
     "low_confidence_threshold": float,  # 0-1
+    "month_llm_budget_yuan": float,     # 月度 LLM 预算（元）；int 自动转 float
+    "business_dict": dict,              # Plan 6 Task 17：业务词典；admin 可编辑覆盖默认
 }
 
 

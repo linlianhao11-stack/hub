@@ -13,6 +13,8 @@ docs/integration/2026-04-27-fuzzy-search-audit.md（ERP 仓库）。
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 
 from hub.circuit_breaker import CircuitBreaker
@@ -158,6 +160,23 @@ class Erp4Adapter:
             f"/api/v1/products/{product_id}", acting_as_user_id,
         )
 
+    async def get_customer(self, customer_id: int, *, acting_as_user_id: int | None) -> dict:
+        """ERP `/api/v1/customers/{id}`：单客户详情（精确反查，避免 keyword 搜索误匹配）。"""
+        return await self._act_as_get(
+            f"/api/v1/customers/{customer_id}", acting_as_user_id,
+        )
+
+    async def list_account_sets(self, *, acting_as_user_id: int | None) -> dict:
+        """ERP `/api/v1/account-sets`：列出所有账套（含 company_name / bank_name / bank_account 等
+        合同模板甲方所需字段）。"""
+        return await self._act_as_get("/api/v1/account-sets", acting_as_user_id)
+
+    async def get_account_set(self, set_id: int, *, acting_as_user_id: int | None) -> dict:
+        """ERP `/api/v1/account-sets/{id}`：单账套详情。"""
+        return await self._act_as_get(
+            f"/api/v1/account-sets/{set_id}", acting_as_user_id,
+        )
+
     async def get_product_customer_prices(
         self, product_id: int, customer_id: int, limit: int = 5,
         *, acting_as_user_id: int | None,
@@ -183,6 +202,99 @@ class Erp4Adapter:
 
         return await self._breaker.call(_do)
 
+    async def search_orders(
+        self, *,
+        customer_id: int | None = None,
+        since: datetime | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 200,
+        acting_as_user_id: int,
+    ) -> dict:
+        """ERP `/api/v1/orders`：按客户/时间/状态分页搜单。"""
+        params: dict = {"page": page, "page_size": page_size}
+        if customer_id is not None:
+            params["customer_id"] = customer_id
+        if since is not None:
+            params["since"] = since.isoformat()
+        if status:
+            params["status"] = status
+        return await self._act_as_get("/api/v1/orders", acting_as_user_id, params=params)
+
+    async def get_order_detail(self, order_id: int, *, acting_as_user_id: int) -> dict:
+        """ERP `/api/v1/orders/{order_id}`：订单详情。"""
+        return await self._act_as_get(f"/api/v1/orders/{order_id}", acting_as_user_id)
+
+    async def get_customer_balance(self, customer_id: int, *, acting_as_user_id: int) -> dict:
+        """ERP `/api/v1/finance/customer-statement/{customer_id}`：客户余额（应收/已付/未付）。"""
+        return await self._act_as_get(
+            f"/api/v1/finance/customer-statement/{customer_id}", acting_as_user_id,
+        )
+
+    async def get_inventory_aging(
+        self, *,
+        threshold_days: int = 90,
+        product_id: int | None = None,
+        warehouse_id: int | None = None,
+        acting_as_user_id: int,
+    ) -> dict:
+        """ERP `/api/v1/inventory/aging`：按库龄聚合滞销商品。
+
+        ⏳ 依赖 Task 18 ERP 新增 endpoint；Adapter 方法先写好，
+        测试仅验证 URL/params/headers 而不真打 ERP。
+        """
+        params: dict = {"threshold_days": threshold_days}
+        if product_id is not None:
+            params["product_id"] = product_id
+        if warehouse_id is not None:
+            params["warehouse_id"] = warehouse_id
+        return await self._act_as_get("/api/v1/inventory/aging", acting_as_user_id, params=params)
+
+    async def create_voucher(self, *, voucher_data: dict, client_request_id: str,
+                             acting_as_user_id: int) -> dict:
+        """ERP `POST /api/v1/vouchers` 创建凭证。
+
+        含 client_request_id 实现幂等（Task 18 ERP 加唯一约束 + idempotent_replay 返回）。
+        Task 18 完成前：ERP 会忽略此字段（不会去重；不报错）。
+        """
+        return await self._act_as_post(
+            "/api/v1/vouchers",
+            json={**voucher_data, "client_request_id": client_request_id},
+            acting_as_user_id=acting_as_user_id,
+        )
+
+    async def batch_approve_vouchers(self, *, voucher_ids: list[int],
+                                     acting_as_user_id: int) -> dict:
+        """ERP `POST /api/v1/vouchers/batch-approve`（已存在）。
+
+        返回 {success: list[int], failed: list[{id, reason}]}。
+        """
+        return await self._act_as_post(
+            "/api/v1/vouchers/batch-approve",
+            json={"voucher_ids": voucher_ids},
+            acting_as_user_id=acting_as_user_id,
+        )
+
+    async def upsert_customer_price_rule(self, *, customer_id: int, product_id: int,
+                                          new_price: float, reason: str | None = None,
+                                          client_request_id: str,
+                                          acting_as_user_id: int) -> dict:
+        """ERP `POST /api/v1/customer-price-rules`（Task 18 ERP 完成后才真有 endpoint）。
+
+        第一版仅写 adapter 方法骨架，让 audit_price_request 路由能编译。
+        """
+        return await self._act_as_post(
+            "/api/v1/customer-price-rules",
+            json={
+                "customer_id": customer_id,
+                "product_id": product_id,
+                "price": new_price,
+                "reason": reason,
+                "client_request_id": client_request_id,
+            },
+            acting_as_user_id=acting_as_user_id,
+        )
+
     # ------------- 私有 HTTP 方法 -------------
 
     def _system_headers(self) -> dict:
@@ -205,6 +317,25 @@ class Erp4Adapter:
         async def _do():
             try:
                 r = await self._client.post(path, headers=self._system_headers(), json=json)
+                self._raise_for_status(r)
+                return r.json()
+            except httpx.RequestError as e:
+                raise ErpSystemError(f"网络错误: {e}") from e
+        return await self._breaker.call(_do)
+
+    async def _act_as_post(
+        self, path: str, *, json: dict, acting_as_user_id: int,
+    ) -> dict:
+        if acting_as_user_id is None:
+            raise RuntimeError(
+                "Erp4Adapter 业务调用必须传 acting_as_user_id（spec §11 模型 Y 强制）",
+            )
+
+        async def _do():
+            try:
+                r = await self._client.post(
+                    path, headers=self._act_as_headers(acting_as_user_id), json=json,
+                )
                 self._raise_for_status(r)
                 return r.json()
             except httpx.RequestError as e:

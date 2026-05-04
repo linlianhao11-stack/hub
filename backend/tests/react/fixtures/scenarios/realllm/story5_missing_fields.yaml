@@ -1,0 +1,10 @@
+name: 缺字段 — bot 不调 tool 直接自然语言询问
+turns:
+  - input: "做合同 X1 10 个"
+    expected_tool_calls_zero:
+      - create_contract_draft
+    final_message_contains_any: ["客户", "地址", "联系人", "电话", "请告诉"]
+  - input: "翼蓝,300 块,北京海淀,张三,13800001111"
+    expected_tool_calls_at_least:
+      - search_customer
+      - create_contract_draft

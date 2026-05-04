@@ -23,6 +23,23 @@ dependencies = [
     "python-dateutil>=2.8",
     "structlog>=24.1",
     "dingtalk-stream>=0.18",
+    "tiktoken>=0.5",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    # Plan 6 ToolRegistry 用 jsonschema 验 tool args（registry.py:_validate_args）
+    # 本地 venv 因 transitive 装了所以一直可用；docker 镜像不带，必须显式声明
+    "jsonschema>=4.0",
+    # Plan 6 eval runner 加载 gold_set.yaml；当前由 dingtalk-stream / aerich 间接拉到，
+    # 但这是 Plan 6 自身用的依赖——显式声明防上游断链
+    "PyYAML>=6.0",
+    # Plan 6 v9 GraphAgent：LangGraph 状态机 + LangChain Core 基础类型
+    "langgraph>=0.2.0,<0.3",
+    "langchain-core>=0.3.0,<0.4",
+    "fakeredis>=2.35.1",
+    # Plan 6 v9 跨 worker 重启 checkpoint 持久化（之前用 in-process MemorySaver 重启即丢）
+    "langgraph-checkpoint-postgres>=2.0.0,<3",
+    "psycopg[binary]>=3.1",
+    "psycopg_pool>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +68,10 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 filterwarnings = [
     "ignore::DeprecationWarning",
+]
+markers = [
+    "eval: 真实 LLM eval 测试（CI 默认跳过；Task 19 单独跑 pytest -m eval）",
+    "realllm: 真实 LLM 集成测试（需要 DEEPSEEK_API_KEY；无 key 时全 skip）",
 ]
 
 [tool.ruff]
