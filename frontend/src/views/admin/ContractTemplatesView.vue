@@ -1,11 +1,12 @@
 <!--
   Plan 6 Task 11 admin 合同模板管理页。
 
-  TODO（follow-up）：当前文件行数较多，建议拆成：
-  - ContractTemplateUploadModal.vue（上传逻辑 + 文件输入 + form）
-  - ContractTemplatePlaceholdersModal.vue（占位符列表展示）
-  - ContractTemplateEditModal.vue（编辑元信息）
-  保持本 view 仅做"列表 + 路由 + 模态打开"。
+  弹窗已拆为子组件：
+  - contract-templates/TemplateUploadModal.vue（上传逻辑 + 文件输入 + form）
+  - contract-templates/TemplatePlaceholdersModal.vue（占位符列表展示）
+  - contract-templates/TemplatePreviewModal.vue（docx 预览 + mammoth）
+  - contract-templates/TemplateEditModal.vue（编辑元信息）
+  保持本 view 仅做"列表 + 筛选 + 弹窗调度 + toggleActive"。
 -->
 <template>
   <div class="hub-page">
@@ -14,7 +15,7 @@
         <h1 class="hub-page__title">合同模板管理</h1>
         <p class="hub-page__hint">上传 .docx 模板，系统自动识别 <code v-pre class="hint-code">{{占位符}}</code>，机器人生成合同时自动填充。</p>
       </div>
-      <AppButton variant="primary" size="sm" @click="openUpload">
+      <AppButton variant="primary" size="sm" @click="showUpload = true">
         <Plus class="btn-icon" :size="14" /> 上传模板
       </AppButton>
     </div>
@@ -90,248 +91,42 @@
       </AppTable>
     </AppCard>
 
-    <!-- 上传模板弹窗 -->
-    <AppModal
-      :visible="showUpload"
-      title="上传合同模板"
-      size="md"
-      @update:visible="(v) => { if (!v) closeUpload() }"
-    >
-      <form id="upload-form" @submit.prevent="handleUpload" class="modal-form">
-        <div class="form-field">
-          <label class="form-label" for="upload-name">模板名称 <span class="required">*</span></label>
-          <AppInput
-            id="upload-name"
-            v-model="uploadForm.name"
-            placeholder="如：标准销售合同 v2"
-            maxlength="200"
-          />
-        </div>
-
-        <div class="form-field">
-          <label class="form-label" for="upload-type">模板类型 <span class="required">*</span></label>
-          <AppSelect
-            id="upload-type"
-            v-model="uploadForm.template_type"
-            :options="typeOptionsRequired"
-          />
-        </div>
-
-        <div class="form-field">
-          <label class="form-label" for="upload-desc">描述（可选）</label>
-          <AppTextarea
-            id="upload-desc"
-            v-model="uploadForm.description"
-            placeholder="简要说明该模板适用场景…"
-            :rows="3"
-            maxlength="1000"
-          />
-        </div>
-
-        <div class="form-field">
-          <label class="form-label" for="upload-file">docx 文件 <span class="required">*</span></label>
-          <input
-            id="upload-file"
-            type="file"
-            accept=".docx"
-            class="file-input"
-            @change="onFileChange"
-            required
-          />
-          <p class="form-hint">仅支持 .docx，最大 5MB；文件中用 <code v-pre class="hint-code">{{变量名}}</code> 标记占位符，上传后自动识别</p>
-        </div>
-
-        <div v-if="uploadError" class="form-error">{{ uploadError }}</div>
-      </form>
-
-      <template #footer>
-        <AppButton variant="secondary" size="sm" @click="closeUpload">取消</AppButton>
-        <AppButton variant="primary" size="sm" :loading="uploading" type="submit" form="upload-form">
-          {{ uploading ? '上传中…' : '上传' }}
-        </AppButton>
-      </template>
-    </AppModal>
-
-    <!-- 占位符编辑弹窗（admin 给每个 {{xxx}} 起中文显示名）-->
-    <AppModal
-      :visible="showPlaceholdersModal"
-      :title="`「${currentTpl?.name || ''}」占位符设置`"
-      size="lg"
-      @update:visible="(v) => { if (!v) showPlaceholdersModal = false }"
-    >
-      <div v-if="!editPlaceholders.length" class="text-muted text-sm">该模板未识别到占位符</div>
-      <div v-else>
-        <p class="form-hint" style="margin-bottom: 12px;">
-          给每个占位符起一个中文显示名 — 用户在钉钉 / 预览页看到的是中文名,合同 docx 里仍然写 {{xxx}}。漏起名的会回退用代码。
-        </p>
-        <table class="ph-edit-table">
-          <thead>
-            <tr>
-              <th>代码</th>
-              <th>中文显示名</th>
-              <th>类型</th>
-              <th>必填</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="(ph, idx) in editPlaceholders" :key="ph.name">
-              <td><code class="placeholder-code">{{ phLabel(ph.name) }}</code></td>
-              <td>
-                <AppInput v-model="editPlaceholders[idx].label" size="sm" placeholder="如：客户名" />
-              </td>
-              <td>
-                <AppSelect v-model="editPlaceholders[idx].type" size="sm" :options="phTypeOptions" />
-              </td>
-              <td style="text-align: center;">
-                <input type="checkbox" v-model="editPlaceholders[idx].required" />
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-if="phEditError" class="form-error" style="margin-top: 8px;">{{ phEditError }}</div>
-      </div>
-      <template #footer>
-        <AppButton variant="secondary" size="sm" @click="showPlaceholdersModal = false">取消</AppButton>
-        <AppButton
-          v-if="editPlaceholders.length"
-          variant="primary"
-          size="sm"
-          :loading="phSaving"
-          @click="handleSavePlaceholders"
-        >保存</AppButton>
-      </template>
-    </AppModal>
-
-    <!-- docx 可视化预览（mammoth.js 转 HTML，占位符自动高亮）-->
-    <AppModal
-      :visible="showPreviewModal"
-      :title="`「${currentTpl?.name || ''}」模板预览`"
-      size="lg"
-      @update:visible="(v) => { if (!v) closePreview() }"
-    >
-      <div class="preview-toolbar">
-        <span class="preview-stat">
-          识别到 <strong>{{ currentPlaceholders.length }}</strong> 个占位符
-          <span v-if="currentPlaceholders.length" class="preview-stat-note">— 文档里黄底高亮的就是占位符位置</span>
-        </span>
-        <span v-if="previewError" class="preview-error">{{ previewError }}</span>
-      </div>
-      <div v-if="previewLoading" class="preview-loading">加载中…</div>
-      <div
-        v-else-if="previewHtml"
-        class="preview-content"
-        v-html="sanitizedPreviewHtml"
-      ></div>
-      <div v-else class="preview-empty">没有内容</div>
-      <template #footer>
-        <AppButton variant="secondary" size="sm" @click="closePreview">关闭</AppButton>
-      </template>
-    </AppModal>
-
-    <!-- 编辑元信息弹窗 -->
-    <AppModal
-      :visible="showEditModal"
-      title="编辑模板信息"
-      size="md"
-      @update:visible="(v) => { if (!v) showEditModal = false }"
-    >
-      <form id="edit-form" @submit.prevent="handleUpdate" class="modal-form">
-        <div class="form-field">
-          <label class="form-label" for="edit-name">模板名称</label>
-          <AppInput id="edit-name" v-model="editForm.name" maxlength="200" />
-        </div>
-        <div class="form-field">
-          <label class="form-label" for="edit-type">模板类型</label>
-          <AppSelect id="edit-type" v-model="editForm.template_type" :options="typeOptionsRequired" />
-        </div>
-        <div class="form-field">
-          <label class="form-label" for="edit-desc">描述</label>
-          <AppTextarea id="edit-desc" v-model="editForm.description" :rows="3" maxlength="1000" />
-        </div>
-        <div v-if="editError" class="form-error">{{ editError }}</div>
-      </form>
-      <template #footer>
-        <AppButton variant="secondary" size="sm" @click="showEditModal = false">取消</AppButton>
-        <AppButton variant="primary" size="sm" :loading="saving" type="submit" form="edit-form">保存</AppButton>
-      </template>
-    </AppModal>
+    <TemplateUploadModal :showUpload="showUpload" @close="showUpload = false" @uploaded="onUploaded" />
+    <TemplatePlaceholdersModal :showModal="showPlaceholdersModal" :template="currentTpl" @close="showPlaceholdersModal = false" @saved="onPlaceholdersSaved" />
+    <TemplatePreviewModal :showModal="showPreviewModal" :template="currentTpl" @close="showPreviewModal = false" />
+    <TemplateEditModal :showModal="showEditModal" :template="editTemplate" @close="showEditModal = false" @saved="onEditSaved" />
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
-import DOMPurify from 'dompurify'
+import { onMounted, ref } from 'vue'
 import { Plus } from 'lucide-vue-next'
 import { contractTemplatesApi } from '../../api/contract_templates'
 import { pickErrorDetail } from '../../api'
 import AppCard from '../../components/ui/AppCard.vue'
 import AppTable from '../../components/common/AppTable.vue'
-import AppModal from '../../components/ui/AppModal.vue'
 import AppButton from '../../components/ui/AppButton.vue'
-import AppInput from '../../components/ui/AppInput.vue'
-import AppSelect from '../../components/ui/AppSelect.vue'
-import AppTextarea from '../../components/ui/AppTextarea.vue'
 import AppBadge from '../../components/ui/AppBadge.vue'
+import AppSelect from '../../components/ui/AppSelect.vue'
+import TemplateUploadModal from './contract-templates/TemplateUploadModal.vue'
+import TemplatePlaceholdersModal from './contract-templates/TemplatePlaceholdersModal.vue'
+import TemplatePreviewModal from './contract-templates/TemplatePreviewModal.vue'
+import TemplateEditModal from './contract-templates/TemplateEditModal.vue'
 
-// ──────────────────────────────────────────────
 // 状态
-// ──────────────────────────────────────────────
-
 const items = ref([])
 const total = ref(0)
 const error = ref('')
 const filterType = ref('')
 const filterActive = ref('')
-
-// 上传弹窗
 const showUpload = ref(false)
-const uploading = ref(false)
-const uploadError = ref('')
-const uploadForm = ref({ name: '', template_type: 'sales', description: '', file: null })
-
-// 占位符弹窗
 const showPlaceholdersModal = ref(false)
-const currentTpl = ref(null)
-const currentPlaceholders = ref([])
-// 占位符编辑（深拷贝 currentPlaceholders 给 admin 改 label / type / required）
-const editPlaceholders = ref([])
-const phSaving = ref(false)
-const phEditError = ref('')
-const phTypeOptions = [
-  { value: 'string', label: '文本' },
-  { value: 'number', label: '数字' },
-  { value: 'date', label: '日期' },
-  { value: 'money', label: '金额' },
-  { value: 'phone', label: '电话' },
-]
-
-// docx 可视化预览弹窗（mammoth.js 转 HTML）
 const showPreviewModal = ref(false)
-const previewLoading = ref(false)
-const previewError = ref('')
-const previewHtml = ref('')
-
-// DOMPurify 过滤 mammoth 输出，防止恶意 docx 注入 HTML/JS。
-// title/data-name 必须保留 — 占位符高亮 span 需要 title 显示原代码,data-name 给 JS 反查。
-const sanitizedPreviewHtml = computed(() => {
-  if (!previewHtml.value) return ''
-  return DOMPurify.sanitize(previewHtml.value, {
-    ALLOWED_TAGS: ['p', 'br', 'b', 'i', 'u', 'strong', 'em', 'span', 'table', 'tr', 'td', 'th', 'thead', 'tbody', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'a', 'div', 'mark'],
-    ALLOWED_ATTR: ['class', 'style', 'href', 'target', 'title', 'data-name'],
-  })
-})
-
-// 编辑弹窗
 const showEditModal = ref(false)
-const saving = ref(false)
-const editError = ref('')
-const editingId = ref(null)
-const editForm = ref({ name: '', template_type: 'sales', description: '' })
+const currentTpl = ref(null)
+const editTemplate = ref(null)
 
-// ──────────────────────────────────────────────
 // 选项数据
-// ──────────────────────────────────────────────
-
 const typeOptions = [
   { value: '', label: '所有类型' },
   { value: 'sales', label: '销售合同' },
@@ -340,31 +135,16 @@ const typeOptions = [
   { value: 'quote', label: '报价单' },
   { value: 'other', label: '其他' },
 ]
-
-const typeOptionsRequired = typeOptions.filter((o) => o.value !== '')
-
 const activeOptions = [
   { value: '', label: '所有状态' },
   { value: 'true', label: '启用' },
   { value: 'false', label: '禁用' },
 ]
-
 const TYPE_LABEL_MAP = {
   sales: '销售合同', purchase: '采购合同', framework: '框架协议',
   quote: '报价单', other: '其他',
 }
-
-function typeLabel(t) {
-  return TYPE_LABEL_MAP[t] || t
-}
-
-/** 将占位符名称格式化为 {{name}} 展示文本。 */
-function phLabel(name) {
-  const lb = '\x7B\x7B'  // {{
-  const rb = '\x7D\x7D'  // }}
-  return lb + name + rb
-}
-
+function typeLabel(t) { return TYPE_LABEL_MAP[t] || t }
 function fmtDateTime(iso) {
   if (!iso) return '-'
   return new Date(iso).toLocaleString('zh-CN', {
@@ -373,10 +153,7 @@ function fmtDateTime(iso) {
   })
 }
 
-// ──────────────────────────────────────────────
 // 数据加载
-// ──────────────────────────────────────────────
-
 async function load() {
   error.value = ''
   try {
@@ -391,186 +168,26 @@ async function load() {
   }
 }
 
-// ──────────────────────────────────────────────
-// 上传
-// ──────────────────────────────────────────────
-
-function openUpload() {
-  uploadForm.value = { name: '', template_type: 'sales', description: '', file: null }
-  uploadError.value = ''
-  showUpload.value = true
-}
-
-function closeUpload() {
-  showUpload.value = false
-  uploadError.value = ''
-}
-
-function onFileChange(e) {
-  uploadForm.value.file = e.target.files[0] || null
-}
-
-async function handleUpload() {
-  if (!uploadForm.value.file) {
-    uploadError.value = '请选择 .docx 文件'
-    return
-  }
-  if (!uploadForm.value.name.trim()) {
-    uploadError.value = '请填写模板名称'
-    return
-  }
-  uploading.value = true
-  uploadError.value = ''
-  try {
-    await contractTemplatesApi.upload(uploadForm.value)
-    closeUpload()
-    await load()
-  } catch (e) {
-    uploadError.value = pickErrorDetail(e, '上传失败，请检查文件格式')
-  } finally {
-    uploading.value = false
-  }
-}
-
-// ──────────────────────────────────────────────
-// 占位符查看
-// ──────────────────────────────────────────────
-
-function openPlaceholders(tpl) {
-  currentTpl.value = tpl
-  currentPlaceholders.value = tpl.placeholders || []
-  // 深拷贝 — 编辑时不脏 list 数据,取消时直接关 modal 即可
-  editPlaceholders.value = (tpl.placeholders || []).map((p) => ({
-    name: p.name,
-    label: p.label || p.name,  // 后端 _enrich_placeholders 应该已经填了,这里兜底
-    type: p.type || 'string',
-    required: p.required !== false,
-  }))
-  phEditError.value = ''
-  showPlaceholdersModal.value = true
-}
-
-async function handleSavePlaceholders() {
-  if (!currentTpl.value) return
-  phEditError.value = ''
-  phSaving.value = true
-  try {
-    const res = await contractTemplatesApi.updatePlaceholders(
-      currentTpl.value.id,
-      editPlaceholders.value,
-    )
-    // 同步 currentPlaceholders + 列表里这条记录的 placeholders
-    const updated = res.data?.placeholders || editPlaceholders.value
-    currentPlaceholders.value = updated
+// 弹窗调度
+function openPlaceholders(tpl) { currentTpl.value = tpl; showPlaceholdersModal.value = true }
+function openPreview(tpl) { currentTpl.value = tpl; showPreviewModal.value = true }
+function openEdit(tpl) { editTemplate.value = tpl; showEditModal.value = true }
+async function onUploaded() { showUpload.value = false; await load() }
+function onPlaceholdersSaved(updatedPlaceholders) {
+  if (currentTpl.value) {
     const idx = items.value.findIndex((it) => it.id === currentTpl.value.id)
-    if (idx >= 0) items.value[idx].placeholders = updated
-    showPlaceholdersModal.value = false
-  } catch (e) {
-    phEditError.value = pickErrorDetail(e, '保存失败')
-  } finally {
-    phSaving.value = false
+    if (idx >= 0) items.value[idx].placeholders = updatedPlaceholders
   }
+  showPlaceholdersModal.value = false
 }
+async function onEditSaved() { showEditModal.value = false; await load() }
 
-// ──────────────────────────────────────────────
-// docx 可视化预览（mammoth.js 转 HTML，占位符高亮）
-// ──────────────────────────────────────────────
-
-/** 把渲染后的 HTML 中所有 `{{xxx}}` 文本节点替换为高亮 span。
- *  span 显示**中文 label**（admin 起的中文显示名）,鼠标 hover 在 title 里显示原代码。
- *  `labels` 是 `{name → label}` 查表,缺则回退到代码 `{{name}}`。
- */
-function _highlightPlaceholders(html, labels = {}) {
-  return html.replace(
-    /\{\{([\w一-龥]+)\}\}/g,
-    (match, name) => {
-      const label = labels[name] || name  // 没 label 用 name
-      // 显示中文 label（不带 {{ }}）;hover 显示代码,方便 admin 核对
-      return `<span class="ph-highlight" data-name="${name}" title="占位符代码: ${match}">${label}</span>`
-    },
-  )
-}
-
-async function openPreview(tpl) {
-  currentTpl.value = tpl
-  currentPlaceholders.value = tpl.placeholders || []
-  previewError.value = ''
-  previewHtml.value = ''
-  previewLoading.value = true
-  showPreviewModal.value = true
-  try {
-    // 拿 docx 字节流
-    const resp = await contractTemplatesApi.getFile(tpl.id)
-    const arrayBuffer = resp.data  // axios responseType=arraybuffer 直接给 ArrayBuffer
-    // 懒加载 mammoth（避免初始 bundle 加 ~200KB）
-    const mammoth = (await import('mammoth')).default || (await import('mammoth'))
-    const result = await mammoth.convertToHtml({ arrayBuffer })
-    // 构造 name→label 查表,占位符高亮显示中文 label 而不是代码
-    const labels = {}
-    for (const ph of currentPlaceholders.value) {
-      if (ph.name) labels[ph.name] = ph.label || ph.name
-    }
-    previewHtml.value = _highlightPlaceholders(result.value || '', labels)
-    if (result.messages?.length) {
-      console.warn('mammoth 转换警告:', result.messages)
-    }
-  } catch (e) {
-    previewError.value = pickErrorDetail(e, '加载预览失败')
-  } finally {
-    previewLoading.value = false
-  }
-}
-
-function closePreview() {
-  showPreviewModal.value = false
-  previewHtml.value = ''
-  previewError.value = ''
-}
-
-// ──────────────────────────────────────────────
-// 编辑元信息
-// ──────────────────────────────────────────────
-
-function openEdit(tpl) {
-  editingId.value = tpl.id
-  editForm.value = {
-    name: tpl.name,
-    template_type: tpl.template_type,
-    description: tpl.description || '',
-  }
-  editError.value = ''
-  showEditModal.value = true
-}
-
-async function handleUpdate() {
-  saving.value = true
-  editError.value = ''
-  try {
-    await contractTemplatesApi.update(editingId.value, editForm.value)
-    showEditModal.value = false
-    await load()
-  } catch (e) {
-    editError.value = pickErrorDetail(e, '保存失败')
-  } finally {
-    saving.value = false
-  }
-}
-
-// ──────────────────────────────────────────────
 // 启用 / 禁用
-// ──────────────────────────────────────────────
-
 async function toggleActive(tpl) {
   try {
-    if (tpl.is_active) {
-      await contractTemplatesApi.disable(tpl.id)
-    } else {
-      await contractTemplatesApi.enable(tpl.id)
-    }
+    if (tpl.is_active) { await contractTemplatesApi.disable(tpl.id) } else { await contractTemplatesApi.enable(tpl.id) }
     await load()
-  } catch (e) {
-    error.value = pickErrorDetail(e, '操作失败')
-  }
+  } catch (e) { error.value = pickErrorDetail(e, '操作失败') }
 }
 
 onMounted(load)
@@ -599,27 +216,6 @@ onMounted(load)
 .row-actions { display: flex; align-items: center; gap: 4px; justify-content: flex-end; }
 .action-danger { color: var(--error) !important; }
 .action-success { color: var(--success) !important; }
-
-/* 弹窗表单 */
-.modal-form { display: flex; flex-direction: column; gap: 14px; }
-.form-field { display: flex; flex-direction: column; gap: 4px; }
-.form-label { font-size: 13px; font-weight: 500; color: var(--text); }
-.required { color: var(--error); margin-left: 2px; }
-.form-hint { font-size: 11px; color: var(--text-muted); margin: 4px 0 0; }
-.form-error {
-  background: color-mix(in srgb, var(--error) 10%, transparent);
-  color: var(--error);
-  border: 1px solid color-mix(in srgb, var(--error) 25%, transparent);
-  border-radius: 4px;
-  padding: 6px 8px;
-  font-size: 12px;
-}
-.file-input {
-  font-size: 13px;
-  color: var(--text);
-  cursor: pointer;
-  padding: 4px 0;
-}
 .hint-code {
   font-family: var(--font-mono, monospace);
   font-size: 11px;
@@ -627,131 +223,5 @@ onMounted(load)
   padding: 1px 4px;
   border-radius: 3px;
   color: var(--text-secondary);
-}
-
-/* 占位符列表 */
-.placeholder-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0; }
-.placeholder-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 4px;
-  border-bottom: 1px solid var(--border);
-}
-.placeholder-item:last-child { border-bottom: none; }
-.placeholder-code {
-  font-family: var(--font-mono, monospace);
-  font-size: 12px;
-  color: var(--primary);
-  background: color-mix(in srgb, var(--primary) 8%, transparent);
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-.placeholder-meta { display: flex; align-items: center; gap: 6px; }
-.ph-type { font-size: 11px; color: var(--text-muted); }
-.ph-required {
-  font-size: 10px;
-  background: color-mix(in srgb, var(--warning) 15%, transparent);
-  color: var(--warning);
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-weight: 500;
-}
-
-/* 占位符编辑表格 */
-.ph-edit-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-.ph-edit-table th {
-  background: var(--bg-secondary, #f7f7f8);
-  text-align: left;
-  padding: 8px 10px;
-  font-weight: 600;
-  font-size: 12px;
-  color: var(--text-muted);
-  border-bottom: 1px solid var(--border, #e5e7eb);
-}
-.ph-edit-table td {
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border, #f0f0f0);
-  vertical-align: middle;
-}
-.ph-edit-table tr:last-child td { border-bottom: none; }
-
-/* docx 可视化预览 */
-.preview-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 12px;
-  margin-bottom: 12px;
-  background: var(--bg-secondary, #f7f7f8);
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 6px;
-  font-size: 12px;
-}
-.preview-stat strong { color: var(--brand, #4a5568); font-size: 14px; }
-.preview-stat-note { color: var(--text-muted); margin-left: 6px; }
-.preview-error { color: var(--error); }
-.preview-loading {
-  padding: 40px;
-  text-align: center;
-  color: var(--text-muted);
-}
-.preview-empty {
-  padding: 40px;
-  text-align: center;
-  color: var(--text-muted);
-}
-.preview-content {
-  max-height: 65vh;
-  overflow-y: auto;
-  padding: 24px 32px;
-  background: white;
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 6px;
-  font-family: var(--font-primary);
-  font-size: 14px;
-  line-height: 1.7;
-  color: #111;
-}
-/* mammoth 输出的元素基本样式（保留 docx 大致排版感）*/
-.preview-content :deep(h1) { font-size: 20px; font-weight: 600; margin: 16px 0 12px; }
-.preview-content :deep(h2) { font-size: 17px; font-weight: 600; margin: 14px 0 10px; }
-.preview-content :deep(h3) { font-size: 15px; font-weight: 600; margin: 12px 0 8px; }
-.preview-content :deep(p) { margin: 8px 0; }
-.preview-content :deep(table) {
-  border-collapse: collapse;
-  width: 100%;
-  margin: 12px 0;
-  font-size: 13px;
-}
-.preview-content :deep(td),
-.preview-content :deep(th) {
-  border: 1px solid #ccc;
-  padding: 6px 10px;
-  text-align: left;
-  vertical-align: top;
-}
-.preview-content :deep(th) { background: #f3f4f6; font-weight: 600; }
-.preview-content :deep(strong) { font-weight: 600; }
-.preview-content :deep(em) { font-style: italic; }
-
-/* 占位符高亮：黄底圆角,鼠标悬停 cursor 变 help */
-.preview-content :deep(.ph-highlight) {
-  background: #fef3c7;
-  color: #92400e;
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-family: var(--font-mono);
-  font-weight: 600;
-  font-size: 0.95em;
-  cursor: help;
-  border: 1px solid #fde68a;
-}
-.preview-content :deep(.ph-highlight:hover) {
-  background: #fde68a;
 }
 </style>

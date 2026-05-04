@@ -144,31 +144,12 @@
     </AppCard>
 
     <!-- 详情弹窗 -->
-    <AppModal
-      :visible="!!detailRow"
-      :title="detailTitle"
-      size="lg"
-      @update:visible="(v) => { if (!v) detailRow = null }"
-    >
-      <div v-if="detailRow" class="detail-content">
-        <table class="detail-table">
-          <tbody>
-            <tr v-for="(val, key) in detailFields" :key="key">
-              <td class="detail-key">{{ key }}</td>
-              <td class="detail-val">
-                <template v-if="typeof val === 'object' && val !== null">
-                  <pre class="detail-json">{{ JSON.stringify(val, null, 2) }}</pre>
-                </template>
-                <template v-else>{{ val ?? '-' }}</template>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <template #footer>
-        <AppButton variant="secondary" size="sm" @click="detailRow = null">关闭</AppButton>
-      </template>
-    </AppModal>
+    <ApprovalDetailModal
+      :detail-row="detailRow"
+      :current-tab="currentTab"
+      :current-tab-label="currentTabLabel"
+      @close="detailRow = null"
+    />
 
     <!-- M1: 批量通过二次确认 modal（替换 confirm()） -->
     <AppModal
@@ -188,114 +169,26 @@
     </AppModal>
 
     <!-- I3: 批量审批结果 modal（替换 alert，展示 reason） -->
-    <AppModal
-      v-if="resultData"
-      :visible="!!resultData"
-      :title="resultTitle"
-      size="md"
-      @update:visible="(v) => { if (!v) resultData = null }"
-    >
-      <div class="result-sections">
-        <div class="result-section result-section--success" v-if="(resultData.approved_count || 0) > 0">
-          <h4 class="result-section__title result-section__title--success">
-            已通过 {{ resultData.approved_count }} 条
-          </h4>
-        </div>
-        <div class="result-section result-section--success" v-if="(resultData.rejected_count || 0) > 0">
-          <h4 class="result-section__title result-section__title--success">
-            已拒绝 {{ resultData.rejected_count }} 条
-          </h4>
-        </div>
-        <div class="result-section" v-if="resultData.in_progress?.length">
-          <h4 class="result-section__title result-section__title--warning">
-            处理中 {{ resultData.in_progress.length }} 条（请稍后刷新）
-          </h4>
-          <ul class="result-list">
-            <li v-for="item in resultData.in_progress" :key="item.draft_id">
-              <span class="result-id">#{{ item.draft_id }}</span>{{ item.reason || '正在被另一会话处理' }}
-            </li>
-          </ul>
-        </div>
-        <div class="result-section" v-if="resultData.creation_failed?.length">
-          <h4 class="result-section__title result-section__title--error">
-            创建失败 {{ resultData.creation_failed.length }} 条
-          </h4>
-          <ul class="result-list">
-            <li v-for="item in resultData.creation_failed" :key="item.draft_id">
-              <span class="result-id">#{{ item.draft_id }}</span>{{ item.reason || '创建失败' }}
-            </li>
-          </ul>
-        </div>
-        <div class="result-section" v-if="resultData.approve_failed?.length">
-          <h4 class="result-section__title result-section__title--error">
-            审批失败 {{ resultData.approve_failed.length }} 条
-          </h4>
-          <ul class="result-list">
-            <li v-for="item in resultData.approve_failed" :key="item.draft_id">
-              <span class="result-id">#{{ item.draft_id }}</span>{{ item.reason || '审批失败' }}
-            </li>
-          </ul>
-        </div>
-        <!-- price / stock 通用 failed 字段 -->
-        <div class="result-section" v-if="resultData.failed?.length">
-          <h4 class="result-section__title result-section__title--error">
-            失败 {{ resultData.failed.length }} 条
-          </h4>
-          <ul class="result-list">
-            <li v-for="item in resultData.failed" :key="item.request_id ?? item.draft_id">
-              <span class="result-id">#{{ item.request_id ?? item.draft_id }}</span>{{ item.reason || '处理失败' }}
-            </li>
-          </ul>
-        </div>
-      </div>
-      <template #footer>
-        <AppButton variant="primary" size="sm" @click="resultData = null">知道了</AppButton>
-      </template>
-    </AppModal>
+    <ApprovalsResultModal
+      :result-data="resultData"
+      :result-title="resultTitle"
+      @close="resultData = null"
+    />
 
     <!-- 批量拒绝 reason 输入弹窗 -->
-    <AppModal
-      :visible="showRejectModal"
-      title="批量拒绝"
-      size="sm"
-      @update:visible="(v) => { if (!v) closeRejectModal() }"
-    >
-      <!-- M7: useId 生成 form id -->
-      <form :id="rejectFormId" @submit.prevent="handleBatchReject" class="modal-form">
-        <div class="form-field">
-          <label class="form-label" :for="rejectFormId + '-reason'">
-            拒绝原因 <span class="required">*</span>
-          </label>
-          <AppTextarea
-            :id="rejectFormId + '-reason'"
-            v-model="rejectReason"
-            placeholder="请填写拒绝原因（最多 500 字）"
-            :rows="3"
-            maxlength="500"
-            required
-          />
-        </div>
-        <div v-if="rejectError" class="form-error">{{ rejectError }}</div>
-      </form>
-      <template #footer>
-        <AppButton variant="secondary" size="sm" @click="closeRejectModal">取消</AppButton>
-        <AppButton
-          variant="danger"
-          size="sm"
-          :loading="rejecting"
-          :disabled="!rejectReason.trim()"
-          type="submit"
-          :form="rejectFormId"
-        >
-          确认拒绝
-        </AppButton>
-      </template>
-    </AppModal>
+    <ApprovalRejectModal
+      :show-reject-modal="showRejectModal"
+      :selected-ids="selectedIds"
+      :current-tab-label="currentTabLabel"
+      :rejecting="rejecting"
+      @close="showRejectModal = false"
+      @submit="onRejectSubmit"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, useId } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { RefreshCw } from 'lucide-vue-next'
 import { approvalsApi } from '../../api/approvals'
 import { pickErrorDetail } from '../../api'
@@ -307,12 +200,11 @@ import AppTable from '../../components/common/AppTable.vue'
 import AppModal from '../../components/ui/AppModal.vue'
 import AppButton from '../../components/ui/AppButton.vue'
 import AppSelect from '../../components/ui/AppSelect.vue'
-import AppTextarea from '../../components/ui/AppTextarea.vue'
 import AppCheckbox from '../../components/ui/AppCheckbox.vue'
 import AppPagination from '../../components/ui/AppPagination.vue'
-
-// M7: useId 生成稳定 form id
-const rejectFormId = useId()
+import ApprovalDetailModal from './approvals/ApprovalDetailModal.vue'
+import ApprovalsResultModal from './approvals/ApprovalsResultModal.vue'
+import ApprovalRejectModal from './approvals/ApprovalRejectModal.vue'
 
 // ────────────────────────────────────────
 // Tab 定义
@@ -341,8 +233,6 @@ const selectedIds = ref([])
 const detailRow = ref(null)
 
 const showRejectModal = ref(false)
-const rejectReason = ref('')
-const rejectError = ref('')
 const rejecting = ref(false)
 const approving = ref(false)
 
@@ -497,58 +387,10 @@ const allSelectedLabel = computed(() => {
   return `全选所有 ${currentRows.value.length} 条`
 })
 
-const detailTitle = computed(() => {
-  if (!detailRow.value) return ''
-  return `${currentTabLabel.value} 详情 #${detailRow.value.id}`
-})
-
 // I3: 结果 modal 标题
 const resultTitle = computed(() => {
   const tabLabel = currentTabLabel.value
   return `${tabLabel} 批量操作结果`
-})
-
-const detailFields = computed(() => {
-  if (!detailRow.value) return {}
-  const row = detailRow.value
-  if (currentTab.value === 'voucher') {
-    return {
-      'ID': row.id,
-      '申请人 ID': row.requester_hub_user_id != null ? `#${row.requester_hub_user_id}` : '-',
-      '凭证类型': row.rule_matched ?? '-',
-      '状态': voucherStatusLabel(row.status),
-      '凭证数据': row.voucher_data,
-      'ERP 凭证 ID': row.erp_voucher_id ?? '-',
-      '拒绝原因': row.rejection_reason ?? '-',
-      '处理开始时间': fmtDateTime(row.creating_started_at),
-      '创建时间': fmtDateTime(row.created_at),
-    }
-  }
-  if (currentTab.value === 'price') {
-    return {
-      'ID': row.id,
-      '申请人 ID': row.requester_hub_user_id != null ? `#${row.requester_hub_user_id}` : '-',
-      '客户 ID': row.customer_id,
-      '商品 ID': row.product_id,
-      '当前价格': fmtNumber(row.current_price, 2),
-      '申请新价格': fmtNumber(row.new_price, 2),
-      '折扣比例': row.discount_pct != null ? (row.discount_pct * 100).toFixed(2) + '%' : '-',
-      '申请原因': row.reason ?? '-',
-      '状态': voucherStatusLabel(row.status),
-      '创建时间': fmtDateTime(row.created_at),
-    }
-  }
-  // stock
-  return {
-    'ID': row.id,
-    '申请人 ID': row.requester_hub_user_id != null ? `#${row.requester_hub_user_id}` : '-',
-    '商品 ID': row.product_id,
-    '仓库 ID': row.warehouse_id,
-    '调整数量': fmtNumber(row.adjustment_qty, 0),
-    '申请原因': row.reason ?? '-',
-    '状态': voucherStatusLabel(row.status),
-    '创建时间': fmtDateTime(row.created_at),
-  }
 })
 
 // ────────────────────────────────────────
@@ -690,43 +532,30 @@ async function executeBatchApprove() {
 // ────────────────────────────────────────
 
 function openRejectModal() {
-  rejectReason.value = ''
-  rejectError.value = ''
   showRejectModal.value = true
 }
 
-function closeRejectModal() {
-  showRejectModal.value = false
-  rejectReason.value = ''
-  rejectError.value = ''
-}
-
-async function handleBatchReject() {
-  if (!rejectReason.value.trim()) {
-    rejectError.value = '请填写拒绝原因'
-    return
-  }
+async function onRejectSubmit(rejectReason) {
   rejecting.value = true
-  rejectError.value = ''
   try {
     let data
     if (currentTab.value === 'voucher') {
-      const resp = await approvalsApi.batchRejectVoucher(selectedIds.value, rejectReason.value)
+      const resp = await approvalsApi.batchRejectVoucher(selectedIds.value, rejectReason)
       data = resp.data
     } else if (currentTab.value === 'price') {
-      const resp = await approvalsApi.batchRejectPrice(selectedIds.value, rejectReason.value)
+      const resp = await approvalsApi.batchRejectPrice(selectedIds.value, rejectReason)
       data = resp.data
     } else {
-      const resp = await approvalsApi.batchRejectStock(selectedIds.value, rejectReason.value)
+      const resp = await approvalsApi.batchRejectStock(selectedIds.value, rejectReason)
       data = resp.data
     }
     // I3: 拒绝结果也用 resultData modal 展示
     resultData.value = data
-    closeRejectModal()
+    showRejectModal.value = false
     selectedIds.value = []
     await loadCurrentTab()
   } catch (e) {
-    rejectError.value = pickErrorDetail(e, '批量拒绝失败，请重试')
+    pageError.value = '批量拒绝失败：' + pickErrorDetail(e, '请求失败')
   } finally {
     rejecting.value = false
   }
@@ -868,131 +697,5 @@ onMounted(loadCurrentTab)
   color: var(--text);
   margin: 0 0 4px;
   line-height: 1.6;
-}
-
-/* I3: 结果 modal */
-.result-sections {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.result-section {
-  border-radius: 6px;
-  padding: 10px 12px;
-  background: var(--elevated);
-}
-
-.result-section__title {
-  font-size: 13px;
-  font-weight: 600;
-  margin: 0 0 6px;
-}
-
-.result-section__title--success { color: var(--success-emphasis); }
-.result-section__title--warning { color: var(--warning-emphasis); }
-.result-section__title--error   { color: var(--error); }
-
-.result-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.result-list li {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.5;
-}
-
-.result-id {
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-right: 6px;
-}
-
-/* 详情弹窗 */
-.detail-content {
-  max-height: 60vh;
-  overflow-y: auto;
-}
-
-.detail-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.detail-table tr {
-  border-bottom: 1px solid var(--border);
-}
-
-.detail-table tr:last-child {
-  border-bottom: none;
-}
-
-.detail-key {
-  width: 130px;
-  padding: 8px 12px 8px 0;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  vertical-align: top;
-  white-space: nowrap;
-}
-
-.detail-val {
-  padding: 8px 0;
-  font-size: 13px;
-  color: var(--text);
-  word-break: break-all;
-}
-
-.detail-json {
-  white-space: pre-wrap;
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  background: var(--elevated);
-  padding: 8px 10px;
-  border-radius: 4px;
-  margin: 0;
-  max-height: 200px;
-  overflow: auto;
-}
-
-/* 拒绝弹窗表单 */
-.modal-form {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.form-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.form-label {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.required {
-  color: var(--error);
-  margin-left: 2px;
-}
-
-.form-error {
-  background: color-mix(in srgb, var(--error) 10%, transparent);
-  color: var(--error);
-  border: 1px solid color-mix(in srgb, var(--error) 25%, transparent);
-  border-radius: 4px;
-  padding: 6px 8px;
-  font-size: 12px;
 }
 </style>

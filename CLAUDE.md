@@ -53,6 +53,21 @@ C 阶段（当前）目标：钉钉机器人闭环 — 用户绑定钉钉账号 
 - **拒绝向后兼容遗留**：删干净，别留 `_unused` / `// removed` / 已废弃的 re-export
 - **错误处理只在系统边界**（用户输入、外部 API），内部代码相信类型和不变量
 
+### 250 行豁免清单
+
+以下文件超 250 行但职责单一，拆分会损害可读性，不拆：
+
+| 文件 | 行数 | 豁免理由 |
+|---|---|---|
+| `backend/hub/agent/tools/confirm_gate.py` | ~840 | Redis CAS 写门禁状态机，单一职责 |
+| `backend/hub/agent/document/contract.py` | ~590 | docx 渲染引擎，工具函数是渲染流程的有机组成 |
+| `backend/hub/agent/tools/registry.py` | ~410 | tool 注册-调用中心，schema 构建和调用是同一生命周期 |
+| `backend/hub/adapters/downstream/erp4.py` | ~380 | HTTP 适配器，18 处引用的全局核心 |
+| `backend/hub/agent/llm_client.py` | ~370 | 两个 client 共享 retry/error 逻辑 |
+| `backend/hub/handlers/dingtalk_inbound.py` | ~400 | 入站消息处理入口，fallback 是降级分支不是独立职责 |
+| `backend/hub/routers/setup_full.py` | ~370 | setup 向导线性流水线 |
+| `backend/hub/seed.py` | ~320 | 一次性启动种子脚本 |
+
 ### UI 大白话原则（最重要）
 
 **UI 文案必须中文大白话，绝对禁止暴露任何代码标识符**：

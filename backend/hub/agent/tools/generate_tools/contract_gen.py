@@ -1,10 +1,4 @@
-"""Plan 6 Task 7：生成型 tool（合同 / 报价 / Excel）。
-
-特点：
-- ToolType.GENERATE（不需 confirmation_action_id；register-time 不强制）
-- 输出对请求人本人（生成 docx/xlsx + 钉钉发文件）
-- 重复调用允许（每次新 draft；不强制幂等）
-"""
+"""合同生成 tool（合同草稿 docx → 钉钉发文件）。"""
 from __future__ import annotations
 
 import hashlib
@@ -12,18 +6,18 @@ import json
 import logging
 from datetime import date
 
-from hub.adapters.channel.dingtalk_sender import DingTalkSender, DingTalkSendError
-from hub.adapters.downstream.erp4 import Erp4Adapter, ErpAdapterError, ErpNotFoundError
+from hub.adapters.channel.dingtalk_sender import DingTalkSendError
+from hub.adapters.downstream.erp4 import ErpAdapterError, ErpNotFoundError
 from hub.agent.document.contract import (
     ContractRenderer,
     TemplateNotFoundError,
     TemplateRenderError,
 )
-from hub.agent.document.excel import ExcelExporter
-from hub.agent.tools.registry import ToolRegistry
-from hub.agent.tools.types import ToolType
-from hub.models.contract import ContractDraft, ContractTemplate
-from hub.models.identity import ChannelUserBinding
+from hub.agent.tools.generate_tools import current_erp_adapter, current_sender
+
+logger = logging.getLogger("hub.agent.tools.generate_tools")
+
+import hub.agent.tools.generate_tools as _gt
 
 
 def _normalize_for_fingerprint(value):
@@ -51,8 +45,6 @@ def _compute_contract_fingerprint(
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-logger = logging.getLogger("hub.agent.tools.generate_tools")
 
 
 # ===== Plan 6 v9 Task 2.2：strict tool schema（spec §1.3 / §5.2）=====
@@ -144,92 +136,6 @@ GENERATE_CONTRACT_DRAFT_SCHEMA: dict = {
     },
     "_subgraphs": ["contract"],
 }
-
-GENERATE_PRICE_QUOTE_SCHEMA: dict = {
-    "type": "function",
-    "function": {
-        "name": "generate_price_quote",
-        "strict": True,
-        "description": "生成客户报价单 docx 并发到钉钉",
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "customer_id",
-                "items",
-                "extras",
-            ],
-            "properties": {
-                "customer_id": {
-                    "type": "integer",
-                    "description": "ERP 客户 ID，必须用 search_customers 真返过的 id",
-                },
-                "items": {
-                    "type": "array",
-                    "description": "商品列表，每项含 product_id/name/qty/price；如无传 []",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["product_id", "qty", "price"],
-                        "properties": {
-                            "product_id": {
-                                "type": "integer",
-                                "description": "ERP 商品 ID（必须用 search_products 真返过的 id）",
-                            },
-                            "qty": {
-                                "type": "number",
-                                "description": "数量（必须大于 0）",
-                            },
-                            "price": {
-                                "type": "number",
-                                "description": "单价（必须大于 0）",
-                            },
-                        },
-                    },
-                },
-                "extras": {
-                    "type": "object",
-                    "description": "模板自定义占位符（极少用），如无传 {}",
-                    "additionalProperties": True,
-                },
-            },
-        },
-    },
-    "_subgraphs": ["quote"],
-}
-
-
-# 模块单例（与 erp_tools 同模式）
-_dingtalk_sender: DingTalkSender | None = None
-_erp_adapter: Erp4Adapter | None = None
-
-
-def set_dependencies(
-    *,
-    sender: DingTalkSender | None,
-    erp: Erp4Adapter | None,
-) -> None:
-    """app startup 调；测试 fixture 注入 mock。"""
-    global _dingtalk_sender, _erp_adapter
-    _dingtalk_sender = sender
-    _erp_adapter = erp
-
-
-def current_sender() -> DingTalkSender:
-    if _dingtalk_sender is None:
-        raise RuntimeError(
-            "DingTalkSender 未初始化（startup 必须先调 set_dependencies）"
-        )
-    return _dingtalk_sender
-
-
-def current_erp_adapter() -> Erp4Adapter:
-    if _erp_adapter is None:
-        raise RuntimeError("Erp4Adapter 未初始化（startup 必须先调 set_dependencies）")
-    return _erp_adapter
-
-
-# ===== 3 个 tool =====
 
 
 async def generate_contract_draft(
@@ -434,7 +340,7 @@ async def generate_contract_draft(
         items=items,
         extras=merged_extras,
     )
-    draft = await ContractDraft.filter(
+    draft = await _gt.ContractDraft.filter(
         conversation_id=conversation_id,
         requester_hub_user_id=hub_user_id,
         fingerprint=fingerprint,
@@ -462,7 +368,7 @@ async def generate_contract_draft(
         # create 抛 IntegrityError 时回查 first() 拿对端 race winner 的 draft 复用
         from tortoise.exceptions import IntegrityError
         try:
-            draft = await ContractDraft.create(
+            draft = await _gt.ContractDraft.create(
                 template_id=template_id,
                 requester_hub_user_id=hub_user_id,
                 customer_id=customer_id,
@@ -478,7 +384,7 @@ async def generate_contract_draft(
                 "ContractDraft fingerprint 并发 race，回查复用 conv=%s fp=%s",
                 conversation_id, fingerprint[:16],
             )
-            draft = await ContractDraft.filter(
+            draft = await _gt.ContractDraft.filter(
                 conversation_id=conversation_id,
                 requester_hub_user_id=hub_user_id,
                 fingerprint=fingerprint,
@@ -493,7 +399,7 @@ async def generate_contract_draft(
 
     # 4. 发钉钉
     sender = current_sender()
-    binding = await ChannelUserBinding.filter(
+    binding = await _gt.ChannelUserBinding.filter(
         hub_user_id=hub_user_id,
         channel_type="dingtalk",
         status="active",
@@ -530,126 +436,3 @@ async def generate_contract_draft(
         "file_sent": True,
         "file_name": file_name,
     }
-
-
-async def generate_price_quote(
-    customer_id: int,
-    items: list[dict],
-    extras: dict | None = None,
-    *,
-    hub_user_id: int,
-    conversation_id: str,
-    acting_as_user_id: int,
-) -> dict:
-    """生成报价单 docx（同 generate_contract_draft 模式但用报价模板）。
-
-    简化第一版：自动找第一个 active 的 quote 类型模板。
-    """
-    # sentinel 归一化（spec §1.3 v3.4）：LLM 传 {} 当 optional → 归一化成 {} 已 ok；extras={} 保持
-    extras = extras or {}
-
-    template = await ContractTemplate.filter(
-        template_type="quote",
-        is_active=True,
-    ).first()
-    if not template:
-        logger.warning(
-            "用户 hub_user_id=%s 调 generate_price_quote 但无 quote 模板 conv=%s",
-            hub_user_id, conversation_id,
-        )
-        return {
-            "draft_id": None,
-            "file_sent": False,
-            "error": "未配置报价模板，请先在管理后台创建 template_type=quote 的模板",
-        }
-    # 复用 generate_contract_draft 实现
-    return await generate_contract_draft(
-        template_id=template.id,
-        customer_id=customer_id,
-        items=items,
-        extras=extras,
-        hub_user_id=hub_user_id,
-        conversation_id=conversation_id,
-        acting_as_user_id=acting_as_user_id,
-    )
-
-
-async def export_to_excel(
-    table_data: list[dict],
-    file_name: str,
-    *,
-    hub_user_id: int,
-    conversation_id: str,
-    acting_as_user_id: int,
-) -> dict:
-    """把 list[dict] 导出 .xlsx 并发到钉钉。
-
-    Args:
-        table_data: 表格数据（key = 列名）
-        file_name: 文件名（自动补 .xlsx 后缀）
-    """
-    if not file_name.endswith(".xlsx"):
-        file_name += ".xlsx"
-
-    exporter = ExcelExporter()
-    xlsx_bytes = await exporter.export(table_data=table_data)
-
-    sender = current_sender()
-    binding = await ChannelUserBinding.filter(
-        hub_user_id=hub_user_id,
-        channel_type="dingtalk",
-        status="active",
-    ).first()
-    if not binding:
-        return {
-            "file_sent": False,
-            "warning": "用户未绑定钉钉，文件未发送",
-        }
-
-    try:
-        await sender.send_file(
-            dingtalk_userid=binding.channel_userid,
-            file_bytes=xlsx_bytes,
-            file_name=file_name,
-            file_type="xlsx",
-        )
-    except DingTalkSendError:
-        logger.exception("export_to_excel send_file 失败 file=%s", file_name)
-        raise
-
-    return {
-        "file_sent": True,
-        "file_name": file_name,
-        "rows_count": len(table_data),
-    }
-
-
-# ===== register =====
-
-
-def register_all(registry: ToolRegistry) -> None:
-    """3 个 GENERATE 类 tool 注册。
-
-    GENERATE 类不强制 confirmation_action_id（register fail-fast 不触发）。
-    """
-    registry.register(
-        "generate_contract_draft",
-        generate_contract_draft,
-        perm="usecase.generate_contract.use",
-        tool_type=ToolType.GENERATE,
-        description="生成销售合同草稿 docx 并发到钉钉",
-    )
-    registry.register(
-        "generate_price_quote",
-        generate_price_quote,
-        perm="usecase.generate_quote.use",
-        tool_type=ToolType.GENERATE,
-        description="生成客户报价单 docx 并发到钉钉",
-    )
-    registry.register(
-        "export_to_excel",
-        export_to_excel,
-        perm="usecase.export.use",
-        tool_type=ToolType.GENERATE,
-        description="把表格数据导出成 .xlsx 发到钉钉",
-    )
