@@ -131,12 +131,21 @@ class DeepSeekChatModel(BaseChatModel):
             invalid_calls = []
             for tc in resp.tool_calls:
                 try:
+                    parsed_args = json.loads(tc["function"]["arguments"])
+                    # AIMessage.tool_calls[*].args 期望 dict — 合法 JSON 但不是 object
+                    # （如 "[]" / "null" / "\"some string\""）也要降级,防 Pydantic
+                    # ValidationError 在 LangGraph 编排里炸掉整个 turn。
+                    if not isinstance(parsed_args, dict):
+                        raise TypeError(
+                            f"tool_call.function.arguments 必须是 JSON object,"
+                            f"实际 {type(parsed_args).__name__}: {parsed_args!r}"
+                        )
                     valid_calls.append({
                         "id": tc["id"],
                         "name": tc["function"]["name"],
-                        "args": json.loads(tc["function"]["arguments"]),
+                        "args": parsed_args,
                     })
-                except (json.JSONDecodeError, KeyError) as e:
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
                     logger.warning(
                         "DeepSeek 返回 tool_call 解析失败,降级为 invalid_tool_call: %s — tc=%r",
                         e, tc,

@@ -125,3 +125,41 @@ async def test_deepseek_chat_model_handles_malformed_tool_call_args():
     assert len(result.invalid_tool_calls) == 1
     assert result.invalid_tool_calls[0]["name"] == "search_product"
     assert "not-valid-json" in result.invalid_tool_calls[0].get("args", "")
+
+
+@pytest.mark.asyncio
+async def test_deepseek_chat_model_handles_non_dict_tool_call_args():
+    """DeepSeek 偶发返合法 JSON 但不是 object（如 "[]" / "null" / "\\"str\\""）—
+    AIMessage.tool_calls[*].args 期望 dict,直接放进去会让 Pydantic 校验报 ValidationError
+    打死整个 turn。wrapper 必须降级为 invalid_tool_call。
+    """
+    from hub.agent.react.llm import DeepSeekChatModel
+    from hub.agent.llm_client import DeepSeekLLMClient
+    from langchain_core.messages import HumanMessage
+    from unittest.mock import MagicMock
+
+    async def chat_with_array_args(*, messages, **kwargs):
+        return type("R", (), {
+            "text": "",
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                {"id": "list-1", "function": {"name": "search_customer", "arguments": "[]"}},
+                {"id": "null-2", "function": {"name": "search_product", "arguments": "null"}},
+                {"id": "ok-3", "function": {"name": "search_customer", "arguments": '{"query": "X"}'}},
+            ],
+            "usage": {}, "cache_hit_rate": 0.0,
+        })()
+
+    fake_client = MagicMock(spec=DeepSeekLLMClient)
+    fake_client.chat = chat_with_array_args
+
+    model = DeepSeekChatModel(deepseek_client=fake_client)
+    result = await model.ainvoke([HumanMessage(content="hi")])
+
+    # 1 个合法 dict args 进 tool_calls
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["args"] == {"query": "X"}
+    # 2 个非 dict 进 invalid_tool_calls
+    assert len(result.invalid_tool_calls) == 2
+    assert result.invalid_tool_calls[0]["args"] == "[]"
+    assert result.invalid_tool_calls[1]["args"] == "null"

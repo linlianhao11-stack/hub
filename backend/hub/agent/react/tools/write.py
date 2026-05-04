@@ -17,10 +17,13 @@ execute 阶段（LLM 调 confirm_action(action_id)）：
 不是 React tool 名（"create_contract_draft"）。这样 dispatch 直接按底层函数名查表。
 """
 from __future__ import annotations
+from typing import Any, Awaitable, Callable
+
 from langchain_core.tools import tool
 
 from hub.agent.react.context import tool_ctx
 from hub.agent.react.tools._confirm_helper import create_pending_action
+from hub.observability.tool_logger import log_tool_call
 from hub.permissions import require_permissions
 
 
@@ -44,6 +47,34 @@ def _format_items_preview(items: list[dict]) -> str:
             f"{i}. 商品 id={it.get('product_id')} × {it.get('qty')} 件 @ {it.get('price')}"
         )
     return "\n  ".join(parts)
+
+
+async def _audit_plan_phase(
+    *,
+    react_tool_name: str,
+    react_tool_args: dict,
+    body: Callable[[], Awaitable[dict]],
+) -> dict:
+    """plan 阶段统一审计 wrapper —— 把 LLM 调用 + 校验结果 + create_pending 全程包到
+    `log_tool_call` 里写 tool_call_log。
+
+    跟 invoke_business_tool（read tool 用）模式对齐：require_permissions 在 wrapper
+    外面（perm denial 抛 BizError 不在审计里）；validation / create_pending /
+    业务返值都被 log_tool_call 捕获。
+    """
+    c = tool_ctx.get()
+    if c is None:
+        return {"error": "tool_ctx 未 set"}
+    async with log_tool_call(
+        conversation_id=c["conversation_id"],
+        hub_user_id=c["hub_user_id"],
+        round_idx=0,
+        tool_name=react_tool_name,
+        args=react_tool_args,
+    ) as log_ctx:
+        result = await body()
+        log_ctx.set_result(result)
+        return result
 
 
 @tool
@@ -77,42 +108,58 @@ async def create_contract_draft(
 
     await require_permissions(c["hub_user_id"], ["usecase.generate_contract.use"])
 
-    if not items:
-        return {"error": "items 不能为空,合同至少要有一项商品"}
-    if not customer_id:
-        return {"error": "customer_id 必须传"}
-
-    template_id = await _resolve_default_template_id()
-    if template_id is None:
-        return {"error": "未启用销售合同模板,请联系管理员到 admin 后台上传"}
-
-    payload = {
-        "tool_name": "generate_contract_draft",
-        "args": {
-            "template_id": template_id,
-            "customer_id": customer_id,
-            "items": items,
-            "shipping_address": shipping_address,
-            "shipping_contact": shipping_contact,
-            "shipping_phone": shipping_phone,
-            "payment_terms": payment_terms,
-            "tax_rate": tax_rate,
-        },
+    react_args = {
+        "customer_id": customer_id,
+        "items": items,
+        "shipping_address": shipping_address,
+        "shipping_contact": shipping_contact,
+        "shipping_phone": shipping_phone,
+        "payment_terms": payment_terms,
+        "tax_rate": tax_rate,
     }
 
-    summary = (
-        f"将给客户 id={customer_id} 生成销售合同：\n"
-        f"  {_format_items_preview(items)}\n"
-        f"  收货：{shipping_address} / {shipping_contact} / {shipping_phone}"
+    async def _body() -> dict:
+        if not items:
+            return {"error": "items 不能为空,合同至少要有一项商品"}
+        if not customer_id:
+            return {"error": "customer_id 必须传"}
+
+        template_id = await _resolve_default_template_id()
+        if template_id is None:
+            return {"error": "未启用销售合同模板,请联系管理员到 admin 后台上传"}
+
+        payload = {
+            "tool_name": "generate_contract_draft",
+            "args": {
+                "template_id": template_id,
+                "customer_id": customer_id,
+                "items": items,
+                "shipping_address": shipping_address,
+                "shipping_contact": shipping_contact,
+                "shipping_phone": shipping_phone,
+                "payment_terms": payment_terms,
+                "tax_rate": tax_rate,
+            },
+        }
+        summary = (
+            f"将给客户 id={customer_id} 生成销售合同：\n"
+            f"  {_format_items_preview(items)}\n"
+            f"  收货：{shipping_address} / {shipping_contact} / {shipping_phone}"
+        )
+        pending = await create_pending_action(
+            subgraph="contract", summary=summary, payload=payload,
+        )
+        return {
+            "status": "pending_confirmation",
+            "action_id": pending.action_id,
+            "preview": summary,
+        }
+
+    return await _audit_plan_phase(
+        react_tool_name="create_contract_draft",
+        react_tool_args=react_args,
+        body=_body,
     )
-    pending = await create_pending_action(
-        subgraph="contract", summary=summary, payload=payload,
-    )
-    return {
-        "status": "pending_confirmation",
-        "action_id": pending.action_id,
-        "preview": summary,
-    }
 
 
 @tool
@@ -131,35 +178,50 @@ async def create_quote_draft(
         return {"error": "tool_ctx 未 set"}
     await require_permissions(c["hub_user_id"], ["usecase.generate_quote.use"])
 
-    if not items:
-        return {"error": "items 不能为空"}
-    if not customer_id:
-        return {"error": "customer_id 必须传"}
-
-    extras: dict = {}
-    if shipping_address:
-        extras["shipping_address"] = shipping_address
-    if shipping_contact:
-        extras["shipping_contact"] = shipping_contact
-    if shipping_phone:
-        extras["shipping_phone"] = shipping_phone
-
-    payload = {
-        "tool_name": "generate_price_quote",
-        "args": {
-            "customer_id": customer_id,
-            "items": items,
-            "extras": extras,
-        },
+    react_args = {
+        "customer_id": customer_id,
+        "items": items,
+        "shipping_address": shipping_address,
+        "shipping_contact": shipping_contact,
+        "shipping_phone": shipping_phone,
     }
-    summary = (
-        f"将给客户 id={customer_id} 生成报价单：\n"
-        f"  {_format_items_preview(items)}"
+
+    async def _body() -> dict:
+        if not items:
+            return {"error": "items 不能为空"}
+        if not customer_id:
+            return {"error": "customer_id 必须传"}
+
+        extras: dict = {}
+        if shipping_address:
+            extras["shipping_address"] = shipping_address
+        if shipping_contact:
+            extras["shipping_contact"] = shipping_contact
+        if shipping_phone:
+            extras["shipping_phone"] = shipping_phone
+
+        payload = {
+            "tool_name": "generate_price_quote",
+            "args": {
+                "customer_id": customer_id,
+                "items": items,
+                "extras": extras,
+            },
+        }
+        summary = (
+            f"将给客户 id={customer_id} 生成报价单：\n"
+            f"  {_format_items_preview(items)}"
+        )
+        pending = await create_pending_action(
+            subgraph="quote", summary=summary, payload=payload,
+        )
+        return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
+
+    return await _audit_plan_phase(
+        react_tool_name="create_quote_draft",
+        react_tool_args=react_args,
+        body=_body,
     )
-    pending = await create_pending_action(
-        subgraph="quote", summary=summary, payload=payload,
-    )
-    return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
 
 
 @tool
@@ -183,24 +245,33 @@ async def create_voucher_draft(
         return {"error": "tool_ctx 未 set"}
     await require_permissions(c["hub_user_id"], ["usecase.create_voucher.use"])
 
-    if not isinstance(voucher_data, dict) or not voucher_data:
-        return {"error": "voucher_data 必须是非空 dict（含 entries / total_amount / summary）"}
+    react_args = {"voucher_data": voucher_data, "rule_matched": rule_matched}
 
-    payload = {
-        "tool_name": "create_voucher_draft",
-        "args": {
-            "voucher_data": voucher_data,
-            "rule_matched": rule_matched or None,
-        },
-    }
-    total = voucher_data.get("total_amount", "?")
-    desc = voucher_data.get("summary", "<无摘要>")
-    summary = f"将提交财务凭证草稿:总额 {total},摘要：{desc}"
-    pending = await create_pending_action(
-        subgraph="voucher", summary=summary, payload=payload,
-        use_idempotency=True,
+    async def _body() -> dict:
+        if not isinstance(voucher_data, dict) or not voucher_data:
+            return {"error": "voucher_data 必须是非空 dict（含 entries / total_amount / summary）"}
+
+        payload = {
+            "tool_name": "create_voucher_draft",
+            "args": {
+                "voucher_data": voucher_data,
+                "rule_matched": rule_matched or None,
+            },
+        }
+        total = voucher_data.get("total_amount", "?")
+        desc = voucher_data.get("summary", "<无摘要>")
+        summary = f"将提交财务凭证草稿:总额 {total},摘要：{desc}"
+        pending = await create_pending_action(
+            subgraph="voucher", summary=summary, payload=payload,
+            use_idempotency=True,
+        )
+        return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
+
+    return await _audit_plan_phase(
+        react_tool_name="create_voucher_draft",
+        react_tool_args=react_args,
+        body=_body,
     )
-    return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
 
 
 @tool
@@ -213,31 +284,43 @@ async def request_price_adjustment(
         return {"error": "tool_ctx 未 set"}
     await require_permissions(c["hub_user_id"], ["usecase.adjust_price.use"])
 
-    if not customer_id or not product_id:
-        return {"error": "customer_id 和 product_id 必须传"}
-    if new_price <= 0:
-        return {"error": "new_price 必须 > 0"}
-    if not reason or len(reason) < 2:
-        return {"error": "reason 必须填写（≥2 字）"}
-
-    payload = {
-        "tool_name": "create_price_adjustment_request",
-        "args": {
-            "customer_id": customer_id,
-            "product_id": product_id,
-            "new_price": new_price,
-            "reason": reason,
-        },
+    react_args = {
+        "customer_id": customer_id, "product_id": product_id,
+        "new_price": new_price, "reason": reason,
     }
-    summary = (
-        f"将提交客户 id={customer_id} 商品 id={product_id} 调价至 {new_price}。\n"
-        f"理由：{reason}\n等 admin 审批后生效。"
+
+    async def _body() -> dict:
+        if not customer_id or not product_id:
+            return {"error": "customer_id 和 product_id 必须传"}
+        if new_price <= 0:
+            return {"error": "new_price 必须 > 0"}
+        if not reason or len(reason) < 2:
+            return {"error": "reason 必须填写（≥2 字）"}
+
+        payload = {
+            "tool_name": "create_price_adjustment_request",
+            "args": {
+                "customer_id": customer_id,
+                "product_id": product_id,
+                "new_price": new_price,
+                "reason": reason,
+            },
+        }
+        summary = (
+            f"将提交客户 id={customer_id} 商品 id={product_id} 调价至 {new_price}。\n"
+            f"理由：{reason}\n等 admin 审批后生效。"
+        )
+        pending = await create_pending_action(
+            subgraph="adjust_price", summary=summary, payload=payload,
+            use_idempotency=True,
+        )
+        return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
+
+    return await _audit_plan_phase(
+        react_tool_name="request_price_adjustment",
+        react_tool_args=react_args,
+        body=_body,
     )
-    pending = await create_pending_action(
-        subgraph="adjust_price", summary=summary, payload=payload,
-        use_idempotency=True,
-    )
-    return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
 
 
 @tool
@@ -253,32 +336,44 @@ async def request_stock_adjustment(
         return {"error": "tool_ctx 未 set"}
     await require_permissions(c["hub_user_id"], ["usecase.adjust_stock.use"])
 
-    if not product_id:
-        return {"error": "product_id 必须传"}
-    if adjustment_qty == 0:
-        return {"error": "adjustment_qty 不能为 0"}
-    if not reason or len(reason) < 2:
-        return {"error": "reason 必须填写（≥2 字）"}
-
-    args = {
-        "product_id": product_id,
-        "adjustment_qty": adjustment_qty,
-        "reason": reason,
+    react_args = {
+        "product_id": product_id, "adjustment_qty": adjustment_qty,
+        "reason": reason, "warehouse_id": warehouse_id,
     }
-    if warehouse_id:
-        args["warehouse_id"] = warehouse_id
 
-    payload = {
-        "tool_name": "create_stock_adjustment_request",
-        "args": args,
-    }
-    sign = "+" if adjustment_qty > 0 else ""
-    summary = (
-        f"将提交商品 id={product_id} 库存调整 {sign}{adjustment_qty}。\n"
-        f"理由：{reason}\n等 admin 审批后生效。"
+    async def _body() -> dict:
+        if not product_id:
+            return {"error": "product_id 必须传"}
+        if adjustment_qty == 0:
+            return {"error": "adjustment_qty 不能为 0"}
+        if not reason or len(reason) < 2:
+            return {"error": "reason 必须填写（≥2 字）"}
+
+        args = {
+            "product_id": product_id,
+            "adjustment_qty": adjustment_qty,
+            "reason": reason,
+        }
+        if warehouse_id:
+            args["warehouse_id"] = warehouse_id
+
+        payload = {
+            "tool_name": "create_stock_adjustment_request",
+            "args": args,
+        }
+        sign = "+" if adjustment_qty > 0 else ""
+        summary = (
+            f"将提交商品 id={product_id} 库存调整 {sign}{adjustment_qty}。\n"
+            f"理由：{reason}\n等 admin 审批后生效。"
+        )
+        pending = await create_pending_action(
+            subgraph="adjust_stock", summary=summary, payload=payload,
+            use_idempotency=True,
+        )
+        return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}
+
+    return await _audit_plan_phase(
+        react_tool_name="request_stock_adjustment",
+        react_tool_args=react_args,
+        body=_body,
     )
-    pending = await create_pending_action(
-        subgraph="adjust_stock", summary=summary, payload=payload,
-        use_idempotency=True,
-    )
-    return {"status": "pending_confirmation", "action_id": pending.action_id, "preview": summary}

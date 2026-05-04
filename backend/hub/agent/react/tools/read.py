@@ -141,12 +141,24 @@ async def analyze_top_customers(period: str = "近一月", top_n: int = 10) -> d
 async def _query_recent_contract_drafts(
     conversation_id: str, hub_user_id: int, limit: int,
 ) -> list[dict]:
-    """查 ContractDraft sent 的最近 limit 条 — 抽成 helper 便于 mock。"""
+    """查 ContractDraft sent 的最近 limit 条（**仅 sales 类型**） — 抽成 helper 便于 mock。
+
+    **关键过滤**：ContractDraft 表被合同 + 报价单共用（generate_price_quote 也写 ContractDraft）,
+    本 tool 只为"复用上份合同"场景服务,所以必须按 ContractTemplate.template_type='sales'
+    过滤,防止用户做过报价后 LLM 误把报价当合同复用。
+    """
+    from hub.models.contract import ContractTemplate
+    sales_template_ids = await ContractTemplate.filter(
+        template_type="sales",
+    ).values_list("id", flat=True)
+    if not sales_template_ids:
+        return []  # 无任何 sales 模板,自然没合同草稿
     drafts = await (
         ContractDraft.filter(
             conversation_id=conversation_id,
             requester_hub_user_id=hub_user_id,
             status="sent",
+            template_id__in=list(sales_template_ids),
         )
         .order_by("-created_at")
         .limit(limit)

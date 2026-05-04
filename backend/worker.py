@@ -24,6 +24,7 @@ async def main():
     from hub.agent.react.llm import build_chat_model
     from hub.agent.react.tools import ALL_TOOLS
     from hub.agent.react.tools._confirm_helper import set_confirm_gate
+    from hub.agent.tools import draft_tools, erp_tools, generate_tools
     from hub.agent.tools.confirm_gate import ConfirmGate
     from hub.agent.types import AgentResult
     from hub.capabilities.factory import load_active_ai_provider
@@ -100,6 +101,13 @@ async def main():
     # 1. ConfirmGate（写门禁 pending/confirmed 状态）
     confirm_gate = ConfirmGate(redis_client)
     set_confirm_gate(confirm_gate)
+
+    # 1b. ReAct read/write tool 全局依赖注入 — 跟 main.py(gateway) 一致。
+    # 不注入会导致 worker 进程里 current_erp_adapter() / current_sender() 抛
+    # "ERP adapter / DingTalkSender 未初始化"，钉钉真测直接挂。
+    erp_tools.set_erp_adapter(erp_adapter)
+    draft_tools.set_erp_adapter(erp_adapter)
+    generate_tools.set_dependencies(sender=sender, erp=erp_adapter)
 
     # 2. chat model（ReActAgent 使用 LangChain ChatOpenAI 接口）
     agent_base_url = ai_provider.base_url if ai_provider else ""
@@ -204,9 +212,19 @@ async def main():
     try:
         await runtime.run()
     finally:
-        # close 顺序：先关 ai_provider，再关其他
+        # close 顺序：先关 ai_provider，再关 LangGraph checkpoint pool，再关其他
         if ai_provider is not None:
             await ai_provider.aclose()
+        # 清空 ReAct tool 全局依赖（防 stale 引用）+ ConfirmGate（防 stale gate）
+        erp_tools.set_erp_adapter(None)
+        draft_tools.set_erp_adapter(None)
+        generate_tools.set_dependencies(sender=None, erp=None)
+        set_confirm_gate(None)
+        # LangGraph checkpoint pool — worker 重启 / 异常退出时不能漏关 PG 连接
+        try:
+            await _checkpoint_pool.close()
+        except Exception:
+            logger.exception("_checkpoint_pool.close 失败 — 继续走后续清理")
         await erp_adapter.aclose()
         await sender.aclose()
         await redis_client.aclose()
