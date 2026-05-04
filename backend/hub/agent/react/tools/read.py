@@ -103,8 +103,20 @@ async def get_customer_balance(customer_id: int) -> dict:
 
 @tool
 async def search_orders(customer_id: int = 0, since_days: int = 30) -> dict:
-    """搜订单（按客户 + 最近 N 天）。customer_id=0 表示不过滤,看全部用户的订单。
-    用户问"最近订单怎样" / "翼蓝最近买啥"时调。
+    """搜订单（按客户 + 最近 N 天）+ **自动聚合销售/毛利汇总**。
+    customer_id=0 表示不过滤,看全部用户的订单。
+
+    返 {items, total, summary}。
+    **summary 字段直接给出聚合数字,问销售额/毛利/净额时直接读 summary 不要自己 sum items**:
+      - summary.total_sales: 销售总额（不含退货）
+      - summary.total_returns: 退货总额（绝对值）
+      - summary.net_amount: 净额 = total_sales - total_returns
+      - summary.total_cost: 成本汇总
+      - summary.total_profit: 毛利汇总
+      - summary.gross_margin_pct: 毛利率(%)
+      - summary.order_count / sales_count / return_count: 订单数
+
+    用户问"最近订单怎样" / "翼蓝最近买啥" / "上个月销售额毛利多少" 等时调。
     """
     return await invoke_business_tool(
         tool_name="search_orders",

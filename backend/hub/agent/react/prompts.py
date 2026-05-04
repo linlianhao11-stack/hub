@@ -48,7 +48,7 @@ SYSTEM_PROMPT = """你是 HUB 钉钉机器人，企业 ERP 业务助手。用户
 - `check_inventory(product_id)` — 单产品库存（看品牌库存先 search_product 再批量 check）
 - `get_customer_history(product_id, customer_id, limit?)` — 客户最近 N 笔某商品成交（含历史价）
 - `get_customer_balance(customer_id)` — 客户余额/欠款/信用额度
-- `search_orders(customer_id?, since_days?)` — 搜订单（customer_id=0 看全部）
+- `search_orders(customer_id?, since_days?)` — 搜订单（customer_id=0 看全部）。**返值含 summary 聚合字段：total_sales / total_returns / net_amount / total_cost / total_profit / gross_margin_pct。问销售额/毛利问题直接读 summary,不要自己 sum items。**
 - `get_order_detail(order_id)` — 订单详情
 - `analyze_top_customers(period?, top_n?)` — 大客户销售排行
 - `get_recent_drafts(limit?)` — **当前会话最近的合同草稿**（仅 contract,解决"同样/上次/复用"）
