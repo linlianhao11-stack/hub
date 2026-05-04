@@ -23,6 +23,7 @@ from langchain_core.tools import tool
 
 from hub.agent.react.context import tool_ctx
 from hub.agent.react.tools._confirm_helper import create_pending_action
+from hub.agent.tools.confirm_gate import CrossContextIdempotency
 from hub.observability.tool_logger import log_tool_call
 from hub.permissions import require_permissions
 
@@ -61,6 +62,13 @@ async def _audit_plan_phase(
     跟 invoke_business_tool（read tool 用）模式对齐：require_permissions 在 wrapper
     外面（perm denial 抛 BizError 不在审计里）；validation / create_pending /
     业务返值都被 log_tool_call 捕获。
+
+    **跨 context 幂等保护**：voucher / price / stock 三类写 tool 用 use_idempotency=True
+    给 ConfirmGate 传 idempotency_key。如果同 idempotency_key 已经在另一个
+    (conversation, hub_user) 里持有 PendingAction,ConfirmGate 抛
+    `CrossContextIdempotency`。这里统一捕获,转成稳定的 fail-closed dict 返给 LLM,
+    避免异常冒出 LangChain tool 调用链让 ReAct turn 走通用错误兜底（用户看"AI 处理失败"
+    比"该申请已在其他会话处理中"差很多）。
     """
     c = tool_ctx.get()
     if c is None:
@@ -72,7 +80,16 @@ async def _audit_plan_phase(
         tool_name=react_tool_name,
         args=react_tool_args,
     ) as log_ctx:
-        result = await body()
+        try:
+            result = await body()
+        except CrossContextIdempotency as e:
+            result = {
+                "error": (
+                    f"该申请已在其他会话处理中,本会话不能复用同一份 pending。"
+                    f"如确实是新需求,请稍微改下参数（如金额、备注）后再试。"
+                    f"（{type(e).__name__}: {e}）"
+                ),
+            }
         log_ctx.set_result(result)
         return result
 

@@ -209,3 +209,41 @@ async def test_create_contract_draft_no_template_returns_error(fake_ctx, monkeyp
     })
     assert "error" in result
     assert "模板" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_voucher_cross_context_idempotency_returns_friendly_error(fake_ctx, monkeypatch):
+    """voucher / price / stock 三类用 use_idempotency=True 的 plan tool —
+    同 idempotency_key 跨 context 命中时 ConfirmGate 抛 CrossContextIdempotency,
+    write tool 必须捕获转成稳定的 error dict,而不是让异常冒出 LangChain tool 链
+    （用户看"AI 处理失败"比看"该申请已在其他会话处理中"差很多）。
+
+    场景：用户 A 在 conv-A 提了凭证申请挂着 pending；用户 B 在 conv-B 用同 args
+    重发同一份凭证 → idempotency_key 命中 A 的 pending → ConfirmGate fail-closed
+    → 本测试验证 wrapper 把异常转成 error dict。
+    """
+    from hub.agent.react.tools.write import create_voucher_draft
+    from hub.agent.tools.confirm_gate import CrossContextIdempotency
+
+    gate = AsyncMock()
+    gate.create_pending = AsyncMock(
+        side_effect=CrossContextIdempotency("idem_key=react-abc 已被 conv=conv-A user=99 持有"),
+    )
+    set_confirm_gate(gate)
+    monkeypatch.setattr("hub.agent.react.tools.write.require_permissions", AsyncMock())
+
+    result = await create_voucher_draft.ainvoke({
+        "voucher_data": {
+            "entries": [{"account": "应收", "debit": 1000, "credit": 0}],
+            "total_amount": 1000, "summary": "X 月销售",
+        },
+        "rule_matched": "sales_template",
+    })
+    # 关键断言：异常被捕获,LLM 看到的是 error dict 不是 raise
+    assert "error" in result, f"期望 error dict,实际 {result}"
+    err_text = result["error"]
+    assert "其他会话" in err_text or "已被" in err_text, (
+        f"error 文案应明确跨会话冲突,实际: {err_text!r}"
+    )
+    assert "status" not in result  # 不能误返 pending_confirmation
+
